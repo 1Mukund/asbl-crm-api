@@ -57,6 +57,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   } catch (err: any) {
     console.error("Website ingest error:", err.message);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({
+      error: err.message,
+      hint: "Check Vercel env vars: ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN",
+    });
   }
 }

@@ -17,44 +17,65 @@ let tokenExpiry = 0;
 export async function getAccessToken(): Promise<string> {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
 
-  const res = await axios.post(ZOHO_TOKEN_URL, null, {
-    params: {
-      grant_type: "refresh_token",
-      client_id: ZOHO_CLIENT_ID,
-      client_secret: ZOHO_CLIENT_SECRET,
-      refresh_token: ZOHO_REFRESH_TOKEN,
-    },
-  });
+  try {
+    const res = await axios.post(ZOHO_TOKEN_URL, null, {
+      params: {
+        grant_type: "refresh_token",
+        client_id: ZOHO_CLIENT_ID,
+        client_secret: ZOHO_CLIENT_SECRET,
+        refresh_token: ZOHO_REFRESH_TOKEN,
+      },
+    });
 
-  cachedToken = res.data.access_token;
-  tokenExpiry = Date.now() + (res.data.expires_in - 60) * 1000;
-  return cachedToken!;
+    if (!res.data.access_token) {
+      throw new Error(`Zoho token error: ${JSON.stringify(res.data)}`);
+    }
+
+    cachedToken = res.data.access_token;
+    tokenExpiry = Date.now() + (res.data.expires_in - 60) * 1000;
+    return cachedToken!;
+  } catch (err: any) {
+    const detail = err.response?.data ?? err.message;
+    throw new Error(`Zoho auth failed: ${JSON.stringify(detail)}`);
+  }
 }
 
 // ─── Lead Search ─────────────────────────────────────────────────────────────
 
 export async function findLeadByPhone(phone: string): Promise<any | null> {
   const token = await getAccessToken();
-  const res = await axios.get(`${ZOHO_API_BASE}/Leads/search`, {
-    headers: { Authorization: `Zoho-oauthtoken ${token}` },
-    params: {
-      criteria: `(Mobile:equals:${phone})`,
-      fields: "id,First_Name,Last_Name,Mobile,Master_Lead_ID,Project_Lead_ID,ASBL_Project",
-    },
-  });
-  return res.data?.data?.[0] ?? null;
+  try {
+    const res = await axios.get(`${ZOHO_API_BASE}/Leads/search`, {
+      headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      params: {
+        criteria: `(Mobile:equals:${phone})`,
+        fields: "id,First_Name,Last_Name,Mobile,Master_Lead_ID,Project_Lead_ID,ASBL_Project",
+      },
+    });
+    return res.data?.data?.[0] ?? null;
+  } catch (err: any) {
+    // Zoho returns 204 No Content when no leads found — treat as null
+    if (err.response?.status === 204) return null;
+    throw err;
+  }
 }
 
 export async function findLeadByPhoneAndProject(phone: string, project: string): Promise<any | null> {
   const token = await getAccessToken();
-  const res = await axios.get(`${ZOHO_API_BASE}/Leads/search`, {
-    headers: { Authorization: `Zoho-oauthtoken ${token}` },
-    params: {
-      criteria: `((Mobile:equals:${phone})and(ASBL_Project:equals:${project}))`,
-      fields: "id,First_Name,Last_Name,Mobile,Master_Lead_ID,Project_Lead_ID,ASBL_Project",
-    },
-  });
-  return res.data?.data?.[0] ?? null;
+  try {
+    const res = await axios.get(`${ZOHO_API_BASE}/Leads/search`, {
+      headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      params: {
+        criteria: `((Mobile:equals:${phone})and(ASBL_Project:equals:${project}))`,
+        fields: "id,First_Name,Last_Name,Mobile,Master_Lead_ID,Project_Lead_ID,ASBL_Project",
+      },
+    });
+    return res.data?.data?.[0] ?? null;
+  } catch (err: any) {
+    // Zoho returns 204 No Content when no leads found — treat as null
+    if (err.response?.status === 204) return null;
+    throw err;
+  }
 }
 
 // ─── MLID / PLID Generation ──────────────────────────────────────────────────
