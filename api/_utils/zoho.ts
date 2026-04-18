@@ -78,37 +78,6 @@ export async function findLeadByPhoneAndProject(phone: string, project: string):
   }
 }
 
-// ─── MLID / PLID Generation ──────────────────────────────────────────────────
-
-export async function getOrCreateMLID(phone: string): Promise<string> {
-  const token = await getAccessToken();
-
-  // Search any lead with this phone
-  const existing = await findLeadByPhone(phone);
-  if (existing?.Master_Lead_ID) return existing.Master_Lead_ID;
-
-  // Get max MLID from all leads
-  try {
-    const res = await axios.get(`${ZOHO_API_BASE}/Leads`, {
-      headers: { Authorization: `Zoho-oauthtoken ${token}` },
-      params: { fields: "Master_Lead_ID", per_page: 200, sort_by: "id", sort_order: "desc" },
-    });
-
-    const leads = res.data?.data ?? [];
-    let max = 1000;
-    for (const l of leads) {
-      const val = parseInt(l.Master_Lead_ID ?? "0");
-      if (!isNaN(val) && val > max) max = val;
-    }
-    return String(max + 1);
-  } catch {
-    return "1001";
-  }
-}
-
-export async function generatePLID(mlid: string, project: string): Promise<string> {
-  return `${mlid}-${project}`;
-}
 
 // ─── Create / Update Lead ────────────────────────────────────────────────────
 

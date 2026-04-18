@@ -1,9 +1,8 @@
 import { NormalizedLead } from "./types";
+import { getOrCreateMLID, getOrCreatePLID, upsertLead } from "./supabase";
 import {
-  findLeadByPhone,
   findLeadByPhoneAndProject,
-  getOrCreateMLID,
-  generatePLID,
+  findLeadByPhone,
   createLead,
   updateLead,
 } from "./zoho";
@@ -18,34 +17,25 @@ export type IngestResult = {
 export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
   const { mobile, project } = lead;
 
-  // 1. Get or create MLID
+  // ── Step 1: Get or create MLID + PLID from Supabase (atomic, race-safe) ──
   const mlid = await getOrCreateMLID(mobile);
+  const plid = await getOrCreatePLID(mobile, mlid, project ?? "UNKNOWN");
 
-  // 2. Dedup check
-  let existingLead: any = null;
-  if (project) {
-    existingLead = await findLeadByPhoneAndProject(mobile, project);
-  } else {
-    existingLead = await findLeadByPhone(mobile);
-  }
-
-  const plid = await generatePLID(mlid, project ?? "UNKNOWN");
-
-  // 3. Build Zoho payload
+  // ── Step 2: Build Zoho payload ────────────────────────────────────────────
   const zohoPayload: Record<string, any> = {
-    // ─── Standard Fields ─────────────────────────────────────────────────
+    // Standard fields
     First_Name: lead.first_name,
     Last_Name: lead.last_name,
     Mobile: mobile,
     Email: lead.email ?? "",
     Lead_Source: lead.lead_source,
 
-    // ─── Identity ─────────────────────────────────────────────────────────
+    // Identity
     Master_Lead_ID: mlid,
     Project_Lead_ID: plid,
     Source_Lead_ID: lead.source_lead_id ?? "",
 
-    // ─── Attribution ─────────────────────────────────────────────────────
+    // Attribution
     Campaign_Name: lead.campaign_name ?? "",
     Ad_Set_Name: lead.ad_set_name ?? "",
     Ad_Name: lead.ad_name ?? "",
@@ -56,7 +46,7 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
     UTM_Term: lead.utm_term ?? "",
     Lead_Received_At: lead.lead_received_at.replace(/\.\d{3}Z$/, "+00:00"),
 
-    // ─── Project & Interest ───────────────────────────────────────────────
+    // Project & Interest
     ASBL_Project: lead.project ?? "",
     Lead_Budget: lead.budget ?? "",
     Size_Preference: lead.size_preference ?? "",
@@ -65,7 +55,7 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
     Purchase_Purpose: lead.purchase_purpose ?? "",
     Lead_Comments: lead.lead_comments ?? "",
 
-    // ─── Web Tracking ────────────────────────────────────────────────────
+    // Web Tracking
     First_Page_Visited: lead.first_page_visited ?? "",
     Last_Page_Visited: lead.last_page_visited ?? "",
     Total_Page_Views: lead.total_page_views ?? 0,
@@ -73,12 +63,28 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
     Referrer_URL: lead.referrer_url ?? "",
   };
 
-  // 4. Create or Update
+  // ── Step 3: Dedup check in Zoho + Create or Update ───────────────────────
+  let existingLead: any = null;
+  if (project) {
+    existingLead = await findLeadByPhoneAndProject(mobile, project);
+  } else {
+    existingLead = await findLeadByPhone(mobile);
+  }
+
+  let zohoLeadId: string;
+  let action: "created" | "updated";
+
   if (existingLead) {
     await updateLead(existingLead.id, zohoPayload);
-    return { action: "updated", zoho_lead_id: existingLead.id, mlid, plid };
+    zohoLeadId = existingLead.id;
+    action = "updated";
   } else {
-    const newId = await createLead(zohoPayload);
-    return { action: "created", zoho_lead_id: newId, mlid, plid };
+    zohoLeadId = await createLead(zohoPayload);
+    action = "created";
   }
+
+  // ── Step 4: Store in Supabase (source of truth + safety net) ─────────────
+  await upsertLead(lead, mlid, plid, zohoLeadId, true);
+
+  return { action, zoho_lead_id: zohoLeadId, mlid, plid };
 }
