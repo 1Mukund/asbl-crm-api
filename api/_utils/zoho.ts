@@ -54,9 +54,9 @@ export async function findLeadByPhone(phone: string): Promise<any | null> {
     });
     return res.data?.data?.[0] ?? null;
   } catch (err: any) {
-    // Zoho returns 204 No Content when no leads found — treat as null
     if (err.response?.status === 204) return null;
-    throw err;
+    const detail = err.response?.data ?? err.message;
+    throw new Error(`Zoho search failed [findByPhone]: ${JSON.stringify(detail)}`);
   }
 }
 
@@ -72,9 +72,9 @@ export async function findLeadByPhoneAndProject(phone: string, project: string):
     });
     return res.data?.data?.[0] ?? null;
   } catch (err: any) {
-    // Zoho returns 204 No Content when no leads found — treat as null
     if (err.response?.status === 204) return null;
-    throw err;
+    const detail = err.response?.data ?? err.message;
+    throw new Error(`Zoho search failed [findByPhoneAndProject]: ${JSON.stringify(detail)}`);
   }
 }
 
