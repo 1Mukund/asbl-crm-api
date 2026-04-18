@@ -49,7 +49,7 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
     UTM_Campaign: lead.utm_campaign ?? "",
     UTM_Content: lead.utm_content ?? "",
     UTM_Term: lead.utm_term ?? "",
-    Lead_Received_At: lead.lead_received_at,
+    Lead_Received_At: lead.lead_received_at.replace(/\.\d{3}Z$/, "+00:00"),
     ASBL_Project: lead.project ?? "",
     Lead_Budget: lead.budget ?? "",
     Size_Preference: lead.size_preference ?? "",
