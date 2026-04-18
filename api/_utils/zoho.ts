@@ -66,19 +66,23 @@ export async function getOrCreateMLID(phone: string): Promise<string> {
   const existing = await findLeadByPhone(phone);
   if (existing?.Master_Lead_ID) return existing.Master_Lead_ID;
 
-  // Get max MLID
-  const res = await axios.get(`${ZOHO_API_BASE}/Leads`, {
-    headers: { Authorization: `Zoho-oauthtoken ${token}` },
-    params: { fields: "Master_Lead_ID", per_page: 200, sort_by: "id", sort_order: "desc" },
-  });
+  // Get max MLID from all leads
+  try {
+    const res = await axios.get(`${ZOHO_API_BASE}/Leads`, {
+      headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      params: { fields: "Master_Lead_ID", per_page: 200, sort_by: "id", sort_order: "desc" },
+    });
 
-  const leads = res.data?.data ?? [];
-  let max = 1000;
-  for (const l of leads) {
-    const val = parseInt(l.Master_Lead_ID ?? "0");
-    if (val > max) max = val;
+    const leads = res.data?.data ?? [];
+    let max = 1000;
+    for (const l of leads) {
+      const val = parseInt(l.Master_Lead_ID ?? "0");
+      if (!isNaN(val) && val > max) max = val;
+    }
+    return String(max + 1);
+  } catch {
+    return "1001";
   }
-  return String(max + 1);
 }
 
 export async function generatePLID(mlid: string, project: string): Promise<string> {
@@ -89,12 +93,17 @@ export async function generatePLID(mlid: string, project: string): Promise<strin
 
 export async function createLead(data: Record<string, any>): Promise<string> {
   const token = await getAccessToken();
-  const res = await axios.post(
-    `${ZOHO_API_BASE}/Leads`,
-    { data: [data] },
-    { headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" } }
-  );
-  return res.data?.data?.[0]?.details?.id;
+  try {
+    const res = await axios.post(
+      `${ZOHO_API_BASE}/Leads`,
+      { data: [data] },
+      { headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" } }
+    );
+    return res.data?.data?.[0]?.details?.id;
+  } catch (err: any) {
+    const detail = err.response?.data ?? err.message;
+    throw new Error(`Zoho createLead failed: ${JSON.stringify(detail)}`);
+  }
 }
 
 export async function updateLead(id: string, data: Record<string, any>): Promise<void> {
