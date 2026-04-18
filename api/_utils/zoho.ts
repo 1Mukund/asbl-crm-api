@@ -129,9 +129,14 @@ export async function createLead(data: Record<string, any>): Promise<string> {
 
 export async function updateLead(id: string, data: Record<string, any>): Promise<void> {
   const token = await getAccessToken();
-  await axios.patch(
-    `${ZOHO_API_BASE}/Leads`,
-    { data: [{ id, ...data }] },
-    { headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" } }
-  );
+  try {
+    await axios.patch(
+      `${ZOHO_API_BASE}/Leads`,
+      { data: [{ id, ...data }] },
+      { headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" } }
+    );
+  } catch (err: any) {
+    const detail = err.response?.data ?? err.message;
+    throw new Error(`Zoho updateLead failed: ${JSON.stringify(detail)}`);
+  }
 }
