@@ -1,6 +1,9 @@
 {
-  "rewrites": [
-    { "source": "/api/ingest/meta", "destination": "/api/ingest/meta" },
-    { "source": "/api/ingest/website", "destination": "/api/ingest/website" }
-  ]
+  "buildCommand": null,
+  "outputDirectory": null,
+  "functions": {
+    "api/**/*.ts": {
+      "runtime": "vercel-node@3.0.0"
+    }
+  }
 }
