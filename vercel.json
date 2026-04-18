@@ -1,0 +1,6 @@
+{
+  "rewrites": [
+    { "source": "/api/ingest/meta", "destination": "/api/ingest/meta" },
+    { "source": "/api/ingest/website", "destination": "/api/ingest/website" }
+  ]
+}
