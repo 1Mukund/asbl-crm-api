@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ASBL CRM — Lead Test Form</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f0f2f5;
+      min-height: 100vh;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 40px 16px;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 560px;
+    }
+
+    .header {
+      text-align: center;
+      margin-bottom: 24px;
+    }
+    .header .badge {
+      display: inline-block;
+      background: #e8f4fd;
+      color: #1a73e8;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      padding: 4px 12px;
+      border-radius: 20px;
+      margin-bottom: 10px;
+    }
+    .header h1 {
+      font-size: 22px;
+      font-weight: 700;
+      color: #1a1a2e;
+    }
+    .header p {
+      font-size: 13px;
+      color: #666;
+      margin-top: 4px;
+    }
+
+    .card {
+      background: #fff;
+      border-radius: 16px;
+      box-shadow: 0 2px 20px rgba(0,0,0,0.08);
+      padding: 32px;
+    }
+
+    .form-group {
+      margin-bottom: 18px;
+    }
+    label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: #444;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 6px;
+    }
+    label .req { color: #e53935; margin-left: 2px; }
+    label .opt {
+      font-weight: 400;
+      color: #999;
+      text-transform: none;
+      letter-spacing: 0;
+      font-size: 11px;
+      margin-left: 4px;
+    }
+
+    input, select, textarea {
+      width: 100%;
+      padding: 11px 14px;
+      border: 1.5px solid #e0e0e0;
+      border-radius: 8px;
+      font-size: 14px;
+      color: #222;
+      background: #fafafa;
+      transition: border-color 0.2s, background 0.2s;
+      outline: none;
+    }
+    input:focus, select:focus, textarea:focus {
+      border-color: #1a73e8;
+      background: #fff;
+    }
+    textarea { resize: vertical; min-height: 80px; }
+
+    .row { display: flex; gap: 14px; }
+    .row .form-group { flex: 1; }
+
+    .divider {
+      border: none;
+      border-top: 1px dashed #e8e8e8;
+      margin: 22px 0;
+    }
+
+    .section-label {
+      font-size: 11px;
+      font-weight: 700;
+      color: #999;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 16px;
+    }
+
+    .endpoint-box {
+      background: #f8f9fa;
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 12px;
+      color: #555;
+      margin-bottom: 18px;
+      word-break: break-all;
+    }
+    .endpoint-box strong { color: #222; }
+
+    button[type="submit"] {
+      width: 100%;
+      padding: 14px;
+      background: linear-gradient(135deg, #1a73e8, #0d47a1);
+      color: #fff;
+      font-size: 15px;
+      font-weight: 600;
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: opacity 0.2s, transform 0.1s;
+      margin-top: 4px;
+    }
+    button[type="submit"]:hover { opacity: 0.92; }
+    button[type="submit"]:active { transform: scale(0.99); }
+    button[type="submit"]:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    /* Response panel */
+    #response-panel {
+      margin-top: 20px;
+      border-radius: 12px;
+      overflow: hidden;
+      display: none;
+    }
+
+    .response-header {
+      padding: 12px 18px;
+      font-size: 13px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .response-header.success { background: #e8f5e9; color: #2e7d32; }
+    .response-header.error   { background: #ffebee; color: #c62828; }
+
+    .response-body {
+      background: #1e1e2e;
+      padding: 20px;
+      overflow-x: auto;
+    }
+    .response-body pre {
+      font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+      font-size: 13px;
+      line-height: 1.6;
+      color: #cdd6f4;
+    }
+
+    /* Highlight keys */
+    .key-mlid    { color: #a6e3a1; font-weight: 700; }
+    .key-plid    { color: #89dceb; font-weight: 700; }
+    .key-zoho    { color: #f38ba8; font-weight: 700; }
+    .key-action  { color: #fab387; font-weight: 700; }
+
+    .loader {
+      display: inline-block;
+      width: 16px; height: 16px;
+      border: 2px solid rgba(255,255,255,0.4);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <div class="header">
+    <div class="badge">🧪 Test Mode</div>
+    <h1>ASBL CRM — Lead Test Form</h1>
+    <p>Fill and submit to verify lead ingestion → Zoho CRM</p>
+  </div>
+
+  <div class="card">
+
+    <div class="endpoint-box">
+      <strong>POST</strong> &nbsp;https://asbl-crm-api.vercel.app/api/ingest/website
+    </div>
+
+    <form id="lead-form">
+
+      <!-- Basic Info -->
+      <div class="section-label">Contact Details</div>
+
+      <div class="row">
+        <div class="form-group">
+          <label>Full Name <span class="req">*</span></label>
+          <input type="text" id="name" placeholder="Pranjal Tiwari" required />
+        </div>
+        <div class="form-group">
+          <label>Phone <span class="req">*</span></label>
+          <input type="tel" id="phone" placeholder="9876543210" required />
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>Email <span class="opt">(optional)</span></label>
+        <input type="email" id="email" placeholder="pranjal@asbl.in" />
+      </div>
+
+      <hr class="divider" />
+
+      <!-- Project Info -->
+      <div class="section-label">Project & Interest</div>
+
+      <div class="form-group">
+        <label>Project <span class="req">*</span></label>
+        <select id="project" required>
+          <option value="">— Select Project —</option>
+          <option value="LOFT">LOFT</option>
+          <option value="SPECTRA">SPECTRA</option>
+          <option value="BROADWAY">BROADWAY</option>
+          <option value="LANDMARK">LANDMARK</option>
+          <option value="LEGACY">LEGACY</option>
+        </select>
+      </div>
+
+      <div class="row">
+        <div class="form-group">
+          <label>Configuration <span class="opt">(BHK)</span></label>
+          <select id="configuration">
+            <option value="">Any</option>
+            <option value="1 BHK">1 BHK</option>
+            <option value="2 BHK">2 BHK</option>
+            <option value="3 BHK">3 BHK</option>
+            <option value="4 BHK">4 BHK</option>
+            <option value="Villa">Villa</option>
+            <option value="Plot">Plot</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Purpose <span class="opt">(optional)</span></label>
+          <select id="purpose">
+            <option value="">Select</option>
+            <option value="Self Use">Self Use</option>
+            <option value="Investment">Investment</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>Budget <span class="opt">(optional)</span></label>
+        <select id="budget">
+          <option value="">Select Range</option>
+          <option value="Below 50L">Below 50L</option>
+          <option value="50L - 1Cr">50L - 1Cr</option>
+          <option value="1Cr - 2Cr">1Cr - 2Cr</option>
+          <option value="2Cr - 3Cr">2Cr - 3Cr</option>
+          <option value="Above 3Cr">Above 3Cr</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label>Message <span class="opt">(optional)</span></label>
+        <textarea id="message" placeholder="Any specific requirements or questions..."></textarea>
+      </div>
+
+      <hr class="divider" />
+
+      <!-- UTM Tracking (pre-filled for test) -->
+      <div class="section-label">UTM Tracking <span style="font-weight:400;color:#aaa;font-size:10px">(auto-filled from URL in production)</span></div>
+
+      <div class="row">
+        <div class="form-group">
+          <label>UTM Source</label>
+          <input type="text" id="utm_source" placeholder="google" value="test" />
+        </div>
+        <div class="form-group">
+          <label>UTM Medium</label>
+          <input type="text" id="utm_medium" placeholder="cpc" value="manual_test" />
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>UTM Campaign</label>
+        <input type="text" id="utm_campaign" placeholder="loft_launch_2024" value="website_test_form" />
+      </div>
+
+      <button type="submit" id="submit-btn">
+        Submit Lead → Zoho CRM
+      </button>
+    </form>
+  </div>
+
+  <!-- Response Panel -->
+  <div id="response-panel">
+    <div class="response-header" id="response-header"></div>
+    <div class="response-body">
+      <pre id="response-pre"></pre>
+    </div>
+  </div>
+</div>
+
+<script>
+  document.getElementById("lead-form").addEventListener("submit", async function(e) {
+    e.preventDefault();
+
+    const btn = document.getElementById("submit-btn");
+    btn.disabled = true;
+    btn.innerHTML = '<span class="loader"></span> Submitting...';
+
+    const payload = {
+      name:          document.getElementById("name").value.trim(),
+      phone:         document.getElementById("phone").value.trim(),
+      email:         document.getElementById("email").value.trim(),
+      project:       document.getElementById("project").value,
+      configuration: document.getElementById("configuration").value,
+      purpose:       document.getElementById("purpose").value,
+      budget:        document.getElementById("budget").value,
+      message:       document.getElementById("message").value.trim(),
+      utm_source:    document.getElementById("utm_source").value.trim(),
+      utm_medium:    document.getElementById("utm_medium").value.trim(),
+      utm_campaign:  document.getElementById("utm_campaign").value.trim(),
+      utm_content:   "",
+      utm_term:      "",
+      page_url:      window.location.href,
+      referrer:      document.referrer || "",
+    };
+
+    const panel  = document.getElementById("response-panel");
+    const header = document.getElementById("response-header");
+    const pre    = document.getElementById("response-pre");
+
+    try {
+      const res  = await fetch("https://asbl-crm-api.vercel.app/api/ingest/website", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify(payload),
+      });
+
+      const data = await res.json();
+      panel.style.display = "block";
+
+      if (res.ok && data.success) {
+        header.className = "response-header success";
+        header.innerHTML = "✅ Lead submitted successfully!";
+      } else {
+        header.className = "response-header error";
+        header.innerHTML = "❌ Submission failed";
+      }
+
+      // Pretty print with highlights
+      const raw = JSON.stringify(data, null, 2);
+      pre.innerHTML = raw
+        .replace(/"mlid":/g,     '<span class="key-mlid">"mlid":</span>')
+        .replace(/"plid":/g,     '<span class="key-plid">"plid":</span>')
+        .replace(/"zoho_lead_id":/g, '<span class="key-zoho">"zoho_lead_id":</span>')
+        .replace(/"action":/g,   '<span class="key-action">"action":</span>');
+
+      panel.scrollIntoView({ behavior: "smooth", block: "start" });
+
+    } catch (err) {
+      panel.style.display = "block";
+      header.className = "response-header error";
+      header.innerHTML = "❌ Network error — check console";
+      pre.textContent = "Error: " + err.message + "\n\nMake sure the API server is running.";
+    }
+
+    btn.disabled = false;
+    btn.innerHTML = "Submit Lead → Zoho CRM";
+  });
+</script>
+
+</body>
+</html>
