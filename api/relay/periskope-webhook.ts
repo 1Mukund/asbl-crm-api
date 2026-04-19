@@ -26,70 +26,16 @@ const SENDER_NUMBERS = [
   "919059555164",
 ];
 
-// ── Extract phone from Periskope webhook payload ──────────────────────────────
-function extractPhone(data: any): string | null {
-  const candidates = [
-    data?.chat_id,
-    data?.sender_phone,
-    data?.from,
-    data?.author,
-    data?.chat?.id,
-    data?.id?.remote,
-    data?.key?.remoteJid,
-    data?.message?.from,
-    data?.message?.chat_id,
-  ];
-
-  for (const c of candidates) {
-    if (!c) continue;
-    let v = String(c).trim();
-    if (v.includes("@")) v = v.split("@")[0];
-    const phone = v.replace(/\D/g, "");
-    if (phone.length >= 10 && phone.length <= 15) return phone;
-  }
-  return null;
-}
-
-// ── Extract message text ──────────────────────────────────────────────────────
-function extractMessage(data: any): string {
-  return (
-    data?.body ||
-    data?.text ||
-    data?.message?.body ||
-    data?.message?.text ||
-    data?.content ||
-    ""
-  ).trim();
+// ── Parse JID → clean phone number ───────────────────────────────────────────
+function parsePhone(jid: string): string | null {
+  if (!jid) return null;
+  const phone = String(jid).split("@")[0].replace(/\D/g, "");
+  return (phone.length >= 10 && phone.length <= 15) ? phone : null;
 }
 
 // ── Is this an inbound (customer) message? ────────────────────────────────────
 function isInbound(data: any): boolean {
-  if (data?.from_me === true || data?.is_from_me === true) return false;
-  const dir = String(data?.direction || data?.message_direction || "").toLowerCase();
-  if (dir === "outbound") return false;
-  return true;
-}
-
-// ── Get sender for this phone (stored in Supabase, fallback to first) ─────────
-async function getSenderForPhone(phone: string): Promise<string> {
-  try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/leads?phone=eq.${phone}&select=whatsapp_sender&limit=1`,
-      {
-        headers: {
-          "apikey": SUPABASE_KEY,
-          "Authorization": `Bearer ${SUPABASE_KEY}`,
-        },
-      }
-    );
-    const rows = await r.json() as any[];
-    const sender = rows?.[0]?.whatsapp_sender;
-    if (sender && SENDER_NUMBERS.includes(sender)) return sender;
-  } catch { /* fallback */ }
-
-  // Fallback: deterministic pick based on phone
-  const lastDigit = parseInt(phone.slice(-1), 10) || 0;
-  return SENDER_NUMBERS[lastDigit % SENDER_NUMBERS.length];
+  return data?.from_me !== true;
 }
 
 // ── Call Anandita LLM ─────────────────────────────────────────────────────────
@@ -160,23 +106,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({ skipped: true, reason: "outbound" });
     }
 
-    const phone   = extractPhone(data);
-    const message = extractMessage(data);
+    // Customer phone from chat_id, sender from org_phone
+    const phone  = parsePhone(data?.chat_id);
+    const sender = parsePhone(data?.org_phone);
+    const message = String(data?.body || "").trim();
 
     if (!phone) {
-      console.log("[Periskope Webhook] Could not extract phone");
+      console.log("[Periskope Webhook] Could not extract customer phone from chat_id");
       return res.status(200).json({ skipped: true, reason: "no phone" });
     }
+    if (!sender) {
+      console.log("[Periskope Webhook] Could not extract org_phone (our sender)");
+      return res.status(200).json({ skipped: true, reason: "no sender" });
+    }
     if (!message) {
-      console.log("[Periskope Webhook] Empty message, skipping");
+      console.log("[Periskope Webhook] Empty message body, skipping");
       return res.status(200).json({ skipped: true, reason: "no message" });
     }
 
-    console.log(`[Periskope Webhook] Inbound from ${phone}: ${message.slice(0, 80)}`);
-
-    // Get sender for this customer
-    const sender = await getSenderForPhone(phone);
-    console.log(`[Periskope Webhook] Using sender: ${sender}`);
+    console.log(`[Periskope Webhook] Inbound from ${phone} → org: ${sender} | msg: ${message.slice(0, 80)}`);
 
     // Call Anandita LLM
     const reply = await callAnandita(phone, message);
