@@ -60,8 +60,28 @@ async function callAnandita(phone: string, message: string): Promise<string> {
   return reply.trim();
 }
 
-// ── Send via Periskope ────────────────────────────────────────────────────────
+// ── Send via Periskope with typing delay ──────────────────────────────────────
 async function sendReply(phone: string, sender: string, message: string): Promise<void> {
+  // 1. Send typing indicator
+  try {
+    await fetch(`https://api.periskope.app/v1/chats/typing`, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "Authorization": `Bearer ${PERISKOPE_API_KEY}`,
+        "x-phone":       sender,
+      },
+      body: JSON.stringify({ chat_id: `${phone}@c.us` }),
+    });
+    console.log(`[Periskope Webhook] Typing indicator sent`);
+  } catch {
+    // Typing not critical, continue anyway
+  }
+
+  // 2. Wait 10 seconds (human-like delay)
+  await new Promise(resolve => setTimeout(resolve, 10000));
+
+  // 3. Send actual message
   const r = await fetch(PERISKOPE_API_URL, {
     method: "POST",
     headers: {

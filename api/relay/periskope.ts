@@ -68,10 +68,12 @@ async function generateMessage(
   if (leadSource)     parts.push(`Lead source: ${leadSource}`);
 
   const prompt =
-    `OUTBOUND_FIRST_MESSAGE | ${parts.join(" | ")} | ` +
-    `Task: Write a warm, personalised first WhatsApp message in Hinglish. ` +
-    `Introduce yourself as Aanandita from ASBL. Reference their enquiry details naturally. ` +
-    `Keep it concise (3-4 lines max). Do NOT add any JSON or meta-text — just the message.`;
+    `Send the very first WhatsApp message to a new real estate lead. ` +
+    `${parts.join(", ")}. ` +
+    `Write as Aanandita Reddy, Relationship Manager at ASBL. ` +
+    `Greet them by name, mention the specific project they enquired about, ` +
+    `naturally reference their budget and size preference if available. ` +
+    `Warm, friendly, Hinglish tone. Max 3-4 lines. Only the message text, nothing else.`;
 
   const r = await fetch(ANANDITA_URL, {
     method: "POST",
@@ -92,6 +94,24 @@ async function generateMessage(
 
   if (!message.trim()) throw new Error("Anandita returned empty message");
   return message.trim();
+}
+
+// ── Store sender mapping in Supabase ─────────────────────────────────────────
+async function storeSenderMapping(phone: string, sender: string): Promise<void> {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_sender_map`, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "apikey":        SUPABASE_KEY,
+        "Authorization": `Bearer ${SUPABASE_KEY}`,
+        "Prefer":        "resolution=merge-duplicates",
+      },
+      body: JSON.stringify({ phone, sender, updated_at: new Date().toISOString() }),
+    });
+  } catch (err) {
+    console.error("[Periskope] Failed to store sender mapping:", err);
+  }
 }
 
 // ── Step 2: Send via Periskope ────────────────────────────────────────────────
@@ -148,6 +168,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // 3. Send via Periskope
     const result = await sendViaPeriskope(phone, sender, message);
+
+    // Store sender mapping so replies use the same number
+    await storeSenderMapping(phone, sender);
 
     console.log(`[Periskope] Sent to ${phone} via ${sender}`);
     return res.status(200).json({ success: true, phone, sender, message, ...result });
