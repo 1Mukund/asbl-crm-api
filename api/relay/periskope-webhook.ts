@@ -41,7 +41,8 @@ function detectIntent(message: string): string {
   }
 
   // Site visit intent — physical visit confirmed
-  if (/site visit|visit karna|visit krna|aa jaun|aa sakta|aa rha|aa raha|physical|dekhna chahta|dekhna chahti|location|address|kahan hai|kahan h|show flat|flat dikhao|project dikhao|aaunga|aaungi/i.test(msg)) {
+  // Includes time-based confirmations like "kal 2 baje", "Sunday aaunga", day+time combos
+  if (/site visit|visit karna|visit krna|aa jaun|aa sakta|aa rha|aa raha|physical|dekhna chahta|dekhna chahti|location|address|kahan hai|kahan h|show flat|flat dikhao|project dikhao|aaunga|aaungi|kal \d|aaj \d|sunday|saturday|monday|tuesday|wednesday|thursday|friday|parso|kal aata|kal aaunga|kal milte|baje aa|baje visit|time confirm|slot confirm|visit confirm|confirmed visit/i.test(msg)) {
     return "site_visit";
   }
 
@@ -257,13 +258,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // 5. Save outbound reply to Supabase
     await saveMessage(phone, "outbound", reply, sender);
 
-    // 6. Update Zoho with intent (async — don't block response)
-    getZohoToken()
-      .then(token => findLeadByPhone(phone, token).then(leadId => {
-        if (leadId) return updateZohoIntent(leadId, intent, token);
+    // 6. Update Zoho with intent — awaited before response (fire-and-forget gets killed by Vercel)
+    try {
+      const token  = await getZohoToken();
+      const leadId = await findLeadByPhone(phone, token);
+      if (leadId) {
+        await updateZohoIntent(leadId, intent, token);
+      } else {
         console.log(`[Periskope Webhook] Lead not found in Zoho for phone ${phone}`);
-      }))
-      .catch(err => console.error("[Periskope Webhook] Zoho update error:", err.message));
+      }
+    } catch (err: any) {
+      console.error("[Periskope Webhook] Zoho update error:", err.message);
+    }
 
     return res.status(200).json({ success: true, phone, intent });
 
