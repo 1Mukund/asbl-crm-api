@@ -145,7 +145,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const event  = String(body?.event_type || body?.event || body?.type || "");
     const data   = body?.data || body;
 
-    console.log(`[Periskope Webhook] Event: ${event}, raw keys: ${Object.keys(data).join(",")}`);
+    console.log(`[Periskope Webhook] FULL BODY: ${JSON.stringify(body).slice(0, 2000)}`);
+    console.log(`[Periskope Webhook] Event: ${event}, data keys: ${Object.keys(data).join(",")}`);;
 
     // Only handle message.created / message.received
     if (event !== "message.created" && event !== "message.received") {
