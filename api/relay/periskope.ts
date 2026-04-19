@@ -49,51 +49,31 @@ async function getNextSender(): Promise<string> {
   }
 }
 
-// ── Step 1: Ask Anandita LLM to generate a personalised first message ─────────
-async function generateMessage(
-  phone: string,
+// ── Build personalised first message from template ────────────────────────────
+function generateMessage(
   firstName: string,
   project: string,
   budget: string,
   sizePreference: string,
-  leadSource: string,
-): Promise<string> {
+): string {
+  const name = firstName?.trim() || "there";
 
-  // Build a structured context prompt for Anandita
-  const parts: string[] = [];
-  if (firstName)      parts.push(`Name: ${firstName}`);
-  if (project)        parts.push(`Project interested in: ${project}`);
-  if (budget)         parts.push(`Budget: ${budget}`);
-  if (sizePreference) parts.push(`Size preference: ${sizePreference}`);
-  if (leadSource)     parts.push(`Lead source: ${leadSource}`);
+  // Build enquiry detail line
+  const details: string[] = [];
+  if (project)        details.push(`*${project}*`);
+  if (budget)         details.push(`budget ${budget}`);
+  if (sizePreference) details.push(`${sizePreference}`);
 
-  const prompt =
-    `Send the very first WhatsApp message to a new real estate lead. ` +
-    `${parts.join(", ")}. ` +
-    `Write as Aanandita Reddy, Relationship Manager at ASBL. ` +
-    `Greet them by name, mention the specific project they enquired about, ` +
-    `naturally reference their budget and size preference if available. ` +
-    `Warm, friendly, Hinglish tone. Max 3-4 lines. Only the message text, nothing else.`;
+  const enquiryLine = details.length > 0
+    ? `Aapne hamare ${details.join(", ")} ke liye enquiry ki thi.`
+    : `Aapne hamare ek project ke liye enquiry ki thi.`;
 
-  const r = await fetch(ANANDITA_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type":  "application/json",
-      "Authorization": `Bearer ${ANANDITA_API_KEY}`,
-    },
-    body: JSON.stringify({ phone: `+${phone}`, message: prompt }),
-  });
-
-  if (!r.ok) {
-    const err = await r.text();
-    throw new Error(`Anandita LLM error ${r.status}: ${err}`);
-  }
-
-  const data = await r.json() as any;
-  const message: string = data?.message || data?.reply || "";
-
-  if (!message.trim()) throw new Error("Anandita returned empty message");
-  return message.trim();
+  return (
+    `Hi ${name}! 👋\n\n` +
+    `Main Aanandita Reddy hoon, ASBL mein aapki dedicated Relationship Manager. ${enquiryLine}\n\n` +
+    `Aapke ghar kharidne ke safar ko smooth aur easy banana mera kaam hai. ` +
+    `Koi bhi sawaal ho — pricing, location, availability — yahan reply karein, main haazir hoon! 🏠`
+  );
 }
 
 // ── Store sender mapping in Supabase ─────────────────────────────────────────
@@ -159,10 +139,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     console.log(`[Periskope] Generating message for ${phone} (${first_name}, ${project}) via ${sender}`);
 
-    // 2. Get personalised message from Anandita
-    const message = await generateMessage(
-      phone, first_name, project, budget, size_preference, lead_source
-    );
+    // 2. Build personalised first message
+    const message = generateMessage(first_name, project, budget, size_preference);
 
     console.log(`[Periskope] Message: ${message.slice(0, 100)}...`);
 
