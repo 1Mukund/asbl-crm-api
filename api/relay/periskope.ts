@@ -76,8 +76,8 @@ async function generateMessage(
   const r = await fetch(ANANDITA_URL, {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
-      "x-api-key": ANANDITA_API_KEY,
+      "Content-Type":  "application/json",
+      "Authorization": `Bearer ${ANANDITA_API_KEY}`,
     },
     body: JSON.stringify({ phone: `+${phone}`, message: prompt }),
   });
