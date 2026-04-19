@@ -42,7 +42,7 @@ function detectIntent(message: string): string {
 
   // Site visit intent — physical visit confirmed
   // Includes time-based confirmations like "kal 2 baje", "Sunday aaunga", day+time combos
-  if (/site visit|visit karna|visit krna|aa jaun|aa sakta|aa rha|aa raha|physical|dekhna chahta|dekhna chahti|location|address|kahan hai|kahan h|show flat|flat dikhao|project dikhao|aaunga|aaungi|kal \d|aaj \d|sunday|saturday|monday|tuesday|wednesday|thursday|friday|parso|kal aata|kal aaunga|kal milte|baje aa|baje visit|time confirm|slot confirm|visit confirm|confirmed visit/i.test(msg)) {
+  if (/site visit|visit site|visit karna|visit krna|want to visit|want visit|wanna visit|come visit|aa jaun|aa sakta|aa rha|aa raha|physical|dekhna chahta|dekhna chahti|location|address|kahan hai|kahan h|show flat|flat dikhao|project dikhao|aaunga|aaungi|kal \d|aaj \d|sunday|saturday|monday|tuesday|wednesday|thursday|friday|parso|kal aata|kal aaunga|kal milte|baje aa|baje visit|time confirm|slot confirm|visit confirm|confirmed visit/i.test(msg)) {
     return "site_visit";
   }
 
