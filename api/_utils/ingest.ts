@@ -7,6 +7,14 @@ import {
   updateLead,
 } from "./zoho";
 
+function isValidUrl(url?: string): boolean {
+  if (!url) return false;
+  try {
+    const u = new URL(url);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch { return false; }
+}
+
 export type IngestResult = {
   action: "created" | "updated";
   zoho_lead_id: string;
@@ -55,9 +63,9 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
     Purchase_Purpose: lead.purchase_purpose ?? "",
     Lead_Comments: lead.lead_comments ?? "",
 
-    // Web Tracking
-    First_Page_Visited: lead.first_page_visited ?? "",
-    Last_Page_Visited: lead.last_page_visited ?? "",
+    // Web Tracking — only send valid http/https URLs, else empty string
+    First_Page_Visited: isValidUrl(lead.first_page_visited) ? lead.first_page_visited : "",
+    Last_Page_Visited: isValidUrl(lead.last_page_visited) ? lead.last_page_visited : "",
     Total_Page_Views: lead.total_page_views ?? 0,
     Time_Spent_Minutes: lead.time_spent_minutes ?? 0,
     Referrer_URL: lead.referrer_url ?? "",
