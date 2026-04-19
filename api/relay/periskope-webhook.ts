@@ -19,6 +19,23 @@ const ANANDITA_API_KEY  = process.env.ANANDITA_API_KEY || "asbl_9b9b6b7ff1f758be
 const SUPABASE_URL      = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY      = process.env.SUPABASE_SECRET_KEY || "";
 
+// ── Save message to Supabase ──────────────────────────────────────────────────
+async function saveMessage(phone: string, direction: "inbound" | "outbound", message: string, sender: string): Promise<void> {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "apikey":        SUPABASE_KEY,
+        "Authorization": `Bearer ${SUPABASE_KEY}`,
+      },
+      body: JSON.stringify({ phone, direction, message, sender }),
+    });
+  } catch (err) {
+    console.error("[Periskope Webhook] Failed to save message:", err);
+  }
+}
+
 const SENDER_NUMBERS = [
   "919063141693",
   "917995284040",
@@ -146,6 +163,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     console.log(`[Periskope Webhook] Inbound from ${phone} → org: ${sender} | msg: ${message.slice(0, 80)}`);
 
+    // Save inbound message to Supabase
+    await saveMessage(phone, "inbound", message, sender);
+
     // Call Anandita LLM
     const reply = await callAnandita(phone, message);
     console.log(`[Periskope Webhook] Anandita reply: ${reply.slice(0, 100)}`);
@@ -153,6 +173,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // Send reply via Periskope
     await sendReply(phone, sender, reply);
     console.log(`[Periskope Webhook] Reply sent to ${phone} via ${sender}`);
+
+    // Save outbound reply to Supabase
+    await saveMessage(phone, "outbound", reply, sender);
 
     return res.status(200).json({ success: true, phone, sender });
 

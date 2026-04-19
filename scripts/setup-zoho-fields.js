@@ -72,50 +72,63 @@ const FIELDS_TO_CREATE = [
   { field_label: "Time Spent Minutes",  api_name: "Time_Spent_Minutes",  data_type: "decimal"               },
   { field_label: "Referrer URL",        api_name: "Referrer_URL",        data_type: "text",     length: 500 },
 
-  // AI Calling
+  // ── Call Tracking ──────────────────────────────────────────────────────────
   {
     field_label: "Call Status",
     api_name: "Call_Status",
     data_type: "picklist",
     pick_list_values: [
-      { display_value: "Pending",       sequence_number: 1 },
+      { display_value: "Not Called",    sequence_number: 1 },
       { display_value: "Connected",     sequence_number: 2 },
       { display_value: "Not Connected", sequence_number: 3 },
+      { display_value: "Busy",          sequence_number: 4 },
+      { display_value: "Switched Off",  sequence_number: 5 },
+      { display_value: "Pre Site",      sequence_number: 6 },
+      { display_value: "Virtual Tour",  sequence_number: 7 },
+      { display_value: "Not Interested",sequence_number: 8 },
     ],
   },
-  {
-    field_label: "Call Outcome",
-    api_name: "Call_Outcome",
-    data_type: "picklist",
-    pick_list_values: [
-      { display_value: "Connected",            sequence_number: 1 },
-      { display_value: "Not Connected",        sequence_number: 2 },
-      { display_value: "Pre Site",             sequence_number: 3 },
-      { display_value: "Virtual Walkthrough",  sequence_number: 4 },
-      { display_value: "Share Brochure",       sequence_number: 5 },
-      { display_value: "Call For Other Project", sequence_number: 6 },
-    ],
-  },
-  { field_label: "Last Call Date",      api_name: "Last_Call_Date",      data_type: "datetime"              },
-  { field_label: "Call Duration",       api_name: "Call_Duration",       data_type: "integer"               },
-  { field_label: "Call Summary",        api_name: "Call_Summary",        data_type: "textarea"              },
-  { field_label: "Call History",        api_name: "Call_History",        data_type: "textarea"              },
+  { field_label: "Call Attempt Count",     api_name: "Call_Attempt_Count",     data_type: "integer"  },
+  { field_label: "Last Call At",           api_name: "Last_Call_At",           data_type: "datetime" },
+  { field_label: "Last Arrowhead Call ID", api_name: "Last_Arrowhead_Call_ID", data_type: "text", length: 100 },
+  { field_label: "Call Duration",          api_name: "Call_Duration",          data_type: "integer"  },
+  { field_label: "Call Summary",           api_name: "Call_Summary",           data_type: "textarea" },
 
-  // WhatsApp
+  // ── WhatsApp Tracking ───────────────────────────────────────────────────────
+  { field_label: "WhatsApp Sent",          api_name: "Whatsapp_Sent",          data_type: "boolean"  },
+  { field_label: "WhatsApp Replied",       api_name: "Whatsapp_Replied",       data_type: "boolean"  },
+  { field_label: "Last WhatsApp At",       api_name: "Last_Whatsapp_At",       data_type: "datetime" },
   {
-    field_label: "WhatsApp Status",
-    api_name: "WhatsApp_Status",
+    field_label: "Last Intent",
+    api_name: "Last_Intent",
     data_type: "picklist",
     pick_list_values: [
-      { display_value: "Sent",      sequence_number: 1 },
-      { display_value: "Delivered", sequence_number: 2 },
-      { display_value: "Read",      sequence_number: 3 },
-      { display_value: "Replied",   sequence_number: 4 },
-      { display_value: "No Reply",  sequence_number: 5 },
+      { display_value: "general",       sequence_number: 1 },
+      { display_value: "brochure",      sequence_number: 2 },
+      { display_value: "price",         sequence_number: 3 },
+      { display_value: "call_me",       sequence_number: 4 },
+      { display_value: "site_visit",    sequence_number: 5 },
+      { display_value: "not_interested",sequence_number: 6 },
     ],
   },
-  { field_label: "Last WhatsApp Date",     api_name: "Last_WhatsApp_Date",     data_type: "datetime" },
-  { field_label: "WhatsApp Chat History",  api_name: "WhatsApp_Chat_History",  data_type: "textarea" },
+
+  // ── SFCF Tracking ───────────────────────────────────────────────────────────
+  { field_label: "SFCF Active",        api_name: "SFCF_Active",        data_type: "boolean"  },
+  { field_label: "SFCF Step",          api_name: "SFCF_Step",          data_type: "integer"  },
+  { field_label: "Next Followup At",   api_name: "Next_Followup_At",   data_type: "datetime" },
+
+  // ── Routing ─────────────────────────────────────────────────────────────────
+  { field_label: "Country Code",       api_name: "Country_Code",       data_type: "text", length: 10 },
+  { field_label: "Call Eligible",      api_name: "Call_Eligible",      data_type: "boolean" },
+
+  // ── Documents Sent ───────────────────────────────────────────────────────────
+  { field_label: "Brochure Sent",          api_name: "Brochure_Sent",          data_type: "boolean" },
+  { field_label: "Price Sheet Sent",       api_name: "Price_Sheet_Sent",       data_type: "boolean" },
+  { field_label: "Site Visit Slots Sent",  api_name: "Site_Visit_Slots_Sent",  data_type: "boolean" },
+
+  // ── Priority ─────────────────────────────────────────────────────────────────
+  { field_label: "High Intent",        api_name: "High_Intent",        data_type: "boolean" },
+  { field_label: "High Intent Reason", api_name: "High_Intent_Reason", data_type: "text", length: 200 },
 ];
 
 // ─── Main ────────────────────────────────────────────────────────────────────

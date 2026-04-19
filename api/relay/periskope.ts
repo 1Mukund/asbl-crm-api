@@ -76,6 +76,23 @@ function generateMessage(
   );
 }
 
+// ── Save message to Supabase ──────────────────────────────────────────────────
+async function saveMessage(phone: string, direction: "inbound" | "outbound", message: string, sender: string): Promise<void> {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "apikey":        SUPABASE_KEY,
+        "Authorization": `Bearer ${SUPABASE_KEY}`,
+      },
+      body: JSON.stringify({ phone, direction, message, sender }),
+    });
+  } catch (err) {
+    console.error("[Periskope] Failed to save message:", err);
+  }
+}
+
 // ── Store sender mapping in Supabase ─────────────────────────────────────────
 async function storeSenderMapping(phone: string, sender: string): Promise<void> {
   try {
@@ -149,6 +166,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // Store sender mapping so replies use the same number
     await storeSenderMapping(phone, sender);
+
+    // Save outbound message to Supabase for chat history
+    await saveMessage(phone, "outbound", message, sender);
 
     console.log(`[Periskope] Sent to ${phone} via ${sender}`);
     return res.status(200).json({ success: true, phone, sender, message, ...result });

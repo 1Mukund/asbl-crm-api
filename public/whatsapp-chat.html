@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WhatsApp Chat — ASBL CRM</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #e5ddd5;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Top bar ── */
+    .topbar {
+      background: #075e54;
+      color: white;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 16px;
+      flex-shrink: 0;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+    }
+    .avatar {
+      width: 40px; height: 40px;
+      border-radius: 50%;
+      background: #25d366;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px; font-weight: 700; color: white;
+      flex-shrink: 0;
+    }
+    .topbar-info { flex: 1; }
+    .topbar-name { font-size: 16px; font-weight: 600; }
+    .topbar-phone { font-size: 12px; opacity: 0.8; margin-top: 1px; }
+    .topbar-badge {
+      font-size: 11px; background: #25d366; padding: 3px 8px;
+      border-radius: 12px; font-weight: 600;
+    }
+
+    /* ── Messages area ── */
+    .messages-wrap {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='400' height='400'%3E%3Crect width='400' height='400' fill='%23e5ddd5'/%3E%3C/svg%3E");
+    }
+
+    .date-divider {
+      text-align: center;
+      margin: 8px 0;
+    }
+    .date-divider span {
+      background: rgba(255,255,255,0.85);
+      color: #555;
+      font-size: 12px;
+      padding: 4px 12px;
+      border-radius: 8px;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+    }
+
+    .bubble-row {
+      display: flex;
+      margin: 2px 0;
+    }
+    .bubble-row.outbound { justify-content: flex-end; }
+    .bubble-row.inbound  { justify-content: flex-start; }
+
+    .bubble {
+      max-width: 68%;
+      padding: 8px 10px 6px 10px;
+      border-radius: 8px;
+      font-size: 14px;
+      line-height: 1.45;
+      word-break: break-word;
+      white-space: pre-wrap;
+      position: relative;
+      box-shadow: 0 1px 1px rgba(0,0,0,0.12);
+    }
+
+    .bubble.outbound {
+      background: #dcf8c6;
+      border-top-right-radius: 2px;
+    }
+    .bubble.inbound {
+      background: #fff;
+      border-top-left-radius: 2px;
+    }
+
+    .bubble-time {
+      font-size: 11px;
+      color: #999;
+      text-align: right;
+      margin-top: 4px;
+    }
+    .bubble.outbound .bubble-time { color: #7aa067; }
+
+    /* Tail for bubbles */
+    .bubble-row.outbound .bubble::after {
+      content: "";
+      position: absolute;
+      top: 0; right: -8px;
+      border: 8px solid transparent;
+      border-top-color: #dcf8c6;
+      border-right: 0;
+    }
+    .bubble-row.inbound .bubble::after {
+      content: "";
+      position: absolute;
+      top: 0; left: -8px;
+      border: 8px solid transparent;
+      border-top-color: #fff;
+      border-left: 0;
+    }
+
+    /* ── State screens ── */
+    .state-screen {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      color: #666;
+      padding: 24px;
+    }
+    .state-icon { font-size: 48px; }
+    .state-title { font-size: 18px; font-weight: 600; color: #333; }
+    .state-sub { font-size: 14px; text-align: center; }
+
+    .spinner {
+      width: 36px; height: 36px;
+      border: 3px solid #ddd;
+      border-top-color: #075e54;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Footer ── */
+    .footer {
+      background: #f0f0f0;
+      padding: 8px 16px;
+      font-size: 12px;
+      color: #888;
+      text-align: center;
+      flex-shrink: 0;
+      border-top: 1px solid #ddd;
+    }
+
+    /* ── Refresh button ── */
+    .refresh-btn {
+      background: none; border: none; cursor: pointer;
+      color: rgba(255,255,255,0.8); font-size: 20px;
+      padding: 4px 8px; border-radius: 4px;
+      transition: background 0.2s;
+    }
+    .refresh-btn:hover { background: rgba(255,255,255,0.15); color: white; }
+
+    /* Bold in messages */
+    .bubble b { font-weight: 600; }
+  </style>
+</head>
+<body>
+
+<!-- Top bar -->
+<div class="topbar">
+  <div class="avatar" id="avatar">?</div>
+  <div class="topbar-info">
+    <div class="topbar-name" id="topbar-name">Loading...</div>
+    <div class="topbar-phone" id="topbar-phone"></div>
+  </div>
+  <span class="topbar-badge" id="msg-count" style="display:none"></span>
+  <button class="refresh-btn" onclick="loadMessages()" title="Refresh">↻</button>
+</div>
+
+<!-- Messages / States -->
+<div id="messages-wrap" class="messages-wrap" style="display:none"></div>
+<div id="state-no-phone" class="state-screen" style="display:none">
+  <div class="state-icon">📵</div>
+  <div class="state-title">No phone number</div>
+  <div class="state-sub">Open this page from the lead detail button in Zoho CRM</div>
+</div>
+<div id="state-loading" class="state-screen">
+  <div class="spinner"></div>
+  <div class="state-sub">Loading conversation...</div>
+</div>
+<div id="state-empty" class="state-screen" style="display:none">
+  <div class="state-icon">💬</div>
+  <div class="state-title">No messages yet</div>
+  <div class="state-sub">WhatsApp conversation will appear here once messages are sent or received</div>
+</div>
+<div id="state-error" class="state-screen" style="display:none">
+  <div class="state-icon">⚠️</div>
+  <div class="state-title">Could not load messages</div>
+  <div class="state-sub" id="error-text"></div>
+</div>
+
+<!-- Footer -->
+<div class="footer">
+  Read-only view · Replies handled automatically by Aanandita AI
+</div>
+
+<script>
+  const API_BASE = "https://asbl-crm-api.vercel.app";
+
+  // Parse phone from URL
+  const params = new URLSearchParams(window.location.search);
+  const rawPhone = (params.get("phone") || "").replace(/\D/g, "");
+
+  function showState(id) {
+    ["messages-wrap","state-no-phone","state-loading","state-empty","state-error"]
+      .forEach(s => document.getElementById(s).style.display = "none");
+    document.getElementById(id).style.display = id === "messages-wrap" ? "flex" : "flex";
+    if (id === "messages-wrap") document.getElementById(id).style.display = "flex";
+  }
+
+  function formatTime(iso) {
+    const d = new Date(iso);
+    return d.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true });
+  }
+
+  function formatDate(iso) {
+    const d = new Date(iso);
+    const today = new Date();
+    const yesterday = new Date(today); yesterday.setDate(yesterday.getDate() - 1);
+    if (d.toDateString() === today.toDateString())     return "Today";
+    if (d.toDateString() === yesterday.toDateString()) return "Yesterday";
+    return d.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
+  }
+
+  function renderBold(text) {
+    // WhatsApp *bold* → <b>bold</b>
+    return text.replace(/\*(.*?)\*/g, "<b>$1</b>");
+  }
+
+  function renderMessages(messages) {
+    const wrap = document.getElementById("messages-wrap");
+    wrap.innerHTML = "";
+
+    let lastDate = null;
+    messages.forEach(msg => {
+      const msgDate = formatDate(msg.created_at);
+      if (msgDate !== lastDate) {
+        const div = document.createElement("div");
+        div.className = "date-divider";
+        div.innerHTML = `<span>${msgDate}</span>`;
+        wrap.appendChild(div);
+        lastDate = msgDate;
+      }
+
+      const row = document.createElement("div");
+      row.className = `bubble-row ${msg.direction}`;
+
+      const bubble = document.createElement("div");
+      bubble.className = `bubble ${msg.direction}`;
+      bubble.innerHTML = `${renderBold(msg.message)}<div class="bubble-time">${formatTime(msg.created_at)}</div>`;
+
+      row.appendChild(bubble);
+      wrap.appendChild(row);
+    });
+
+    // Scroll to bottom
+    wrap.scrollTop = wrap.scrollHeight;
+  }
+
+  async function loadMessages() {
+    if (!rawPhone) {
+      showState("state-no-phone");
+      document.getElementById("topbar-name").textContent = "Unknown Lead";
+      return;
+    }
+
+    showState("state-loading");
+
+    try {
+      const r = await fetch(`${API_BASE}/api/whatsapp-history?phone=${rawPhone}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      const messages = data.messages || [];
+
+      // Update topbar
+      const displayPhone = rawPhone.startsWith("91") ? `+${rawPhone}` : `+${rawPhone}`;
+      document.getElementById("topbar-phone").textContent = displayPhone;
+      document.getElementById("avatar").textContent = rawPhone.slice(-2);
+
+      if (messages.length === 0) {
+        showState("state-empty");
+        document.getElementById("topbar-name").textContent = "No Messages";
+        return;
+      }
+
+      document.getElementById("topbar-name").textContent = "WhatsApp Chat";
+      const badge = document.getElementById("msg-count");
+      badge.textContent = `${messages.length} msgs`;
+      badge.style.display = "inline";
+
+      showState("messages-wrap");
+      renderMessages(messages);
+
+    } catch (err) {
+      showState("state-error");
+      document.getElementById("error-text").textContent = err.message || "Unknown error";
+    }
+  }
+
+  // Load on page start
+  loadMessages();
+
+  // Auto-refresh every 30 seconds
+  setInterval(loadMessages, 30000);
+</script>
+</body>
+</html>

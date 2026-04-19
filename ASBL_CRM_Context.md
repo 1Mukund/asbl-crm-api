@@ -270,6 +270,7 @@ Handles ALL customer interaction — no Gemini, no separate intent detection.
 
 ## 10. Pending Tasks
 
+
 - [x] LazyBot: Deployed on Render, AI reply working ✅
 - [ ] LazyBot API Key: Get from dashboard → needed for Zoho integration
 - [ ] Zoho → LazyBot: Call Not Connected → auto-send WhatsApp (via Vercel relay)
