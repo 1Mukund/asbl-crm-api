@@ -16,98 +16,78 @@ const SUPABASE_KEY       = process.env.SUPABASE_SECRET_KEY || "";
 const PERISKOPE_API_KEY  = process.env.PERISKOPE_API_KEY || "";
 const PERISKOPE_API_URL  = "https://api.periskope.app/v1/messages/send";
 
-// ── 10 follow-up messages — Hyderabad real estate market facts ──────────────
-// All from Anandita, conversational Hindi/English mix, no fabricated prices
+// ── 10 follow-up messages — FOMO-based, no specific prices or market data ────
+// From Anandita — short, conversational, Hindi/English mix
 const FOLLOWUP_MESSAGES: string[] = [
   // Day 1
   `Hi! Main Aanandita hoon, ASBL se. 😊
 
-Sirf ek market update share karna chahti thi — Hyderabad abhi India ka *sabse bada GCC hub* ban gaya hai. Microsoft, Google, Amazon, Meta — 200+ global companies ne yahan apne Global Capability Centres khole hain.
+Bas ek quick update dena chahti thi — abhi ASBL Loft pe ek *exciting offer chal raha hai*. Details share karungi jab baat ho, lekin yeh offer limited time ke liye hai.
 
-Iska seedha impact residential demand pe padta hai — in offices ke aaspaas achhe homes ki zaroorat badh rahi hai.
-
-Koi sawaal ho to reply karein, main hoon yahan! 🏠`,
+Interested hain to ek baar reply zaroor karein! 🏠`,
 
   // Day 2
   `Namaste! Aanandita yahan. 🙏
 
-Aaj TDR ke baare mein batana chahti thi — *Transfer of Development Rights* Telangana mein ek powerful policy hai jo builders ko city ke certain zones mein zyada floor space deta hai. Iska matlab — premium locations mein limited supply rehti hai, aur jo projects ban bhi rahe hain woh zyada carefully planned hote hain.
+Suna hai aap ASBL Loft mein interested hain — aaj batana chahti thi ki abhi jo *pricing chal rahi hai*, woh bahut acha deal hai. Bohot log is price point pe booking kar rahe hain.
 
-ASBL ke projects isi planning ke saath bane hain.
-
-Koi cheez poochni ho? 😊`,
+Ek baar baat karte hain? Reply karein! 😊`,
 
   // Day 3
   `Hi! Aanandita here.
 
-Ek interesting fact — Hyderabad ka *Outer Ring Road (ORR)* corridor India ke fastest-growing real estate micro-markets mein se ek hai. Kokapet, Narsingi, Financial District — yeh sab ORR ke saath connected hain.
+ASBL Loft mein *1695 sq ft west facing units* abhi bahut tezi se bik rahi hain. Yeh size aur facing combination limited hai — jo jaldi decide karta hai usko milta hai.
 
-Connectivity jo pehle issue thi, ab woh strength ban gayi hai is area ki.
-
-ASBL ke projects isi corridor pe hain. Kuch aur jaanna ho to batao! 🏙️`,
+Aapke liye hold karwa sakti hoon — batao! 🏠`,
 
   // Day 4
   `Namaste! Aanandita here. 😊
 
-Kya aap jaante hain — Hyderabad India ke *top rental yield cities* mein consistently aata hai? HITEC City aur Financial District ke aaspaas rental demand IT professionals ki wajah se har saal strong rehti hai.
+Just checking in — ASBL Loft pe *current offer* aur kuch din hi hai. Price aur terms dono bahut favorable hain abhi.
 
-Jo log investment ke liye soch rahe hain — rental income ek steady return deta hai yahan.
-
-Koi query ho to zaroor reply karein!`,
+Koi bhi sawaal ho — call karein ya reply karein, main hoon yahan!`,
 
   // Day 5
-  `Hi! Main Aanandita — ASBL.
+  `Hi! Main Aanandita — ASBL se.
 
-Aaj Hyderabad ke *Pharma City* ke baare mein — yeh Asia ka sabse bada pharma cluster banne ki raah pe hai. 15,000+ acres ka project, lakhs jobs create karega. Yeh poora corridor — Shamshabad se Mucherla tak — infrastructure ke mamle mein rapidly develop ho raha hai.
+Aaj specially isliye message kar rahi hoon ki *west facing 1695 sq ft* mein se kuch units hi bacha hain. Is size ki demand bahut zyada hai Loft mein.
 
-Real estate mein long-term value employment hubs ke aaspaas banti hai. Yeh ek aisi location hai.
-
-Koi sawaal? Main hoon yahan! 🙂`,
+Agar serious hain to abhi baat karte hain — warna yeh units nahi milenge. 🙏`,
 
   // Day 6
-  `Namaste! Aanandita here.
+  `Namaste! Aanandita yahan.
 
-Ek aur interesting development — Hyderabad mein *Metro Phase 2* ka expansion plan approved hai. New corridors connect karenge HITEC City ko aur bhi areas se. Infrastructure investment ka real estate pe direct positive impact padta hai — yeh globally proven hai.
+ASBL Loft mein jo *special pricing* chal rahi hai — woh sirf kuch bookings ke liye aur available hai. Uske baad normal price pe jaayega.
 
-ASBL ke projects in well-connected locations mein hain.
-
-Reply karein — main personally help karunga/karoongi! 🚇`,
+Ek baar milte hain ya call karte hain? Reply karein! 😊`,
 
   // Day 7
-  `Hi! Aanandita yahan. 😊
+  `Hi! Aanandita here. 🏠
 
-EY, Deloitte, JP Morgan, HSBC — India ke bade financial aur consulting firms ne Hyderabad mein apne operations *significantly expand* kiye hain last few years mein. Yeh sirf IT nahi — diversification ho rahi hai economy ki.
+Last few days mein *kaafi bookings* ho gayi hain ASBL Loft mein. Floor plan aur unit selection abhi bhi hai, lekin jaldi decision lena theek rahega.
 
-Iska matlab job creation aur housing demand dono sustained rahenge.
-
-Koi bhi cheez poochni ho ASBL projects ke baare mein — reply karein! 🏠`,
+Koi doubt ya sawaal ho — seedha reply karein, main personally handle karungi!`,
 
   // Day 8
   `Namaste! Aanandita here.
 
-Aaj *NRI investment* ke baare mein — Hyderabad consistently top NRI real estate investment destinations mein aata hai. Stable governance, world-class infrastructure, aur cosmopolitan culture — yeh factors globally Indians ko attract karte hain.
+Bas ek baar aur remind karna chahti thi — ASBL Loft ka *current offer* close hone wala hai. Iske baad same deal milna mushkil hoga.
 
-Iska matlab — is market mein strong external demand bhi hai, sirf local nahi.
-
-Koi sawaal ho to batao! 🌍`,
+Abhi baat karein? 🙏`,
 
   // Day 9
-  `Hi! Aanandita yahan — ASBL se.
+  `Hi! Aanandita yahan — ASBL se. 😊
 
-Telangana government ki *IT export policy* aur ease of doing business ranking consistently improve ho rahi hai. State mein investment aata hai to jobs aate hain, jobs aate hain to housing demand badhti hai — yeh simple equation hai.
+*1695 west facing* — yeh unit specifically bahut popular hai. Agar aap consider kar rahe hain to please ek baar baat karte hain, main poori detail clearly explain karungi bina kisi pressure ke.
 
-Hyderabad is cycle mein ek stable, growing market hai.
-
-Main chahti hoon ki aap informed decision lein — koi bhi cheez poochni ho, reply karein! 😊`,
+Reply ka wait karungi! 🏠`,
 
   // Day 10
   `Namaste! Main Aanandita — ASBL.
 
-Yeh mera aakhri follow-up hai. Main sirf itna kehna chahti thi — main genuinely help karna chahti hoon, koi pressure nahi.
+Yeh mera aakhri follow-up hai. Koi pressure nahi — bas itna kehna tha ki agar kabhi bhi ASBL Loft ke baare mein baat karni ho, main available hoon.
 
-Agar abhi ready nahi hain — bilkul theek hai. Agar koi doubt hai, ya sirf samajhna chahte hain ki ASBL kya offer karta hai aur Hyderabad market ke baare mein — ek baar reply karein, 5 minutes ki baat hai.
-
-Hoon yahan jab bhi zaroorat ho! 🙏🏠`,
+*Offer abhi bhi chal raha hai* — jab ready ho, reply karein. Hoon yahan! 🙏`,
 ];
 
 // ── Supabase helpers ──────────────────────────────────────────────────────────
