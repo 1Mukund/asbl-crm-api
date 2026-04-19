@@ -25,48 +25,57 @@ const ZOHO_CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET || "";
 const ZOHO_REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN || "";
 const ZOHO_API_BASE      = "https://www.zohoapis.in/crm/v3";
 
-// ── Intent detection ──────────────────────────────────────────────────────────
-// Returns one of: not_interested | site_visit | price | brochure | call_me | general
-function detectIntent(message: string): string {
-  const msg = message.toLowerCase();
+// ── Intent classification via LLM ────────────────────────────────────────────
+// Uses Anandita LLM to semantically classify customer intent.
+// No regex — handles any phrasing in Hindi, English, or Hinglish.
+async function classifyIntent(message: string): Promise<string> {
+  const VALID_INTENTS = ["site_visit", "virtual_tour", "not_interested", "price", "brochure", "call_me", "general"];
 
-  // Not interested — negative signals
-  if (/not interested|nahi chahiye|nhi chahiye|nahin chahiye|interested nahi|interest nahi|band karo|mat karo|mujhe nahi|mujhe nhi|no thanks|don't contact|do not contact|stop|unsubscribe|remove me|bura|galat|spam/i.test(msg)) {
-    return "not_interested";
-  }
+  const classificationPrompt = `You are an intent classifier for a real estate company's WhatsApp bot in India. Customers speak Hindi, English, or Hinglish.
 
-  // Virtual tour intent — check BEFORE site_visit
-  if (/virtual tour|virtual visit|online tour|online dekh|zoom|video call|video pe dikhao|virtually|virtual/i.test(msg)) {
-    return "virtual_tour";
-  }
+Classify this customer message into EXACTLY ONE of these intents:
+- site_visit: wants to physically come and see the property/project
+- virtual_tour: wants online viewing, video call, virtual walkthrough
+- not_interested: wants to stop communication, not interested
+- price: asking about price, cost, EMI, budget, loan
+- brochure: wants brochure, PDF, floor plan, project details sent
+- call_me: wants a callback or phone call
+- general: anything else — general interest, questions, greetings
 
-  // Site visit intent — physical visit confirmed
-  // Includes time-based confirmations like "kal 2 baje", "Sunday aaunga", day+time combos
-  if (/site visit|visit site|visit karna|visit krna|want to visit|want visit|wanna visit|come visit|aa jaun|aa sakta|aa rha|aa raha|physical|dekhna chahta|dekhna chahti|location|address|kahan hai|kahan h|show flat|flat dikhao|project dikhao|aaunga|aaungi|kal \d|aaj \d|sunday|saturday|monday|tuesday|wednesday|thursday|friday|parso|kal aata|kal aaunga|kal milte|baje aa|baje visit|time confirm|slot confirm|visit confirm|confirmed visit/i.test(msg)) {
-    return "site_visit";
-  }
+Customer message: "${message.replace(/"/g, "'")}"
 
-  // Price intent
-  if (/price|cost|rate|kitna|budget|amount|kitne ka|kitne mein|kaafi mehnga|affordable|emi|loan/i.test(msg)) {
-    return "price";
-  }
+Reply with ONLY the intent label. Nothing else. No explanation.`;
 
-  // Brochure intent
-  if (/brochure|pdf|details|information|info bhejo|send|bhej do|share karo/i.test(msg)) {
-    return "brochure";
-  }
+  try {
+    const r = await fetch(ANANDITA_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "Authorization": `Bearer ${ANANDITA_API_KEY}`,
+      },
+      body: JSON.stringify({
+        phone:   "+910000000001", // dedicated classification phone (no history)
+        message: classificationPrompt,
+      }),
+    });
 
-  // Call me intent
-  if (/call karo|call me|call krna|phone karo|baat karna|baat krni|call back|callback/i.test(msg)) {
-    return "call_me";
-  }
+    if (!r.ok) throw new Error(`LLM ${r.status}`);
 
-  // Positive general interest
-  if (/haan|ha |yes|interested|batao|bataiye|theek hai|thik hai|okay|ok|acha|accha|sure|zaroor/i.test(msg)) {
+    const data = await r.json() as any;
+    const raw  = (data?.message || data?.reply || "").trim().toLowerCase();
+
+    // Find which valid intent appears in the response
+    for (const intent of VALID_INTENTS) {
+      if (raw.includes(intent)) return intent;
+    }
+
+    console.log(`[Intent] LLM returned unexpected: "${raw}", defaulting to general`);
+    return "general";
+
+  } catch (err: any) {
+    console.error(`[Intent] LLM classification failed: ${err.message}, defaulting to general`);
     return "general";
   }
-
-  return "general";
 }
 
 // ── Zoho: Get access token ─────────────────────────────────────────────────────
@@ -241,9 +250,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     console.log(`[Periskope Webhook] Inbound from ${phone} | msg: ${message.slice(0, 80)}`);
 
-    // 1. Detect intent
-    const intent = detectIntent(message);
-    console.log(`[Periskope Webhook] Intent detected: ${intent}`);
+    // 1. Classify intent via LLM (handles any phrasing — Hindi, English, Hinglish)
+    const intent = await classifyIntent(message);
+    console.log(`[Periskope Webhook] Intent classified: ${intent}`);
 
     // 2. Save inbound message to Supabase
     await saveMessage(phone, "inbound", message, sender);
