@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>ASBL — Meta Leads Upload</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f6fa; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 32px 16px; }
+
+    .card { background: white; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); padding: 32px; width: 100%; max-width: 680px; }
+
+    .logo { font-size: 22px; font-weight: 700; color: #1a1a2e; margin-bottom: 4px; }
+    .logo span { color: #e63946; }
+    .subtitle { font-size: 13px; color: #888; margin-bottom: 28px; }
+
+    /* Drop zone */
+    .dropzone {
+      border: 2px dashed #d0d7de;
+      border-radius: 10px;
+      padding: 40px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s;
+      background: #fafbfc;
+    }
+    .dropzone:hover, .dropzone.drag { border-color: #2563eb; background: #eff6ff; }
+    .dropzone svg { opacity: 0.4; margin-bottom: 12px; }
+    .dropzone .drop-text { font-size: 15px; color: #444; margin-bottom: 6px; }
+    .dropzone .drop-hint { font-size: 12px; color: #888; }
+    .dropzone input { display: none; }
+    .browse-btn {
+      display: inline-block; margin-top: 14px;
+      background: #2563eb; color: white;
+      padding: 8px 20px; border-radius: 6px;
+      font-size: 13px; cursor: pointer;
+      transition: background 0.2s;
+    }
+    .browse-btn:hover { background: #1d4ed8; }
+
+    /* File selected */
+    .file-info {
+      display: none;
+      margin-top: 16px;
+      background: #f0f9ff;
+      border: 1px solid #bae6fd;
+      border-radius: 8px;
+      padding: 12px 16px;
+      display: none;
+      align-items: center;
+      gap: 12px;
+    }
+    .file-info .fname { font-size: 14px; font-weight: 500; color: #0369a1; flex: 1; }
+    .file-info .fmeta { font-size: 12px; color: #888; }
+    .remove-btn { background: none; border: none; cursor: pointer; color: #888; font-size: 18px; }
+
+    /* Preview table */
+    .preview-section { display: none; margin-top: 20px; }
+    .preview-section h3 { font-size: 13px; color: #666; margin-bottom: 8px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+    .preview-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .preview-table th { background: #f8f9fa; padding: 8px 10px; text-align: left; border-bottom: 2px solid #e9ecef; color: #555; font-weight: 600; }
+    .preview-table td { padding: 8px 10px; border-bottom: 1px solid #f0f0f0; color: #333; }
+    .preview-table tr:last-child td { border-bottom: none; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .badge-loft { background: #fef3c7; color: #92400e; }
+    .badge-spectra { background: #ede9fe; color: #5b21b6; }
+    .badge-broadway { background: #dcfce7; color: #166534; }
+    .badge-landmark { background: #fce7f3; color: #9d174d; }
+    .badge-legacy { background: #e0f2fe; color: #0c4a6e; }
+    .badge-unknown { background: #f3f4f6; color: #6b7280; }
+
+    /* Upload btn */
+    .upload-btn {
+      display: none;
+      width: 100%; margin-top: 20px;
+      background: #16a34a; color: white;
+      border: none; border-radius: 8px;
+      padding: 14px; font-size: 15px; font-weight: 600;
+      cursor: pointer; transition: background 0.2s;
+    }
+    .upload-btn:hover { background: #15803d; }
+    .upload-btn:disabled { background: #aaa; cursor: not-allowed; }
+
+    /* Progress */
+    .progress-section { display: none; margin-top: 20px; }
+    .progress-bar-wrap { background: #e9ecef; border-radius: 100px; height: 8px; overflow: hidden; margin-bottom: 8px; }
+    .progress-bar { height: 100%; background: #16a34a; border-radius: 100px; width: 0%; transition: width 0.3s; }
+    .progress-text { font-size: 13px; color: #666; text-align: center; }
+
+    /* Results */
+    .results-section { display: none; margin-top: 20px; }
+    .summary-boxes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 16px; }
+    .summary-box { background: #f8f9fa; border-radius: 8px; padding: 14px; text-align: center; }
+    .summary-box .num { font-size: 28px; font-weight: 700; }
+    .summary-box .lbl { font-size: 12px; color: #888; margin-top: 2px; }
+    .summary-box.created .num { color: #16a34a; }
+    .summary-box.updated .num { color: #2563eb; }
+    .summary-box.error .num { color: #dc2626; }
+
+    .result-rows { max-height: 260px; overflow-y: auto; }
+    .result-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
+    .result-row:last-child { border-bottom: none; }
+    .result-icon { font-size: 16px; flex-shrink: 0; }
+    .result-name { flex: 1; font-weight: 500; }
+    .result-phone { color: #888; font-size: 12px; }
+    .result-action { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; }
+    .action-created { background: #dcfce7; color: #166534; }
+    .action-updated { background: #dbeafe; color: #1e40af; }
+    .action-error { background: #fee2e2; color: #991b1b; }
+    .action-skipped { background: #f3f4f6; color: #6b7280; }
+
+    .upload-again-btn {
+      width: 100%; margin-top: 16px;
+      background: #f8f9fa; color: #444;
+      border: 1px solid #ddd; border-radius: 8px;
+      padding: 10px; font-size: 14px; cursor: pointer;
+      transition: background 0.2s;
+    }
+    .upload-again-btn:hover { background: #e9ecef; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">ASBL <span>CRM</span></div>
+    <div class="subtitle">Meta Leads Upload — FIM Forms</div>
+
+    <!-- Drop Zone -->
+    <div class="dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()"
+      ondragover="event.preventDefault();this.classList.add('drag')"
+      ondragleave="this.classList.remove('drag')"
+      ondrop="handleDrop(event)">
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z" stroke="#555" stroke-width="1.5" fill="none"/>
+        <path d="M14 2v6h6M12 18v-6M9 15l3-3 3 3" stroke="#555" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+      <div class="drop-text">Drop your Meta CSV file here</div>
+      <div class="drop-hint">Download from Meta Ads Manager → Leads Center → Export</div>
+      <div class="browse-btn">Browse File</div>
+      <input type="file" id="fileInput" accept=".csv" onchange="handleFile(this.files[0])"/>
+    </div>
+
+    <!-- File Info -->
+    <div class="file-info" id="fileInfo">
+      <span style="font-size:20px">📄</span>
+      <div style="flex:1">
+        <div class="fname" id="fileName"></div>
+        <div class="fmeta" id="fileMeta"></div>
+      </div>
+      <button class="remove-btn" onclick="resetAll()">✕</button>
+    </div>
+
+    <!-- Preview -->
+    <div class="preview-section" id="previewSection">
+      <h3 id="previewTitle">Preview</h3>
+      <table class="preview-table">
+        <thead><tr>
+          <th>Name</th><th>Phone</th><th>Project</th><th>Budget</th><th>Size</th>
+        </tr></thead>
+        <tbody id="previewBody"></tbody>
+      </table>
+    </div>
+
+    <!-- Upload Button -->
+    <button class="upload-btn" id="uploadBtn" onclick="uploadLeads()">
+      Upload Leads to CRM →
+    </button>
+
+    <!-- Progress -->
+    <div class="progress-section" id="progressSection">
+      <div class="progress-bar-wrap"><div class="progress-bar" id="progressBar"></div></div>
+      <div class="progress-text" id="progressText">Uploading...</div>
+    </div>
+
+    <!-- Results -->
+    <div class="results-section" id="resultsSection">
+      <div class="summary-boxes">
+        <div class="summary-box created"><div class="num" id="numCreated">0</div><div class="lbl">Created</div></div>
+        <div class="summary-box updated"><div class="num" id="numUpdated">0</div><div class="lbl">Updated</div></div>
+        <div class="summary-box error"><div class="num" id="numErrors">0</div><div class="lbl">Errors</div></div>
+      </div>
+      <div class="result-rows" id="resultRows"></div>
+      <button class="upload-again-btn" onclick="resetAll()">Upload Another File</button>
+    </div>
+  </div>
+
+<script>
+let parsedRows = [];
+
+function handleDrop(e) {
+  e.preventDefault();
+  document.getElementById('dropzone').classList.remove('drag');
+  const file = e.dataTransfer.files[0];
+  if (file) handleFile(file);
+}
+
+function handleFile(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      // Try UTF-16 first, then UTF-8
+      parseCSV(e.target.result, file);
+    } catch(err) {
+      alert('Could not parse CSV: ' + err.message);
+    }
+  };
+  // Meta exports are UTF-16 LE
+  reader.readAsText(file, 'UTF-16');
+}
+
+function parseCSV(text, file) {
+  // Split by lines
+  const lines = text.split(/\r?\n/).filter(l => l.trim());
+  if (lines.length < 2) throw new Error('CSV has no data rows');
+
+  // Detect delimiter (tab for Meta exports)
+  const delim = lines[0].includes('\t') ? '\t' : ',';
+
+  function parseLine(line) {
+    const results = [];
+    let cur = '', inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (c === '"' && line[i+1] === '"') { cur += '"'; i++; }
+      else if (c === '"') { inQ = !inQ; }
+      else if (c === delim && !inQ) { results.push(cur.trim()); cur = ''; }
+      else { cur += c; }
+    }
+    results.push(cur.trim());
+    return results;
+  }
+
+  const headers = parseLine(lines[0]).map(h => h.replace(/^"(.*)"$/, '$1').trim());
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const vals = parseLine(lines[i]);
+    if (vals.length < 3) continue;
+    const row = {};
+    headers.forEach((h, idx) => row[h] = (vals[idx] || '').replace(/^"(.*)"$/, '$1').trim());
+    rows.push(row);
+  }
+
+  parsedRows = rows;
+  showFileInfo(file, rows.length);
+  showPreview(rows);
+}
+
+function normalizePhone(raw) {
+  const digits = raw.replace(/\D/g, '');
+  if (digits.length === 10) return '91' + digits;
+  if (digits.length === 12 && digits.startsWith('91')) return digits;
+  return digits;
+}
+
+function detectProject(texts) {
+  const t = texts.join(' ').toLowerCase();
+  if (t.includes('loft')) return 'LOFT';
+  if (t.includes('spectra')) return 'SPECTRA';
+  if (t.includes('broadway')) return 'BROADWAY';
+  if (t.includes('landmark')) return 'LANDMARK';
+  if (t.includes('legacy')) return 'LEGACY';
+  return null;
+}
+
+function cleanBudget(raw) {
+  return raw.replace(/_/g,' ').replace(/\s+/g,' ').replace(/cr\b/gi,'Cr').trim();
+}
+
+function projectBadge(p) {
+  if (!p) return '<span class="badge badge-unknown">Unknown</span>';
+  return `<span class="badge badge-${p.toLowerCase()}">${p}</span>`;
+}
+
+function showFileInfo(file, count) {
+  document.getElementById('fileInfo').style.display = 'flex';
+  document.getElementById('fileName').textContent = file.name;
+  document.getElementById('fileMeta').textContent = `${count} lead${count !== 1 ? 's' : ''} found`;
+}
+
+function showPreview(rows) {
+  const tbody = document.getElementById('previewBody');
+  const preview = rows.slice(0, 5);
+  tbody.innerHTML = preview.map(row => {
+    const phone = normalizePhone(row['phone'] || '');
+    const project = detectProject([row['campaign_name']||'', row['ad_name']||'', row['form_name']||'']);
+    const budget = cleanBudget(row['what_is_your_preffered_budget?'] || row['budget'] || '—');
+    const size = (row['what_is_your_sft_requirement?'] || row['size'] || '—').replace(/_/g,' ');
+    return `<tr>
+      <td>${(row['full_name']||'').trim() || '—'}</td>
+      <td>${phone || '—'}</td>
+      <td>${projectBadge(project)}</td>
+      <td>${budget || '—'}</td>
+      <td>${size}</td>
+    </tr>`;
+  }).join('');
+  if (rows.length > 5) {
+    tbody.innerHTML += `<tr><td colspan="5" style="text-align:center;color:#888;font-style:italic">... and ${rows.length - 5} more</td></tr>`;
+  }
+  document.getElementById('previewSection').style.display = 'block';
+  document.getElementById('previewTitle').textContent = `Preview (${rows.length} leads)`;
+  document.getElementById('uploadBtn').style.display = 'block';
+}
+
+async function uploadLeads() {
+  if (!parsedRows.length) return;
+  const btn = document.getElementById('uploadBtn');
+  btn.disabled = true;
+  document.getElementById('progressSection').style.display = 'block';
+
+  const results = [];
+  for (let i = 0; i < parsedRows.length; i++) {
+    const pct = Math.round(((i) / parsedRows.length) * 100);
+    document.getElementById('progressBar').style.width = pct + '%';
+    document.getElementById('progressText').textContent = `Uploading ${i + 1} of ${parsedRows.length}...`;
+
+    try {
+      const r = await fetch('/api/ingest/fim', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(parsedRows[i]),
+      });
+      const data = await r.json();
+      if (data.results && data.results[0]) results.push(data.results[0]);
+      else results.push({ status: 'error', reason: data.error || 'Unknown', name: parsedRows[i]['full_name'] });
+    } catch(err) {
+      results.push({ status: 'error', reason: err.message, name: parsedRows[i]['full_name'] });
+    }
+  }
+
+  document.getElementById('progressBar').style.width = '100%';
+  document.getElementById('progressText').textContent = 'Done!';
+  setTimeout(() => showResults(results), 500);
+}
+
+function showResults(results) {
+  document.getElementById('progressSection').style.display = 'none';
+  document.getElementById('resultsSection').style.display = 'block';
+
+  const created = results.filter(r => r.action === 'created').length;
+  const updated = results.filter(r => r.action === 'updated').length;
+  const errors  = results.filter(r => r.status === 'error').length;
+
+  document.getElementById('numCreated').textContent = created;
+  document.getElementById('numUpdated').textContent = updated;
+  document.getElementById('numErrors').textContent = errors;
+
+  const rows = document.getElementById('resultRows');
+  rows.innerHTML = results.map(r => {
+    const icon = r.status === 'error' ? '❌' : r.action === 'created' ? '✅' : '🔄';
+    const actionCls = r.status === 'error' ? 'action-error' : r.action === 'created' ? 'action-created' : r.action === 'updated' ? 'action-updated' : 'action-skipped';
+    const actionText = r.status === 'error' ? 'Error' : r.action === 'created' ? 'Created' : r.action === 'updated' ? 'Updated' : 'Skipped';
+    const detail = r.status === 'error' ? `<span style="color:#dc2626;font-size:11px">${r.reason||''}</span>` : `<span class="result-phone">${r.phone || ''} · ${r.plid || ''}</span>`;
+    return `<div class="result-row">
+      <span class="result-icon">${icon}</span>
+      <div style="flex:1">
+        <div class="result-name">${r.name || r.source_id || '—'}</div>
+        ${detail}
+      </div>
+      <span class="result-action ${actionCls}">${actionText}</span>
+    </div>`;
+  }).join('');
+}
+
+function resetAll() {
+  parsedRows = [];
+  document.getElementById('fileInput').value = '';
+  document.getElementById('fileInfo').style.display = 'none';
+  document.getElementById('previewSection').style.display = 'none';
+  document.getElementById('uploadBtn').style.display = 'none';
+  document.getElementById('uploadBtn').disabled = false;
+  document.getElementById('progressSection').style.display = 'none';
+  document.getElementById('resultsSection').style.display = 'none';
+}
+</script>
+</body>
+</html>
