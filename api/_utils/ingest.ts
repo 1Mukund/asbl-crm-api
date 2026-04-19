@@ -91,6 +91,10 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
   } else {
     zohoLeadId = await createLead(zohoPayload);
     action = "created";
+    // Zoho sometimes ignores custom fields in POST — patch Born_Date separately
+    if (zohoPayload.Born_Date) {
+      await updateLead(zohoLeadId, { Born_Date: zohoPayload.Born_Date }).catch(() => {});
+    }
   }
 
   // ── Step 4: Store in Supabase (source of truth + safety net) ─────────────
