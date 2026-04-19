@@ -53,6 +53,8 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
     UTM_Content: lead.utm_content ?? "",
     UTM_Term: lead.utm_term ?? "",
     Lead_Received_At: lead.lead_received_at.replace(/\.\d{3}Z$/, "+00:00"),
+    // Born Date = date lead entered CRM (YYYY-MM-DD format for Zoho date field)
+    Born_Date: lead.lead_received_at.slice(0, 10),
 
     // Project & Interest
     ASBL_Project: lead.project ?? "",
