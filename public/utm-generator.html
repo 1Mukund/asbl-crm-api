@@ -9,170 +9,310 @@
 
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: #f5f6fa;
-      color: #333;
+      background: #f0f2f5;
+      color: #1a1a2e;
       min-height: 100vh;
-      padding: 24px 16px;
     }
 
-    .container { max-width: 780px; margin: 0 auto; }
-
-    header {
+    /* ── Top Nav ── */
+    .topbar {
+      background: #fff;
+      border-bottom: 1px solid #e8eaed;
+      padding: 0 32px;
+      height: 60px;
       display: flex;
       align-items: center;
-      gap: 12px;
-      margin-bottom: 28px;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06);
     }
-    .logo {
-      width: 38px; height: 38px;
-      background: linear-gradient(135deg, #1a3c5e, #2e7d5e);
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .topbar-logo {
+      width: 40px;
+      height: 40px;
       border-radius: 8px;
-      display: flex; align-items: center; justify-content: center;
-      color: #fff; font-weight: 800; font-size: 14px; letter-spacing: 0.5px;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #f5f5f5;
     }
-    header h1 { font-size: 20px; font-weight: 700; color: #1a3c5e; }
-    header p { font-size: 12px; color: #888; margin-top: 2px; }
+    .topbar-logo img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+    .topbar-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: #1a1a2e;
+      letter-spacing: -0.3px;
+    }
+    .topbar-sub {
+      font-size: 11px;
+      color: #888;
+      margin-top: 1px;
+    }
+    .topbar-badge {
+      background: #e8f5e9;
+      color: #2e7d32;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 20px;
+      border: 1px solid #c8e6c9;
+    }
 
+    /* ── Main Layout ── */
+    .main {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 28px 20px 40px;
+    }
+
+    /* ── Section Label ── */
+    .section-label {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1.2px;
+      color: #999;
+      margin-bottom: 10px;
+      padding-left: 2px;
+    }
+
+    /* ── Card ── */
     .card {
       background: #fff;
-      border-radius: 12px;
-      padding: 24px;
-      box-shadow: 0 1px 4px rgba(0,0,0,0.08);
-      margin-bottom: 20px;
-    }
-    .card-title {
-      font-size: 13px; font-weight: 600; color: #888;
-      text-transform: uppercase; letter-spacing: 0.8px;
-      margin-bottom: 18px;
+      border-radius: 14px;
+      padding: 22px 24px;
+      margin-bottom: 16px;
+      border: 1px solid #e8eaed;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.05);
     }
 
-    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-    .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+    /* ── Grid ── */
+    .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 
-    .field { display: flex; flex-direction: column; gap: 6px; }
-    .field label { font-size: 12px; font-weight: 600; color: #555; }
-    .field select, .field input {
-      height: 40px;
+    /* ── Field ── */
+    .field { display: flex; flex-direction: column; gap: 5px; }
+    .field label {
+      font-size: 11px;
+      font-weight: 600;
+      color: #555;
+      letter-spacing: 0.2px;
+    }
+    .required-star { color: #e53935; margin-left: 2px; }
+
+    .field select,
+    .field input {
+      height: 42px;
       border: 1.5px solid #e2e6ea;
-      border-radius: 8px;
-      padding: 0 12px;
+      border-radius: 9px;
+      padding: 0 14px;
       font-size: 13px;
       color: #222;
       background: #fafbfc;
-      transition: border-color 0.15s;
+      transition: border-color 0.15s, box-shadow 0.15s;
+      width: 100%;
+    }
+    .field select {
       appearance: none;
       -webkit-appearance: none;
-      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%23999' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='11' height='7' viewBox='0 0 11 7'%3E%3Cpath d='M1 1l4.5 4.5L10 1' stroke='%23aaa' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
       background-repeat: no-repeat;
       background-position: right 12px center;
+      padding-right: 32px;
     }
-    .field input {
-      background-image: none;
-    }
-    .field select:focus, .field input:focus {
+    .field select:focus,
+    .field input:focus {
       outline: none;
-      border-color: #2e7d5e;
-      background-color: #fff;
+      border-color: #1565c0;
+      box-shadow: 0 0 0 3px rgba(21,101,192,0.08);
+      background: #fff;
     }
-    .field select.required-empty { border-color: #e74c3c; }
 
-    /* Output section */
-    .output-box {
-      background: #f0f7f4;
-      border: 1.5px solid #2e7d5e;
-      border-radius: 10px;
-      padding: 16px 18px;
+    /* ── Output ── */
+    .output-card {
+      background: linear-gradient(135deg, #1a237e 0%, #1565c0 100%);
+      border-radius: 14px;
+      padding: 22px 24px;
+      margin-bottom: 16px;
       position: relative;
+      overflow: hidden;
+    }
+    .output-card::before {
+      content: '';
+      position: absolute;
+      top: -40px; right: -40px;
+      width: 160px; height: 160px;
+      background: rgba(255,255,255,0.04);
+      border-radius: 50%;
     }
     .output-label {
-      font-size: 11px; font-weight: 700; color: #2e7d5e;
-      text-transform: uppercase; letter-spacing: 0.8px;
-      margin-bottom: 8px;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1.2px;
+      color: rgba(255,255,255,0.55);
+      margin-bottom: 10px;
+    }
+    .output-url-wrap {
+      background: rgba(255,255,255,0.1);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 10px;
+      padding: 14px 16px;
+      min-height: 52px;
+      display: flex;
+      align-items: center;
+      margin-bottom: 14px;
     }
     #output-url {
-      font-size: 13px; color: #1a3c5e; word-break: break-all;
-      line-height: 1.6; min-height: 40px;
+      font-size: 13px;
+      line-height: 1.6;
+      word-break: break-all;
+      color: #fff;
+      flex: 1;
     }
-    #output-url.empty { color: #aaa; font-style: italic; }
+    #output-url.empty {
+      color: rgba(255,255,255,0.35);
+      font-style: italic;
+      font-size: 12.5px;
+    }
 
     .copy-btn {
-      position: absolute; top: 14px; right: 14px;
-      background: #2e7d5e; color: #fff;
-      border: none; border-radius: 6px;
-      padding: 6px 14px; font-size: 12px; font-weight: 600;
-      cursor: pointer; transition: background 0.15s, transform 0.1s;
+      background: #fff;
+      color: #1565c0;
+      border: none;
+      border-radius: 8px;
+      padding: 9px 22px;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.1s, background 0.15s;
+      letter-spacing: 0.2px;
     }
-    .copy-btn:hover { background: #245e47; }
+    .copy-btn:hover { background: #e3f2fd; }
     .copy-btn:active { transform: scale(0.97); }
-    .copy-btn.copied { background: #27ae60; }
+    .copy-btn.copied { background: #e8f5e9; color: #2e7d32; }
 
-    /* UTM breakdown */
-    .utm-breakdown {
-      display: flex; flex-wrap: wrap; gap: 8px;
+    .copy-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    /* UTM Chips */
+    .chips-wrap {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
       margin-top: 14px;
     }
-    .utm-chip {
-      background: #fff; border: 1px solid #d0e8df;
-      border-radius: 20px; padding: 4px 12px;
-      font-size: 11.5px; color: #333;
+    .chip {
+      background: rgba(255,255,255,0.12);
+      border: 1px solid rgba(255,255,255,0.18);
+      border-radius: 20px;
+      padding: 4px 12px;
+      font-size: 11.5px;
+      color: rgba(255,255,255,0.85);
     }
-    .utm-chip span { color: #2e7d5e; font-weight: 700; }
+    .chip b { color: #fff; font-weight: 700; }
 
-    /* History */
-    .history-item {
-      padding: 10px 14px;
-      border-radius: 8px;
-      background: #f8f9fa;
-      border: 1px solid #eee;
-      font-size: 12px; color: #444;
-      word-break: break-all;
-      cursor: pointer;
-      transition: background 0.12s;
-      display: flex; align-items: center; gap: 8px;
+    /* ── History ── */
+    .history-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
     }
-    .history-item:hover { background: #eaf3ef; }
-    .history-url { flex: 1; }
-    .history-copy { color: #2e7d5e; font-weight: 600; font-size: 11px; white-space: nowrap; }
-    .history-list { display: flex; flex-direction: column; gap: 8px; }
-    .no-history { font-size: 13px; color: #bbb; text-align: center; padding: 16px; }
-
     .clear-btn {
-      float: right;
-      background: none; border: none;
-      font-size: 11px; color: #e74c3c; cursor: pointer;
-      padding: 2px 0;
+      background: none;
+      border: none;
+      font-size: 12px;
+      color: #e53935;
+      cursor: pointer;
+      font-weight: 600;
     }
     .clear-btn:hover { text-decoration: underline; }
 
-    .section-row {
-      display: flex; align-items: center; justify-content: space-between;
-      margin-bottom: 14px;
+    .history-list { display: flex; flex-direction: column; gap: 8px; }
+    .history-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      background: #f8f9fa;
+      border: 1px solid #eee;
+      border-radius: 9px;
+      cursor: pointer;
+      transition: background 0.12s, border-color 0.12s;
+    }
+    .history-item:hover { background: #e8f0fe; border-color: #c5d8fb; }
+    .history-icon { font-size: 14px; flex-shrink: 0; }
+    .history-url { font-size: 12px; color: #333; word-break: break-all; flex: 1; line-height: 1.5; }
+    .history-copy-btn {
+      font-size: 11px;
+      font-weight: 700;
+      color: #1565c0;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .no-history {
+      text-align: center;
+      padding: 20px;
+      font-size: 13px;
+      color: #bbb;
     }
 
-    @media (max-width: 560px) {
-      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    /* ── Divider ── */
+    .divider {
+      height: 1px;
+      background: #f0f0f0;
+      margin: 18px 0;
+    }
+
+    @media (max-width: 600px) {
+      .grid-3, .grid-2 { grid-template-columns: 1fr; }
+      .topbar { padding: 0 16px; }
+      .main { padding: 16px 12px 32px; }
     }
   </style>
 </head>
 <body>
-<div class="container">
 
-  <header>
-    <div class="logo">ASBL</div>
-    <div>
-      <h1>UTM Generator</h1>
-      <p>Build trackable campaign URLs for all ASBL projects</p>
+<!-- Top Nav -->
+<div class="topbar">
+  <div class="topbar-left">
+    <div class="topbar-logo">
+      <img src="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRPxmAlF5BzFsMWPsrI8ZO5HipdOY_s6DT6rA&s" alt="ASBL" onerror="this.style.display='none';this.parentElement.innerHTML='<span style=\'font-weight:800;font-size:13px;color:#1a237e\'>ASBL</span>'" />
     </div>
-  </header>
+    <div>
+      <div class="topbar-title">UTM Generator</div>
+      <div class="topbar-sub">Build trackable campaign URLs</div>
+    </div>
+  </div>
+  <div class="topbar-badge">Campaign Tool</div>
+</div>
 
-  <!-- STEP 1: Campaign Setup -->
+<div class="main">
+
+  <!-- Campaign Setup -->
+  <div class="section-label">Campaign Setup</div>
   <div class="card">
-    <div class="card-title">Campaign Setup</div>
-    <div class="grid-3" style="margin-bottom:16px;">
+    <div class="grid-3" style="margin-bottom:14px;">
       <div class="field">
-        <label>Project *</label>
-        <select id="project" onchange="generate()">
-          <option value="">— Select Project —</option>
+        <label>Project <span class="required-star">*</span></label>
+        <select id="project" onchange="onProjectChange()">
+          <option value="">Select project</option>
           <option value="loft">LOFT</option>
           <option value="spectra">SPECTRA</option>
           <option value="broadway">BROADWAY</option>
@@ -181,9 +321,9 @@
         </select>
       </div>
       <div class="field">
-        <label>Team *</label>
+        <label>Team <span class="required-star">*</span></label>
         <select id="team" onchange="generate()">
-          <option value="">— Select Team —</option>
+          <option value="">Select team</option>
           <option value="ci_team">CI Team</option>
           <option value="performance_team">Performance Team</option>
           <option value="rebrand_team">ReBrand Team</option>
@@ -191,9 +331,9 @@
         </select>
       </div>
       <div class="field">
-        <label>Platform / Source *</label>
+        <label>Platform / Source <span class="required-star">*</span></label>
         <select id="platform" onchange="onPlatformChange()">
-          <option value="">— Select Platform —</option>
+          <option value="">Select platform</option>
           <optgroup label="Social Media">
             <option value="facebook">fb</option>
             <option value="instagram">Instagram</option>
@@ -317,23 +457,19 @@
       </div>
     </div>
 
-    <div class="grid-3" style="margin-bottom:16px;">
+    <div class="grid-3">
       <div class="field">
-        <label>Medium *</label>
+        <label>Medium <span class="required-star">*</span></label>
         <select id="medium" onchange="generate()">
-          <option value="">— Select Medium —</option>
+          <option value="">Select medium</option>
           <option value="paid">Paid</option>
           <option value="free">Free</option>
         </select>
       </div>
       <div class="field">
-        <label>Campaign Name *</label>
-        <input type="text" id="campaign_name" placeholder="e.g. loft-apr26-awareness" oninput="generate()" />
-      </div>
-      <div class="field">
         <label>Campaign Type</label>
         <select id="campaign_type" onchange="generate()">
-          <option value="">— Optional —</option>
+          <option value="">Optional</option>
           <option value="generate_visitor">Generate Visitor</option>
           <option value="generate_leads">Generate Leads</option>
           <option value="awareness">Awareness</option>
@@ -344,35 +480,46 @@
           <option value="branding">Branding</option>
         </select>
       </div>
+      <div class="field">
+        <label>Campaign Name <span class="required-star">*</span></label>
+        <input type="text" id="campaign_name" placeholder="e.g. loft-apr26" oninput="generate()" />
+      </div>
     </div>
+  </div>
 
+  <!-- Page & Content -->
+  <div class="section-label">Landing Page & Content</div>
+  <div class="card">
     <div class="grid-2">
       <div class="field">
-        <label>Landing Page URL *</label>
+        <label>Landing Page URL <span class="required-star">*</span></label>
         <input type="text" id="page_url" placeholder="https://asbl.in/loft" oninput="generate()" />
       </div>
       <div class="field">
-        <label>Content / Ad Label <span style="font-weight:400;color:#aaa;">(optional)</span></label>
+        <label>Content / Ad Label <span style="font-size:10px;color:#bbb;font-weight:400;">(optional)</span></label>
         <input type="text" id="utm_content" placeholder="e.g. banner-v1 or video-30sec" oninput="generate()" />
       </div>
     </div>
   </div>
 
-  <!-- OUTPUT -->
-  <div class="card">
-    <div class="card-title">Generated URL</div>
-    <div class="output-box">
-      <div class="output-label">Campaign URL</div>
+  <!-- Output -->
+  <div class="section-label">Generated URL</div>
+  <div class="output-card">
+    <div class="output-label">Campaign URL</div>
+    <div class="output-url-wrap">
       <div id="output-url" class="empty">Fill in the required fields above to generate your URL</div>
-      <button class="copy-btn" id="copy-btn" onclick="copyUrl()">Copy</button>
-      <div class="utm-breakdown" id="utm-chips"></div>
+    </div>
+    <div class="copy-row">
+      <div class="chips-wrap" id="utm-chips"></div>
+      <button class="copy-btn" id="copy-btn" onclick="copyUrl()">Copy URL</button>
     </div>
   </div>
 
-  <!-- HISTORY -->
+  <!-- History -->
+  <div class="section-label">Recent URLs</div>
   <div class="card">
-    <div class="section-row">
-      <div class="card-title" style="margin-bottom:0;">Recent URLs</div>
+    <div class="history-header">
+      <span style="font-size:12px;color:#888;">Last 10 generated URLs</span>
       <button class="clear-btn" onclick="clearHistory()">Clear All</button>
     </div>
     <div class="history-list" id="history-list">
@@ -383,84 +530,76 @@
 </div>
 
 <script>
-  // Project → Base URL map
   const PROJECT_URLS = {
-    loft:      'https://asbl.in/loft',
-    spectra:   'https://asbl.in/spectra',
-    broadway:  'https://asbl.in/broadway',
-    landmark:  'https://asbl.in/landmark',
-    legacy:    'https://asbl.in/legacy',
+    loft:     'https://asbl.in/loft',
+    spectra:  'https://asbl.in/spectra',
+    broadway: 'https://asbl.in/broadway',
+    landmark: 'https://asbl.in/landmark',
+    legacy:   'https://asbl.in/legacy',
   };
 
-  // Platform → suggested medium (paid or free)
-  const PLATFORM_MEDIUM = {
-    // Paid platforms
-    facebook: 'paid', instagram: 'paid', ig: 'paid', linkedin: 'paid',
-    youtube: 'paid', whatsapp: 'paid', reddit: 'paid',
-    google: 'paid', dv360: 'paid',
-    aha_ott: 'paid', jiohotstar: 'paid', netflix: 'paid', sonyliv: 'paid',
-    spotify: 'paid', zee5: 'paid', amazon_mx_player: 'paid',
-    willow_tv: 'paid', big_tv: 'paid', samsung_ctv: 'paid',
-    taboola: 'paid', criteo: 'paid', inshorts: 'paid', dailyhunt: 'paid',
-    mcanvas: 'paid', lokal: 'paid', swiggy: 'paid', zomato: 'paid',
-    blinkit: 'paid', instamart: 'paid', uber: 'paid', zepto: 'paid',
-    mygate: 'paid', makemytrip: 'paid', skyscanner: 'paid',
-    adbeets: 'paid', adgebra: 'paid', adonmo: 'paid', amazon: 'paid',
-    advantageclub: 'paid', cred: 'paid', credai: 'paid',
-    nixglobal: 'paid', yoptima: 'paid', infinitum: 'paid',
-    andhrajyothy: 'paid', cnbc: 'paid', deccanchronicle: 'paid',
-    economictimes: 'paid', eenadu: 'paid', et_now: 'paid',
-    financial_express: 'paid', forbes: 'paid', hans_india: 'paid',
-    htmedia: 'paid', hyderabad_times: 'paid', livemint: 'paid',
-    namaste_telangana: 'paid', namaste_andhra: 'paid', namastenri: 'paid',
-    newindiaexpress: 'paid', news18: 'paid', sakshi: 'paid',
-    telangana_today: 'paid', telugutimes: 'paid', the_south_india_times: 'paid',
-    thehindu: 'paid', toi: 'paid', tv9: 'paid', zeebusiness: 'paid',
-    magazine: 'paid', fim: 'paid', cpc: 'paid', cpl: 'paid',
-    zoom: 'paid', linktree: 'paid', way2news: 'paid',
-    // Free platforms
-    google_organic: 'free', organic: 'free', blog: 'free', article: 'free',
-    forum: 'free', email: 'free', newsletter: 'free',
-    homes_by_asbl: 'free', offline_event: 'free', family_day_hyd: 'free',
-    nri: 'free', orphan: 'free',
-  };
+  const PAID_PLATFORMS = new Set([
+    'facebook','instagram','ig','linkedin','youtube','whatsapp','reddit',
+    'google','dv360','aha_ott','jiohotstar','netflix','sonyliv','spotify',
+    'zee5','amazon_mx_player','willow_tv','big_tv','samsung_ctv',
+    'adbeets','adgebra','adonmo','amazon','criteo','dailyhunt','inshorts',
+    'linktree','lokal','mcanvas','moneycontrol','mygate','nixglobal',
+    'skyscanner','swiggy','taboola','uber','way2news','yoptima','zepto',
+    'zomato','zoom','instamart','blinkit','makemytrip','infinitum',
+    'advantageclub','cred','credai','andhrajyothy','cnbc','deccanchronicle',
+    'economictimes','eenadu','et_now','financial_express','forbes','hans_india',
+    'htmedia','hyderabad_times','livemint','namaste_telangana','namaste_andhra',
+    'namastenri','newindiaexpress','news18','sakshi','telangana_today',
+    'telugutimes','the_south_india_times','thehindu','toi','tv9','zeebusiness',
+    'magazine','fim','cpc','cpl','ad','nobroker_hood','99villas','mysquarefeet',
+    'zoom','colombia','condenast','cricket','family_day_hyd','oem','bgd','pd','ata',
+  ]);
+
+  const FREE_PLATFORMS = new Set([
+    'google_organic','organic','blog','article','forum','email','newsletter',
+    'homes_by_asbl','offline_event','nri','nri_nivesh','nri_one','orphan','others',
+  ]);
+
+  function onProjectChange() {
+    const project = document.getElementById('project').value;
+    const pageUrlEl = document.getElementById('page_url');
+    if (project && !pageUrlEl.value) {
+      pageUrlEl.value = PROJECT_URLS[project] || '';
+    }
+    generate();
+  }
 
   function onPlatformChange() {
     const platform = document.getElementById('platform').value;
-    const medium   = document.getElementById('medium');
-    if (platform && PLATFORM_MEDIUM[platform] && !medium.value) {
-      medium.value = PLATFORM_MEDIUM[platform];
+    const mediumEl = document.getElementById('medium');
+    if (platform && !mediumEl.value) {
+      if (PAID_PLATFORMS.has(platform)) mediumEl.value = 'paid';
+      else if (FREE_PLATFORMS.has(platform)) mediumEl.value = 'free';
     }
     generate();
   }
 
   function slugify(s) {
-    return (s || '').toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_\-]/g, '');
+    return (s || '').toLowerCase().trim().replace(/\s+/g, '_').replace(/[^a-z0-9_\-]/g, '');
   }
 
   let currentUrl = '';
 
   function generate() {
-    const project       = document.getElementById('project').value;
-    const platform      = document.getElementById('platform').value;
-    const medium        = document.getElementById('medium').value;
-    const campaignName  = document.getElementById('campaign_name').value.trim();
-    const campaignType  = document.getElementById('campaign_type').value;
-    const pageUrl       = document.getElementById('page_url').value.trim();
-    const utmContent    = document.getElementById('utm_content').value.trim();
-    const team          = document.getElementById('team').value;
-
-    // Auto-fill page URL when project selected
-    if (project && !pageUrl) {
-      document.getElementById('page_url').value = PROJECT_URLS[project] || '';
-    }
-
-    const baseUrl = document.getElementById('page_url').value.trim() || (project ? PROJECT_URLS[project] : '');
+    const project      = document.getElementById('project').value;
+    const platform     = document.getElementById('platform').value;
+    const medium       = document.getElementById('medium').value;
+    const campaignName = document.getElementById('campaign_name').value.trim();
+    const campaignType = document.getElementById('campaign_type').value;
+    const team         = document.getElementById('team').value;
+    const utmContent   = document.getElementById('utm_content').value.trim();
+    const baseUrl      = document.getElementById('page_url').value.trim()
+                         || (project ? PROJECT_URLS[project] : '');
 
     const outputEl = document.getElementById('output-url');
     const chipsEl  = document.getElementById('utm-chips');
 
-    if (!project || !platform || !medium || !campaignName || !baseUrl) {
+    if (!platform || !medium || !campaignName || !baseUrl) {
       outputEl.textContent = 'Fill in the required fields above to generate your URL';
       outputEl.className = 'empty';
       chipsEl.innerHTML = '';
@@ -468,14 +607,12 @@
       return;
     }
 
-    // Build campaign slug: project + campaign name + optional type
     const campaignSlug = [
-      project,
+      project ? project : '',
       slugify(campaignName),
-      campaignType ? campaignType : ''
+      campaignType ? campaignType : '',
     ].filter(Boolean).join('-');
 
-    // Content: utmContent or team
     const contentVal = utmContent ? slugify(utmContent) : (team ? slugify(team) : '');
 
     const params = new URLSearchParams();
@@ -484,51 +621,52 @@
     params.set('utm_campaign', campaignSlug);
     if (contentVal) params.set('utm_content', contentVal);
 
-    // Ensure baseUrl has no trailing ?
     const base = baseUrl.replace(/\?$/, '');
-    const separator = base.includes('?') ? '&' : '?';
-    currentUrl = base + separator + params.toString();
+    const sep  = base.includes('?') ? '&' : '?';
+    currentUrl = base + sep + params.toString();
 
     outputEl.textContent = currentUrl;
     outputEl.className = '';
 
-    // Chips
     const chipDefs = [
-      ['source',   platform],
-      ['medium',   medium],
+      ['source', platform],
+      ['medium', medium],
       ['campaign', campaignSlug],
       ...(contentVal ? [['content', contentVal]] : []),
     ];
     chipsEl.innerHTML = chipDefs.map(([k, v]) =>
-      `<div class="utm-chip"><span>utm_${k}</span> = ${v}</div>`
+      `<div class="chip"><b>utm_${k}</b> = ${v}</div>`
     ).join('');
   }
 
   function copyUrl() {
     if (!currentUrl) return;
     navigator.clipboard.writeText(currentUrl).then(() => {
-      const btn = document.getElementById('copy-btn');
-      btn.textContent = '✓ Copied!';
-      btn.classList.add('copied');
-      setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 2000);
+      showCopied();
       saveHistory(currentUrl);
     }).catch(() => {
-      // Fallback
       const ta = document.createElement('textarea');
       ta.value = currentUrl;
       document.body.appendChild(ta);
       ta.select();
       document.execCommand('copy');
       document.body.removeChild(ta);
+      showCopied();
       saveHistory(currentUrl);
     });
   }
 
-  // History (in-memory only — no localStorage)
+  function showCopied() {
+    const btn = document.getElementById('copy-btn');
+    btn.textContent = '✓ Copied!';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'Copy URL'; btn.classList.remove('copied'); }, 2000);
+  }
+
   let history = [];
 
   function saveHistory(url) {
-    if (history.includes(url)) return;
+    history = history.filter(u => u !== url);
     history.unshift(url);
     if (history.length > 10) history.pop();
     renderHistory();
@@ -547,8 +685,9 @@
     }
     el.innerHTML = history.map((url, i) => `
       <div class="history-item" onclick="copyHistoryItem(${i})">
+        <span class="history-icon">🔗</span>
         <div class="history-url">${url}</div>
-        <div class="history-copy">Copy</div>
+        <span class="history-copy-btn" id="hcopy-${i}">Copy</span>
       </div>
     `).join('');
   }
@@ -557,18 +696,12 @@
     const url = history[idx];
     navigator.clipboard.writeText(url).catch(() => {
       const ta = document.createElement('textarea');
-      ta.value = url;
-      document.body.appendChild(ta); ta.select();
-      document.execCommand('copy');
+      ta.value = url; document.body.appendChild(ta);
+      ta.select(); document.execCommand('copy');
       document.body.removeChild(ta);
     });
-    const items = document.querySelectorAll('.history-item');
-    if (items[idx]) {
-      items[idx].querySelector('.history-copy').textContent = '✓ Copied';
-      setTimeout(() => {
-        if (items[idx]) items[idx].querySelector('.history-copy').textContent = 'Copy';
-      }, 1500);
-    }
+    const el = document.getElementById(`hcopy-${idx}`);
+    if (el) { el.textContent = '✓ Copied'; setTimeout(() => { el.textContent = 'Copy'; }, 1500); }
   }
 </script>
 </body>
