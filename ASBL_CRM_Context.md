@@ -1,276 +1,279 @@
-# ASBL CRM System — Context File
-
-## Last Updated: 18 Apr 2026
-
----
-
-## 1. Business Overview
-
-Real estate company ASBL with multiple projects:
-- LOFT
-- SPECTRA
-- BROADWAY
-- LANDMARK
-- LEGACY
+# ASBL CRM — Full System Context
+**Last Updated:** 19 April 2026
 
 ---
 
-## 2. Tech Stack
+## Architecture Overview
 
-| Component | Tool |
-|---|---|
-| CRM | Zoho CRM (zoho.in region) |
-| AI Calling | Arrowhead |
-| WhatsApp AI | Lazybot (self-built) |
-| Meta Integration | LeadChain (Zoho Marketplace) |
-| Website Integration | Custom API (server-based) |
-| Callback Relay | Google Apps Script |
-
----
-
-## 3. Lead Sources
-
-### Meta Ads (via LeadChain)
-- Flow: Meta Lead Ad Form → LeadChain → Zoho CRM
-- Phone stored in: `Mobile` field
-- Layout used: Custom `Leads` layout (ID: `1288576000000594067`)
-- `Lead_Id1` populated with Meta Social Lead ID
-- `Lead_Source`: FIM Forms
-
-### Website (via Custom API)
-- Flow: Website Form → Custom API → Zoho CRM
-- Phone stored in: `Phone` field (NOT Mobile — bug to fix)
-- Layout used: Standard layout (ID: `1288576000000000167`) — WRONG, must use custom
-- `Lead_Id1`: empty
-- `Lead_Source`: Website Inquiry
+```
+Lead Sources (Meta/Website/FIM)
+        ↓
+Vercel API (asbl-crm-api.vercel.app)
+        ↓
+Supabase (MLID/PLID generation)
+        ↓
+Zoho CRM (single source of truth)
+        ↓
+Arrowhead AI Call → LazyBot WhatsApp
+```
 
 ---
 
-## 4. Zoho CRM — Key Fields
+## 1. Lead Ingestion (Vercel API)
 
-| Field Label | API Name | Type | Notes |
-|---|---|---|---|
-| MLID | `MLID` | Text | Master Lead ID, phone-based, starts 1001 |
-| Lead-Id | `Lead_Id1` | Text | Meta Social Lead ID (website leaves empty) |
-| Project | `Project` | Picklist | LOFT/SPECTRA/BROADWAY/LANDMARK/LEGACY |
-| Born Date | `Born_Date` | Date | Lead creation date |
-| Questionnaire | `Questionnaire` | Textarea | Form comments |
-| Campaign Name | `Campaign_Name` | Text | Meta campaign name |
-| Phone Number (Mobile) | `Mobile` | Phone | Primary phone field |
-| Phone | `Phone` | Phone | Secondary — website uses this wrongly |
-| Call Status | `Call_Status` | Picklist | Connected/Not Connected |
-| Call Outcome | `Call_Outcome` | Picklist | Connected/Not Connected/Pre Site/Virtual Walkthrough/Share Brochure/Call For Other Project |
-| Call Duration | `Call_Duration` | Integer | Seconds |
-| Call Date Time | `Call_Date_Time` | DateTime | |
-| Call Notes | `Call_Notes` | Textarea | AI summary, budget, size, intent |
-| Call History | `Call_History` | Textarea | Full log of all calls |
-| Call Trigger Count | `Call_Trigger_Count` | Number | How many times call was triggered |
-| Call Answer Count | `Call_Answer_Count` | Number | Connected calls |
-| Call No Answer Count | `Call_No_Answer_Count` | Number | Not connected calls |
-| Call Pickup Time | `Call_Pickup_Time` | Text | First connected call time |
-| WhatsApp Status | `WhatsApp_Status` | Picklist | Sent/Replied/No Reply |
-| Last Message Date | `Last_Message_Date` | DateTime | |
-| Chat History | `Chat_History` | Textarea | Full WhatsApp conversation log |
-| Budget | `Budget` | Text | |
-| Sq.Ft Preferred | `Sq_Ft_Preffered` | Text | |
+**Repo:** `https://github.com/1Mukund/asbl-crm-api`
+**Live URL:** `https://asbl-crm-api.vercel.app`
+
+### Endpoints
+- `POST /api/ingest/website` — Website form leads
+- `POST /api/ingest/meta` — Meta Ads leads (webhook)
+- `POST /api/relay/arrowhead` — Relay to Arrowhead API (bypasses Zoho domain block)
+- `POST /api/relay/arrowhead-posthook` — Receives Arrowhead call results → updates Zoho
+
+### Key Files
+- `api/_utils/ingest.ts` — Core ingestion logic (MLID/PLID → Zoho create/update)
+- `api/_utils/zoho.ts` — Zoho API helper (search, create, update, findByArrowheadCallId)
+- `api/_utils/supabase.ts` — MLID/PLID via Supabase RPC
+- `api/relay/arrowhead.ts` — Arrowhead relay
+- `api/relay/arrowhead-posthook.ts` — Posthook handler
+
+### Env Vars (Vercel)
+- `ZOHO_CLIENT_ID`, `ZOHO_CLIENT_SECRET`, `ZOHO_REFRESH_TOKEN`
+- `SUPABASE_URL`, `SUPABASE_SECRET_KEY`
 
 ---
 
-## 5. Zoho Org Details
+## 2. Supabase
 
-| Key | Value |
-|---|---|
-| Org ID | org60069991778 |
-| API Region | zoho.in |
-| Custom Layout ID | 1288576000000594067 |
-| Standard Layout ID | 1288576000000000167 (DO NOT USE) |
+**DB:** `postgresql://postgres.nodpzowdaqqexfbmcpsx:...@aws-1-ap-southeast-1.pooler.supabase.com`
 
----
-
-## 6. Zoho OAuth (Self Client)
-
-| Key | Value |
-|---|---|
-| Client ID | 1000.B0AKGFC866W6ID59IQALF8D0UGIP1I |
-| Client Secret | eef6a60091fb98ec3234ff1a91305aa92f3ff614e1 |
-| Refresh Token | 1000.4a4fa18699d091348d63c6d811b7a651.44295cf8e60e2f6fd3f272ae93fb701b |
-| Token URL | https://accounts.zoho.in/oauth/v2/token |
-| API Base | https://www.zohoapis.in/crm/v3 |
+### Key RPC Functions
+- `get_or_create_mlid(p_phone)` → MLID (sequential: 1001, 1002...)
+- `get_or_create_plid(p_phone, p_mlid, p_project)` → PLID (e.g. `1002-BROADWAY`)
 
 ---
 
-## 7. Arrowhead AI Calling
+## 3. Zoho CRM
 
-| Key | Value |
-|---|---|
-| Domain ID | 932f86fc-ed03-42d5-a127-7dfc63216a8a |
-| Campaign ID | a0a15c01-2aa2-40b3-9e46-94109131b17b |
-| API Base | https://api.agent.arrowhead.team/api/v2/public |
-| Bearer Token | 1928b882dbd4e043fcc61be27aa6eec00b925c1b5cdc4af592a623399571119a |
-| Schedule Endpoint | /domain/{domain_id}/campaign/{campaign_id}/schedule |
-| Callback URL | https://script.google.com/macros/s/AKfycbzNnWGs_09WPjys2dVkktxjKx96v6GZbpojBUzeYcoNnUT6t5l-s7hR5r3qkOS8rvf2dA/exec |
+**URL:** `https://crmplus.zoho.in/asbl9777`
+**API Base:** `https://www.zohoapis.in/crm/v3`
 
-### Arrowhead Callback Payload Fields
-- `external_journey_id` — our external_schedule_id
-- `external_customer_id` — our MLID
-- `call_result_slug` — no_answer/connected/auto_callback/not_interested/pre_site/virtual_walkthrough/share_brochure/call_for_other_project
-- `call_duration_in_secs`
-- `current_datetime_ist`
-- `question_answers` — call_summary, budget, size_preference, intent
-- NOTE: `mobile_number` NOT included in callback
+### Phone Number Format in Zoho
+Stored as digits only, NO `+` sign. Example: `918700432466`
 
-### Call Result Mapping
-| Arrowhead Slug | Zoho Call Status | Zoho Call Outcome |
-|---|---|---|
-| no_answer | Not Connected | Not Connected |
-| connected | Connected | Connected |
-| auto_callback | Connected | Connected |
-| not_interested | Connected | Connected |
-| pre_site | Connected | Pre Site |
-| virtual_walkthrough | Connected | Virtual Walkthrough |
-| share_brochure | Connected | Share Brochure |
-| call_for_other_project | Connected | Call For Other Project |
+### Custom Fields (API Names for Deluge)
+| Field | API Name |
+|-------|----------|
+| Master Lead ID | `Master_Lead_ID` |
+| Project Lead ID | `Project_Lead_ID` |
+| Source Lead ID | `Source_Lead_ID` |
+| ASBL Project | `ASBL_Project` |
+| Call Status | `Call_Status` |
+| Call Attempt Count | `Call_Attempt_Count` |
+| Last Call At | `Last_Call_At` |
+| Last Arrowhead Call ID | `Last_Arrowhead_Call_ID` |
+| Call Duration | `Call_Duration` |
+| Call Summary | `Call_Summary` |
+| WhatsApp Sent | `Whatsapp_Sent` |
+| WhatsApp Replied | `Whatsapp_Replied` |
+| Last WhatsApp At | `Last_Whatsapp_At` |
+| Last Intent | `Last_Intent` |
+| SFCF Active | `SFCF_Active` |
+| SFCF Step | `SFCF_Step` |
+| Next Followup At | `Next_Followup_At` |
+| Country Code | `Country_Code` |
+| Call Eligible | `Call_Eligible` |
+| Brochure Sent | `Brochure_Sent` |
+| Price Sheet Sent | `Price_Sheet_Sent` |
+| Site Visit Slots Sent | `Site_Visit_Slots_Sent` |
+| High Intent | `High_Intent` |
+| High Intent Reason | `High_Intent_Reason` |
+| UTM Source | `UTM_Source` |
+| UTM Medium | `UTM_Medium` |
+| UTM Campaign | `UTM_Campaign` |
+| Lead Budget | `Lead_Budget` |
+| Size Preference | `Size_Preference` |
+| Floor Preference | `Floor_Preference` |
+| Lead Comments | `Lead_Comments` |
+| First Page Visited | `First_Page_Visited` |
+| Last Page Visited | `Last_Page_Visited` |
+| Total Page Views | `Total_Page_Views` |
+| Time Spent Minutes | `Time_Spent_Minutes` |
+| Referrer URL | `Referrer_URL` |
+| Ad Set Name | `Ad_Set_Name` |
+| Ad Name | `Ad_Name` |
 
----
+### Call_Status Picklist Values
+`Not Called`, `Connected`, `Not Connected`, `Busy`, `Switched Off`, `Pre Site`, `Virtual Tour`, `Not Interested`
 
-## 8. Lazybot WhatsApp
+### Last_Intent Picklist Values
+`general`, `brochure`, `price`, `call_me`, `site_visit`, `not_interested`
 
-| Key | Value |
-|---|---|
-| API Base | https://showplace-underhand-endurable.ngrok-free.dev/api/v1 |
-| API Key | lzb_b296d613541755478c587ed952bb79fd41b569c8dfb89b67 |
-| Active Session | 13a646d3-476c-4c6d-bb7b-e2ccca48a3ba |
-| Send Endpoint | /messages/send |
-| Webhook Events | message.received (inbound), message.created (outbound) |
-| Webhook URL | Same as Arrowhead callback URL (Apps Script) |
+### ASBL_Project Picklist Values
+`LOFT`, `SPECTRA`, `BROADWAY`, `LANDMARK`, `LEGACY`
 
----
-
-## 9. Google Apps Script (Relay)
-
-URL: `https://script.google.com/macros/s/AKfycbzNnWGs_09WPjys2dVkktxjKx96v6GZbpojBUzeYcoNnUT6t5l-s7hR5r3qkOS8rvf2dA/exec`
-
-Handles two types of POST:
-1. Arrowhead callback → updates Zoho lead call fields + triggers Lazybot message
-2. Lazybot webhook → updates Chat_History in Zoho
-
-Lead lookup order: MLID (external_customer_id) → Lead_Id1 → fallback
-
----
-
-## 10. Zoho Workflows (Active)
-
-| Workflow | Trigger | Action |
-|---|---|---|
-| Auto Assign MLID and Lead ID | Lead Created | Deluge: assign_mlid_leadid |
-| Arrowhead Call Trigger | Lead Created (phone starts +91 or +1) | Deluge: auto_trigger_arrowhead_call |
-| Auto Assign Project | Lead Created | Deluge: auto_assign_project |
-| Lazybot First Touch | Lead Created | Deluge: lazybot_first_touch (skips Indian numbers) |
+### Dedup Logic
+- Same phone + same project → UPDATE existing lead
+- Same phone + new project → CREATE new lead
+- MLID same across projects, PLID different per project
 
 ---
 
-## 11. Zoho Deluge Functions
+## 4. Arrowhead (AI Calling)
 
-| Function | Category | Purpose |
-|---|---|---|
-| assign_mlid_leadid | Automation | Assigns MLID based on phone, Born Date |
-| auto_trigger_arrowhead_call | Automation | Triggers Arrowhead call on lead create |
-| auto_assign_project | Automation | Sets Project from Campaign Name |
-| lazybot_first_touch | Automation | WhatsApp message for non-Indian numbers |
-| trigger_arrowhead_call | Button | Manual call trigger from lead record |
-| bulk_trigger_arrowhead_call | Button | Bulk call trigger from list view |
-| lazybot_manual_trigger | Button | Manual WhatsApp send |
-| lazybot_bulk_trigger | Button | Bulk WhatsApp send |
-| arrowhead_callback | Standalone | Legacy — not in use |
+**API URL:** `https://api.agent.arrowhead.team/api/v2/public/domain/932f86fc-ed03-42d5-a127-7dfc63216a8a/campaign/a0a15c01-2aa2-40b3-9e46-94109131b17b/schedule`
+**Bearer Token:** `1928b882dbd4e043fcc61be27aa6eec00b925c1b5cdc4af592a623399571119a`
+
+### Payload Format
+```json
+{
+  "customer_full_name": "Name",
+  "mobile_number": "919876543210",
+  "external_customer_id": "1002",
+  "external_schedule_id": "1002-BROADWAY-call-1",
+  "input_variables": {
+    "customer_name": "Name",
+    "project": "BROADWAY",
+    "budget": "1Cr - 2Cr",
+    "size_preference": "",
+    "intent": "", "country": "", "comments": "",
+    "web_time_spent": "", "call_enrichment_data": "",
+    "floor_level_preference": "", "handover_timeline_preference": ""
+  }
+}
+```
+
+### external_schedule_id Format: `PLID-call-N` (e.g. `1002-BROADWAY-call-3`)
+
+### Posthook URL (sent to Arrowhead team — pending their config)
+`https://asbl-crm-api.vercel.app/api/relay/arrowhead-posthook`
+
+### Call Status Mapping (Arrowhead → Zoho)
+- `CONNECTED`/`AUTO_CALLBACK` → `Connected`
+- `NOT_CONNECTED`/`NO_ANSWER` → `Not Connected`
+- `BUSY` → `Busy`
+- `SWITCHED_OFF` → `Switched Off`
+- `PRE_SITE` → `Pre Site`
+- `VIRTUAL_TOUR` → `Virtual Tour`
+- `NOT_INTERESTED` → `Not Interested`
 
 ---
 
-## 12. Known Issues / To Fix
+## 5. Zoho Deluge Functions
 
-1. Website leads use `Phone` field instead of `Mobile` — dev needs to fix API payload
-2. Website leads use Standard layout — dev needs to pass custom layout ID
-3. Website leads have no `Lead_Id1` — need source lead ID from website
-4. Multiple Arrowhead schedules appearing — Arrowhead groups by phone number in dashboard UI (not our bug)
-5. `external_schedule_id` is required by Arrowhead API — cannot be omitted
+### `automation.triggerArrowheadCall(string lead_id)` ✅ WORKING
+- Fetches lead, normalizes phone, increments attempt count
+- Calls `https://asbl-crm-api.vercel.app/api/relay/arrowhead`
+- Updates: `Call_Attempt_Count`, `Last_Call_At`, `Last_Arrowhead_Call_ID`, `Call_Status`
+- DateTime format: `yyyy-MM-dd'T'HH:mm:ss+05:30`
+
+### `button.triggerCallButton(string lead_id)` ✅ WORKING
+- Manual button wrapper for detail view
+
+### Zoho Connection
+- `arrowhead_connection` — created but Vercel relay used instead (more reliable)
+
+### Important Notes for Deluge
+- `zoho.crm.updateRecord` needs `lead_id.toLong()` — NOT string
+- `request` and `input` variables do NOT work in CRM functions
+- Phone in Zoho: digits only, no + sign
+- Datetime format must be `yyyy-MM-dd'T'HH:mm:ss+05:30`
 
 ---
 
-## 13. Architecture Decision: Fresh Start
+## 6. Zoho Automation ✅
 
-Decision taken on 18 Apr 2026:
-- Deleted all test leads
-- Deleted custom `Leads` layout — using `Standard` layout only (ID: `1288576000000000167`)
-- All sources must use Standard layout
-- Phone always in `Mobile` field
-- MLID logic: same phone = same MLID across projects
-- PLID logic: same phone + same project = same PLID, new project = new PLID
+### Workflow Rule: `Auto Trigger Arrowhead Call` — ACTIVE
+- Trigger: Lead Created
+- Condition: Phone Number starts with `91` OR starts with `1`
+- Action: `automation.triggerArrowheadCall(lead_id)`
+
+### Button: `Trigger Arrowhead Call` — Detail View
+- Function: `button.triggerCallButton(lead_id)`
+
+### Blueprint
+- Stages: New Lead → First Touch → Contacted → Pre Site → Virtual Tour → Not Interested
 
 ---
 
-## 14. Zoho Custom Fields (Standard Layout)
+## 7. LazyBot (WhatsApp CRM)
 
-### Identity
-| API Name | Label | Type |
-|---|---|---|
-| `Master_Lead_ID` | Master Lead ID | Text |
-| `Project_Lead_ID` | Project Lead ID | Text |
+**Repo:** `https://github.com/1Mukund/lazybot-whatsapp-crm`
+**Backend:** Render — `https://lazybot-whatsapp-crm.onrender.com`
+**Frontend:** Vercel — `https://lazybot-whatsapp-crm.vercel.app`
+**Local folder:** `Own A Periskope/whatsapp-crm/`
 
-### Source & Attribution
-| API Name | Label | Type |
-|---|---|---|
-| `Source_Lead_ID` | Source Lead ID | Text |
-| `Campaign_Name` | Campaign Name | Text |
-| `Ad_Set_Name` | Ad Set Name | Text |
-| `Ad_Name` | Ad Name | Text |
-| `UTM_Source` | UTM Source | Text |
-| `UTM_Medium` | UTM Medium | Text |
-| `UTM_Campaign` | UTM Campaign | Text |
-| `UTM_Content` | UTM Content | Text |
-| `UTM_Term` | UTM Term | Text |
-| `Lead_Received_At` | Lead Received At | DateTime |
+### Tech Stack
+- Backend: Node.js + Express + Baileys (WhatsApp Web API)
+- Frontend: React + Vite
+- DB: Supabase (same DB as CRM)
+- AI: Anandita LLM
 
-### Project & Interest
-| API Name | Label | Type |
-|---|---|---|
-| `ASBL_Project` | ASBL Project | Picklist (LOFT/SPECTRA/BROADWAY/LANDMARK/LEGACY) |
-| `Lead_Budget` | Lead Budget | Text |
-| `Size_Preference` | Size Preference | Text |
-| `Floor_Preference` | Floor Preference | Text |
-| `Possession_Timeline` | Possession Timeline | Text |
-| `Purchase_Purpose` | Purchase Purpose | Picklist (Self Use/Investment) |
-| `Lead_Comments` | Lead Comments | Textarea |
+### Active Session (19 Apr 2026)
+- Session ID: `3945463e-9f14-4597-9471-005cd8ee14ad`
+- Phone: `+919599896700` (Bala SK number)
 
-### Web Tracking
-| API Name | Label | Type |
-|---|---|---|
-| `First_Page_Visited` | First Page Visited | URL |
-| `Last_Page_Visited` | Last Page Visited | URL |
-| `Total_Page_Views` | Total Page Views | Integer |
-| `Time_Spent_Minutes` | Time Spent Minutes | Double |
-| `Referrer_URL` | Referrer URL | URL |
+### Backend .env (Render)
+```
+DATABASE_URL=...connection_limit=2  ← updated to fix pool exhaustion
+AGENT_URL=http://35.154.144.37:8080/api/chat/
+AGENT_API_KEY=asbl_9b9b6b7ff1f758be40aca7ceb03d7d0d9c57d788b4457d5ca5819620b25d146a
+```
 
-### AI Calling (Arrowhead)
-| API Name | Label | Type |
-|---|---|---|
-| `Call_Status` | Call Status | Picklist (Pending/Connected/Not Connected) |
-| `Call_Outcome` | Call Outcome | Picklist |
-| `Last_Call_Date` | Last Call Date | DateTime |
-| `Call_Duration` | Call Duration | Integer |
-| `Call_Summary` | Call Summary | Textarea |
-| `Call_History` | Call History | Textarea |
+### Anandita LLM API Format
+```json
+Request:  { "phone": "+919876543210", "message": "user message" }
+Response: { "flag": "success", "message": "AI reply text" }
+```
 
-### WhatsApp (Lazybot)
-| API Name | Label | Type |
-|---|---|---|
-| `WhatsApp_Status` | WhatsApp Status | Picklist (Sent/Delivered/Read/Replied/No Reply) |
-| `Last_WhatsApp_Date` | Last WhatsApp Date | DateTime |
-| `WhatsApp_Chat_History` | WhatsApp Chat History | Textarea |
+### Public API (for Zoho to send WhatsApp)
+```
+POST /api/v1/messages/send
+Header: X-API-Key: <lazybot_api_key>
+Body: { "sessionId": "3945463e-9f14-4597-9471-005cd8ee14ad", "phone": "919876543210", "message": "..." }
+```
 
-### Standard Zoho Fields Used
-| API Name | Label | Notes |
-|---|---|---|
-| `First_Name` | First Name | |
-| `Last_Name` | Last Name | Required |
-| `Mobile` | Phone Number | Primary phone — always 91XXXXXXXXXX |
-| `Email` | Email | |
-| `Lead_Source` | Lead Source | Meta Ads/Website/FIM/WhatsApp/Channel Partner |
+### How It Works
+1. Customer sends WhatsApp → LazyBot receives via Baileys
+2. Calls Anandita LLM `{phone, message}` → gets reply
+3. Sends reply back on WhatsApp (@lid JID handled natively)
+4. Fires webhooks to configured URLs
+
+### Fixes Applied (19 Apr 2026)
+- LID JID fix: sends to @lid directly (Baileys internal routing)
+- Session retry: waits 15s for reconnect before dropping reply
+- Stale sessions deleted (4c24a8dc, 0234681c)
+- DB connection_limit=2 to prevent pool exhaustion
+- Duplicate webhooks cleaned up
+
+---
+
+## 8. Anandita LLM
+
+**URL:** `http://35.154.144.37:8080/api/chat/`
+**API Key:** `asbl_9b9b6b7ff1f758be40aca7ceb03d7d0d9c57d788b4457d5ca5819620b25d146a`
+
+Handles ALL customer interaction — no Gemini, no separate intent detection.
+
+---
+
+## 9. Key Architectural Decisions
+
+1. No Zoho auto-dedup — MLID/PLID generated before pushing to Zoho
+2. Vercel as Arrowhead relay — Zoho blocks direct external API calls
+3. Arrowhead posthook via Vercel — Zoho functions don't support raw body access
+4. LazyBot over Periskope — owned, free, Anandita LLM already integrated
+5. Phone stored as digits in Zoho (no + prefix)
+6. Only +91 and +1 numbers get Arrowhead calls
+
+---
+
+## 10. Pending Tasks
+
+- [x] LazyBot: Deployed on Render, AI reply working ✅
+- [ ] LazyBot API Key: Get from dashboard → needed for Zoho integration
+- [ ] Zoho → LazyBot: Call Not Connected → auto-send WhatsApp (via Vercel relay)
+- [ ] LazyBot → Zoho webhook: Customer WhatsApp reply → update Zoho fields
+- [ ] SFCF Scheduler: Follow-up sequence
+- [ ] Arrowhead posthook: Confirm team has configured URL
+- [ ] UptimeRobot: Setup to keep Render alive (prevent spin-down)
