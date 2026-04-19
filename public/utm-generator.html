@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ASBL UTM Generator</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #f5f6fa;
+      color: #333;
+      min-height: 100vh;
+      padding: 24px 16px;
+    }
+
+    .container { max-width: 780px; margin: 0 auto; }
+
+    header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 28px;
+    }
+    .logo {
+      width: 38px; height: 38px;
+      background: linear-gradient(135deg, #1a3c5e, #2e7d5e);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      color: #fff; font-weight: 800; font-size: 14px; letter-spacing: 0.5px;
+    }
+    header h1 { font-size: 20px; font-weight: 700; color: #1a3c5e; }
+    header p { font-size: 12px; color: #888; margin-top: 2px; }
+
+    .card {
+      background: #fff;
+      border-radius: 12px;
+      padding: 24px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+      margin-bottom: 20px;
+    }
+    .card-title {
+      font-size: 13px; font-weight: 600; color: #888;
+      text-transform: uppercase; letter-spacing: 0.8px;
+      margin-bottom: 18px;
+    }
+
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+
+    .field { display: flex; flex-direction: column; gap: 6px; }
+    .field label { font-size: 12px; font-weight: 600; color: #555; }
+    .field select, .field input {
+      height: 40px;
+      border: 1.5px solid #e2e6ea;
+      border-radius: 8px;
+      padding: 0 12px;
+      font-size: 13px;
+      color: #222;
+      background: #fafbfc;
+      transition: border-color 0.15s;
+      appearance: none;
+      -webkit-appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%23999' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 12px center;
+    }
+    .field input {
+      background-image: none;
+    }
+    .field select:focus, .field input:focus {
+      outline: none;
+      border-color: #2e7d5e;
+      background-color: #fff;
+    }
+    .field select.required-empty { border-color: #e74c3c; }
+
+    /* Output section */
+    .output-box {
+      background: #f0f7f4;
+      border: 1.5px solid #2e7d5e;
+      border-radius: 10px;
+      padding: 16px 18px;
+      position: relative;
+    }
+    .output-label {
+      font-size: 11px; font-weight: 700; color: #2e7d5e;
+      text-transform: uppercase; letter-spacing: 0.8px;
+      margin-bottom: 8px;
+    }
+    #output-url {
+      font-size: 13px; color: #1a3c5e; word-break: break-all;
+      line-height: 1.6; min-height: 40px;
+    }
+    #output-url.empty { color: #aaa; font-style: italic; }
+
+    .copy-btn {
+      position: absolute; top: 14px; right: 14px;
+      background: #2e7d5e; color: #fff;
+      border: none; border-radius: 6px;
+      padding: 6px 14px; font-size: 12px; font-weight: 600;
+      cursor: pointer; transition: background 0.15s, transform 0.1s;
+    }
+    .copy-btn:hover { background: #245e47; }
+    .copy-btn:active { transform: scale(0.97); }
+    .copy-btn.copied { background: #27ae60; }
+
+    /* UTM breakdown */
+    .utm-breakdown {
+      display: flex; flex-wrap: wrap; gap: 8px;
+      margin-top: 14px;
+    }
+    .utm-chip {
+      background: #fff; border: 1px solid #d0e8df;
+      border-radius: 20px; padding: 4px 12px;
+      font-size: 11.5px; color: #333;
+    }
+    .utm-chip span { color: #2e7d5e; font-weight: 700; }
+
+    /* History */
+    .history-item {
+      padding: 10px 14px;
+      border-radius: 8px;
+      background: #f8f9fa;
+      border: 1px solid #eee;
+      font-size: 12px; color: #444;
+      word-break: break-all;
+      cursor: pointer;
+      transition: background 0.12s;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .history-item:hover { background: #eaf3ef; }
+    .history-url { flex: 1; }
+    .history-copy { color: #2e7d5e; font-weight: 600; font-size: 11px; white-space: nowrap; }
+    .history-list { display: flex; flex-direction: column; gap: 8px; }
+    .no-history { font-size: 13px; color: #bbb; text-align: center; padding: 16px; }
+
+    .clear-btn {
+      float: right;
+      background: none; border: none;
+      font-size: 11px; color: #e74c3c; cursor: pointer;
+      padding: 2px 0;
+    }
+    .clear-btn:hover { text-decoration: underline; }
+
+    .section-row {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 14px;
+    }
+
+    @media (max-width: 560px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<div class="container">
+
+  <header>
+    <div class="logo">ASBL</div>
+    <div>
+      <h1>UTM Generator</h1>
+      <p>Build trackable campaign URLs for all ASBL projects</p>
+    </div>
+  </header>
+
+  <!-- STEP 1: Campaign Setup -->
+  <div class="card">
+    <div class="card-title">Campaign Setup</div>
+    <div class="grid-3" style="margin-bottom:16px;">
+      <div class="field">
+        <label>Project *</label>
+        <select id="project" onchange="generate()">
+          <option value="">— Select Project —</option>
+          <option value="loft">LOFT</option>
+          <option value="spectra">SPECTRA</option>
+          <option value="broadway">BROADWAY</option>
+          <option value="landmark">LANDMARK</option>
+          <option value="legacy">LEGACY</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Team *</label>
+        <select id="team" onchange="generate()">
+          <option value="">— Select Team —</option>
+          <option value="ci_team">CI Team</option>
+          <option value="performance_team">Performance Team</option>
+          <option value="rebrand_team">ReBrand Team</option>
+          <option value="creatives_team">Creatives Team</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Platform / Source *</label>
+        <select id="platform" onchange="onPlatformChange()">
+          <option value="">— Select Platform —</option>
+          <optgroup label="Social Media">
+            <option value="facebook">fb</option>
+            <option value="instagram">Instagram</option>
+            <option value="ig">IG</option>
+            <option value="linkedin">LinkedIn</option>
+            <option value="youtube">Youtube</option>
+            <option value="whatsapp">WhatsApp</option>
+            <option value="reddit">reddit</option>
+          </optgroup>
+          <optgroup label="Google / Search">
+            <option value="google">Google</option>
+            <option value="google_organic">Google_Organic</option>
+            <option value="dv360">DV360</option>
+          </optgroup>
+          <optgroup label="OTT / Streaming">
+            <option value="aha_ott">Aha_OTT</option>
+            <option value="jiohotstar">JioHotstar</option>
+            <option value="netflix">Netflix</option>
+            <option value="sonyliv">SonyLiv</option>
+            <option value="spotify">Spotify</option>
+            <option value="zee5">Zee5</option>
+            <option value="amazon_mx_player">Amazon_MX_Player</option>
+            <option value="willow_tv">Willow TV</option>
+            <option value="big_tv">BIG TV</option>
+            <option value="samsung_ctv">Samsung CTV</option>
+          </optgroup>
+          <optgroup label="Real Estate Portals">
+            <option value="99villas">99villas</option>
+            <option value="mysquarefeet">mysquarefeet</option>
+            <option value="homes_by_asbl">Homes by ASBL</option>
+            <option value="nobroker_hood">NoBroker Hood</option>
+          </optgroup>
+          <optgroup label="News / Print">
+            <option value="andhrajyothy">Andhrajyothy</option>
+            <option value="cnbc">CNBC</option>
+            <option value="deccanchronicle">DeccanChronicle</option>
+            <option value="economictimes">EconomicTimes</option>
+            <option value="eenadu">Eenadu</option>
+            <option value="et_now">ET now</option>
+            <option value="financial_express">Financial Express</option>
+            <option value="forbes">Forbes</option>
+            <option value="hans_india">Hans India</option>
+            <option value="htmedia">HTMedia</option>
+            <option value="hyderabad_times">Hyderabad_Times</option>
+            <option value="livemint">LiveMint</option>
+            <option value="namaste_telangana">Namaste Telangana</option>
+            <option value="namaste_andhra">namaste_andhra</option>
+            <option value="namastenri">NamasteNRI</option>
+            <option value="newindiaexpress">NewIndiaExpress</option>
+            <option value="news18">News18</option>
+            <option value="sakshi">Sakshi</option>
+            <option value="telangana_today">Telangana Today</option>
+            <option value="telugutimes">TeluguTimes</option>
+            <option value="the_south_india_times">The_South_India_Times</option>
+            <option value="thehindu">TheHindu</option>
+            <option value="toi">TOI</option>
+            <option value="tv9">TV9</option>
+            <option value="zeebusiness">ZeeBusiness</option>
+          </optgroup>
+          <optgroup label="Programmatic / Display">
+            <option value="adbeets">AdBeets</option>
+            <option value="adgebra">Adgebra</option>
+            <option value="adonmo">Adonmo</option>
+            <option value="amazon">Amazon</option>
+            <option value="criteo">Criteo</option>
+            <option value="dailyhunt">DailyHunt</option>
+            <option value="inshorts">Inshorts</option>
+            <option value="linktree">LinkTree</option>
+            <option value="lokal">Lokal</option>
+            <option value="mcanvas">mCanvas</option>
+            <option value="moneycontrol">MoneyControl</option>
+            <option value="mygate">Mygate</option>
+            <option value="nixglobal">NixGlobal</option>
+            <option value="skyscanner">Skyscanner</option>
+            <option value="swiggy">Swiggy</option>
+            <option value="taboola">Taboola</option>
+            <option value="uber">Uber</option>
+            <option value="way2news">Way2News</option>
+            <option value="yoptima">Yoptima</option>
+            <option value="zepto">Zepto</option>
+            <option value="zomato">Zomato</option>
+            <option value="zoom">zoom</option>
+            <option value="instamart">Instamart</option>
+            <option value="blinkit">Blinkit</option>
+            <option value="makemytrip">MakeMyTrip</option>
+            <option value="infinitum">Infinitum</option>
+          </optgroup>
+          <optgroup label="Loyalty / Rewards">
+            <option value="advantageclub">AdvantageClub</option>
+            <option value="cred">CRED</option>
+            <option value="credai">CredAI</option>
+          </optgroup>
+          <optgroup label="Other / Organic">
+            <option value="email">Email</option>
+            <option value="newsletter">NewsLetter</option>
+            <option value="blog">Blog</option>
+            <option value="article">Article</option>
+            <option value="magazine">Magazine</option>
+            <option value="forum">Forum</option>
+            <option value="organic">Organic</option>
+            <option value="nri">nri</option>
+            <option value="nri_nivesh">NRI_Nivesh</option>
+            <option value="nri_one">NRI_One</option>
+            <option value="fim">FIM</option>
+            <option value="ad">AD</option>
+            <option value="cpc">CPC</option>
+            <option value="cpl">CPL</option>
+            <option value="pd">PD</option>
+            <option value="bgd">BGD</option>
+            <option value="ata">ata</option>
+            <option value="oem">OEM</option>
+            <option value="colombia">Colombia</option>
+            <option value="condenast">Condenast</option>
+            <option value="cricket">Cricket</option>
+            <option value="family_day_hyd">FAMILY_DAY_HYD</option>
+            <option value="offline_event">offline_event</option>
+            <option value="orphan">Orphan</option>
+            <option value="others">Others</option>
+          </optgroup>
+        </select>
+      </div>
+    </div>
+
+    <div class="grid-3" style="margin-bottom:16px;">
+      <div class="field">
+        <label>Medium *</label>
+        <select id="medium" onchange="generate()">
+          <option value="">— Select Medium —</option>
+          <option value="paid">Paid</option>
+          <option value="free">Free</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Campaign Name *</label>
+        <input type="text" id="campaign_name" placeholder="e.g. loft-apr26-awareness" oninput="generate()" />
+      </div>
+      <div class="field">
+        <label>Campaign Type</label>
+        <select id="campaign_type" onchange="generate()">
+          <option value="">— Optional —</option>
+          <option value="generate_visitor">Generate Visitor</option>
+          <option value="generate_leads">Generate Leads</option>
+          <option value="awareness">Awareness</option>
+          <option value="consideration">Consideration</option>
+          <option value="conversion">Conversion</option>
+          <option value="retargeting">Retargeting</option>
+          <option value="lookalike">Lookalike</option>
+          <option value="branding">Branding</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="field">
+        <label>Landing Page URL *</label>
+        <input type="text" id="page_url" placeholder="https://asbl.in/loft" oninput="generate()" />
+      </div>
+      <div class="field">
+        <label>Content / Ad Label <span style="font-weight:400;color:#aaa;">(optional)</span></label>
+        <input type="text" id="utm_content" placeholder="e.g. banner-v1 or video-30sec" oninput="generate()" />
+      </div>
+    </div>
+  </div>
+
+  <!-- OUTPUT -->
+  <div class="card">
+    <div class="card-title">Generated URL</div>
+    <div class="output-box">
+      <div class="output-label">Campaign URL</div>
+      <div id="output-url" class="empty">Fill in the required fields above to generate your URL</div>
+      <button class="copy-btn" id="copy-btn" onclick="copyUrl()">Copy</button>
+      <div class="utm-breakdown" id="utm-chips"></div>
+    </div>
+  </div>
+
+  <!-- HISTORY -->
+  <div class="card">
+    <div class="section-row">
+      <div class="card-title" style="margin-bottom:0;">Recent URLs</div>
+      <button class="clear-btn" onclick="clearHistory()">Clear All</button>
+    </div>
+    <div class="history-list" id="history-list">
+      <div class="no-history">No URLs generated yet</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  // Project → Base URL map
+  const PROJECT_URLS = {
+    loft:      'https://asbl.in/loft',
+    spectra:   'https://asbl.in/spectra',
+    broadway:  'https://asbl.in/broadway',
+    landmark:  'https://asbl.in/landmark',
+    legacy:    'https://asbl.in/legacy',
+  };
+
+  // Platform → suggested medium (paid or free)
+  const PLATFORM_MEDIUM = {
+    // Paid platforms
+    facebook: 'paid', instagram: 'paid', ig: 'paid', linkedin: 'paid',
+    youtube: 'paid', whatsapp: 'paid', reddit: 'paid',
+    google: 'paid', dv360: 'paid',
+    aha_ott: 'paid', jiohotstar: 'paid', netflix: 'paid', sonyliv: 'paid',
+    spotify: 'paid', zee5: 'paid', amazon_mx_player: 'paid',
+    willow_tv: 'paid', big_tv: 'paid', samsung_ctv: 'paid',
+    taboola: 'paid', criteo: 'paid', inshorts: 'paid', dailyhunt: 'paid',
+    mcanvas: 'paid', lokal: 'paid', swiggy: 'paid', zomato: 'paid',
+    blinkit: 'paid', instamart: 'paid', uber: 'paid', zepto: 'paid',
+    mygate: 'paid', makemytrip: 'paid', skyscanner: 'paid',
+    adbeets: 'paid', adgebra: 'paid', adonmo: 'paid', amazon: 'paid',
+    advantageclub: 'paid', cred: 'paid', credai: 'paid',
+    nixglobal: 'paid', yoptima: 'paid', infinitum: 'paid',
+    andhrajyothy: 'paid', cnbc: 'paid', deccanchronicle: 'paid',
+    economictimes: 'paid', eenadu: 'paid', et_now: 'paid',
+    financial_express: 'paid', forbes: 'paid', hans_india: 'paid',
+    htmedia: 'paid', hyderabad_times: 'paid', livemint: 'paid',
+    namaste_telangana: 'paid', namaste_andhra: 'paid', namastenri: 'paid',
+    newindiaexpress: 'paid', news18: 'paid', sakshi: 'paid',
+    telangana_today: 'paid', telugutimes: 'paid', the_south_india_times: 'paid',
+    thehindu: 'paid', toi: 'paid', tv9: 'paid', zeebusiness: 'paid',
+    magazine: 'paid', fim: 'paid', cpc: 'paid', cpl: 'paid',
+    zoom: 'paid', linktree: 'paid', way2news: 'paid',
+    // Free platforms
+    google_organic: 'free', organic: 'free', blog: 'free', article: 'free',
+    forum: 'free', email: 'free', newsletter: 'free',
+    homes_by_asbl: 'free', offline_event: 'free', family_day_hyd: 'free',
+    nri: 'free', orphan: 'free',
+  };
+
+  function onPlatformChange() {
+    const platform = document.getElementById('platform').value;
+    const medium   = document.getElementById('medium');
+    if (platform && PLATFORM_MEDIUM[platform] && !medium.value) {
+      medium.value = PLATFORM_MEDIUM[platform];
+    }
+    generate();
+  }
+
+  function slugify(s) {
+    return (s || '').toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_\-]/g, '');
+  }
+
+  let currentUrl = '';
+
+  function generate() {
+    const project       = document.getElementById('project').value;
+    const platform      = document.getElementById('platform').value;
+    const medium        = document.getElementById('medium').value;
+    const campaignName  = document.getElementById('campaign_name').value.trim();
+    const campaignType  = document.getElementById('campaign_type').value;
+    const pageUrl       = document.getElementById('page_url').value.trim();
+    const utmContent    = document.getElementById('utm_content').value.trim();
+    const team          = document.getElementById('team').value;
+
+    // Auto-fill page URL when project selected
+    if (project && !pageUrl) {
+      document.getElementById('page_url').value = PROJECT_URLS[project] || '';
+    }
+
+    const baseUrl = document.getElementById('page_url').value.trim() || (project ? PROJECT_URLS[project] : '');
+
+    const outputEl = document.getElementById('output-url');
+    const chipsEl  = document.getElementById('utm-chips');
+
+    if (!project || !platform || !medium || !campaignName || !baseUrl) {
+      outputEl.textContent = 'Fill in the required fields above to generate your URL';
+      outputEl.className = 'empty';
+      chipsEl.innerHTML = '';
+      currentUrl = '';
+      return;
+    }
+
+    // Build campaign slug: project + campaign name + optional type
+    const campaignSlug = [
+      project,
+      slugify(campaignName),
+      campaignType ? campaignType : ''
+    ].filter(Boolean).join('-');
+
+    // Content: utmContent or team
+    const contentVal = utmContent ? slugify(utmContent) : (team ? slugify(team) : '');
+
+    const params = new URLSearchParams();
+    params.set('utm_source',   platform);
+    params.set('utm_medium',   medium);
+    params.set('utm_campaign', campaignSlug);
+    if (contentVal) params.set('utm_content', contentVal);
+
+    // Ensure baseUrl has no trailing ?
+    const base = baseUrl.replace(/\?$/, '');
+    const separator = base.includes('?') ? '&' : '?';
+    currentUrl = base + separator + params.toString();
+
+    outputEl.textContent = currentUrl;
+    outputEl.className = '';
+
+    // Chips
+    const chipDefs = [
+      ['source',   platform],
+      ['medium',   medium],
+      ['campaign', campaignSlug],
+      ...(contentVal ? [['content', contentVal]] : []),
+    ];
+    chipsEl.innerHTML = chipDefs.map(([k, v]) =>
+      `<div class="utm-chip"><span>utm_${k}</span> = ${v}</div>`
+    ).join('');
+  }
+
+  function copyUrl() {
+    if (!currentUrl) return;
+    navigator.clipboard.writeText(currentUrl).then(() => {
+      const btn = document.getElementById('copy-btn');
+      btn.textContent = '✓ Copied!';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 2000);
+      saveHistory(currentUrl);
+    }).catch(() => {
+      // Fallback
+      const ta = document.createElement('textarea');
+      ta.value = currentUrl;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      saveHistory(currentUrl);
+    });
+  }
+
+  // History (in-memory only — no localStorage)
+  let history = [];
+
+  function saveHistory(url) {
+    if (history.includes(url)) return;
+    history.unshift(url);
+    if (history.length > 10) history.pop();
+    renderHistory();
+  }
+
+  function clearHistory() {
+    history = [];
+    renderHistory();
+  }
+
+  function renderHistory() {
+    const el = document.getElementById('history-list');
+    if (!history.length) {
+      el.innerHTML = '<div class="no-history">No URLs generated yet</div>';
+      return;
+    }
+    el.innerHTML = history.map((url, i) => `
+      <div class="history-item" onclick="copyHistoryItem(${i})">
+        <div class="history-url">${url}</div>
+        <div class="history-copy">Copy</div>
+      </div>
+    `).join('');
+  }
+
+  function copyHistoryItem(idx) {
+    const url = history[idx];
+    navigator.clipboard.writeText(url).catch(() => {
+      const ta = document.createElement('textarea');
+      ta.value = url;
+      document.body.appendChild(ta); ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    });
+    const items = document.querySelectorAll('.history-item');
+    if (items[idx]) {
+      items[idx].querySelector('.history-copy').textContent = '✓ Copied';
+      setTimeout(() => {
+        if (items[idx]) items[idx].querySelector('.history-copy').textContent = 'Copy';
+      }, 1500);
+    }
+  }
+</script>
+</body>
+</html>
