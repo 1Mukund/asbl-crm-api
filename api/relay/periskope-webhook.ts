@@ -140,26 +140,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST")   return res.status(405).json({ error: "Method not allowed" });
 
-  // Respond to Periskope immediately (avoid timeout/retry)
-  res.status(200).json({ received: true });
-
   try {
     const body   = req.body || {};
     const event  = String(body?.event_type || body?.event || body?.type || "");
     const data   = body?.data || body;
 
-    console.log(`[Periskope Webhook] Event: ${event}`);
+    console.log(`[Periskope Webhook] Event: ${event}, raw keys: ${Object.keys(data).join(",")}`);
 
-    // Only handle message.created
+    // Only handle message.created / message.received
     if (event !== "message.created" && event !== "message.received") {
       console.log(`[Periskope Webhook] Skipped event: ${event}`);
-      return;
+      return res.status(200).json({ skipped: true, event });
     }
 
     // Only inbound messages
     if (!isInbound(data)) {
       console.log("[Periskope Webhook] Outbound message, skipping");
-      return;
+      return res.status(200).json({ skipped: true, reason: "outbound" });
     }
 
     const phone   = extractPhone(data);
@@ -167,27 +164,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (!phone) {
       console.log("[Periskope Webhook] Could not extract phone");
-      return;
+      return res.status(200).json({ skipped: true, reason: "no phone" });
     }
     if (!message) {
-      console.log("[Periskope Webhook] Empty message body, skipping");
-      return;
+      console.log("[Periskope Webhook] Empty message, skipping");
+      return res.status(200).json({ skipped: true, reason: "no message" });
     }
 
     console.log(`[Periskope Webhook] Inbound from ${phone}: ${message.slice(0, 80)}`);
 
-    // Get sender used for this customer
+    // Get sender for this customer
     const sender = await getSenderForPhone(phone);
+    console.log(`[Periskope Webhook] Using sender: ${sender}`);
 
-    // Call Anandita
+    // Call Anandita LLM
     const reply = await callAnandita(phone, message);
-    console.log(`[Periskope Webhook] Anandita reply: ${reply.slice(0, 80)}`);
+    console.log(`[Periskope Webhook] Anandita reply: ${reply.slice(0, 100)}`);
 
-    // Send reply
+    // Send reply via Periskope
     await sendReply(phone, sender, reply);
     console.log(`[Periskope Webhook] Reply sent to ${phone} via ${sender}`);
 
+    return res.status(200).json({ success: true, phone, sender });
+
   } catch (err: any) {
     console.error("[Periskope Webhook] Error:", err.message);
+    return res.status(500).json({ error: err.message });
   }
 }
