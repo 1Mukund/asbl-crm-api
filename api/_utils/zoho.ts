@@ -42,6 +42,24 @@ export async function getAccessToken(): Promise<string> {
 
 // ─── Lead Search ─────────────────────────────────────────────────────────────
 
+export async function findLeadByArrowheadCallId(callId: string): Promise<any | null> {
+  const token = await getAccessToken();
+  try {
+    const res = await axios.get(`${ZOHO_API_BASE}/Leads/search`, {
+      headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      params: {
+        criteria: `(Last_Arrowhead_Call_ID:equals:${callId})`,
+        fields: "id,First_Name,Last_Name,Mobile,Master_Lead_ID,Project_Lead_ID,ASBL_Project",
+      },
+    });
+    return res.data?.data?.[0] ?? null;
+  } catch (err: any) {
+    if (err.response?.status === 204) return null;
+    const detail = err.response?.data ?? err.message;
+    throw new Error(`Zoho search failed [findByArrowheadCallId]: ${JSON.stringify(detail)}`);
+  }
+}
+
 export async function findLeadByPhone(phone: string): Promise<any | null> {
   const token = await getAccessToken();
   try {
