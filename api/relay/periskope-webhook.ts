@@ -4,9 +4,11 @@
  * Flow:
  *   1. Customer replies on WhatsApp
  *   2. Periskope fires webhook here (event_type: "message.created")
- *   3. We filter inbound messages only
- *   4. Call Anandita LLM with customer's message
- *   5. Send Anandita's reply back via Periskope
+ *   3. Filter inbound messages only
+ *   4. Detect intent from customer message
+ *   5. Call Anandita LLM for reply
+ *   6. Send reply via Periskope
+ *   7. Update Zoho: Last_Intent (triggers Workflow → Blueprint stage change)
  *
  * Webhook URL: https://asbl-crm-api.vercel.app/api/relay/periskope-webhook
  */
@@ -18,6 +20,103 @@ const ANANDITA_URL      = process.env.ANANDITA_URL || "http://35.154.144.37:8080
 const ANANDITA_API_KEY  = process.env.ANANDITA_API_KEY || "asbl_9b9b6b7ff1f758be40aca7ceb03d7d0d9c57d788b4457d5ca5819620b25d146a";
 const SUPABASE_URL      = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY      = process.env.SUPABASE_SECRET_KEY || "";
+const ZOHO_CLIENT_ID     = process.env.ZOHO_CLIENT_ID || "";
+const ZOHO_CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET || "";
+const ZOHO_REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN || "";
+const ZOHO_API_BASE      = "https://www.zohoapis.in/crm/v3";
+
+// ── Intent detection ──────────────────────────────────────────────────────────
+// Returns one of: not_interested | site_visit | price | brochure | call_me | general
+function detectIntent(message: string): string {
+  const msg = message.toLowerCase();
+
+  // Not interested — negative signals
+  if (/not interested|nahi chahiye|nhi chahiye|nahin chahiye|interested nahi|interest nahi|band karo|mat karo|mujhe nahi|mujhe nhi|no thanks|don't contact|do not contact|stop|unsubscribe|remove me|bura|galat|spam/i.test(msg)) {
+    return "not_interested";
+  }
+
+  // Virtual tour intent — check BEFORE site_visit
+  if (/virtual tour|virtual visit|online tour|online dekh|zoom|video call|video pe dikhao|virtually|virtual/i.test(msg)) {
+    return "virtual_tour";
+  }
+
+  // Site visit intent — physical visit confirmed
+  if (/site visit|visit karna|visit krna|aa jaun|aa sakta|aa rha|aa raha|physical|dekhna chahta|dekhna chahti|location|address|kahan hai|kahan h|show flat|flat dikhao|project dikhao|aaunga|aaungi/i.test(msg)) {
+    return "site_visit";
+  }
+
+  // Price intent
+  if (/price|cost|rate|kitna|budget|amount|kitne ka|kitne mein|kaafi mehnga|affordable|emi|loan/i.test(msg)) {
+    return "price";
+  }
+
+  // Brochure intent
+  if (/brochure|pdf|details|information|info bhejo|send|bhej do|share karo/i.test(msg)) {
+    return "brochure";
+  }
+
+  // Call me intent
+  if (/call karo|call me|call krna|phone karo|baat karna|baat krni|call back|callback/i.test(msg)) {
+    return "call_me";
+  }
+
+  // Positive general interest
+  if (/haan|ha |yes|interested|batao|bataiye|theek hai|thik hai|okay|ok|acha|accha|sure|zaroor/i.test(msg)) {
+    return "general";
+  }
+
+  return "general";
+}
+
+// ── Zoho: Get access token ─────────────────────────────────────────────────────
+async function getZohoToken(): Promise<string> {
+  const r = await fetch(
+    `https://accounts.zoho.in/oauth/v2/token?grant_type=refresh_token&client_id=${ZOHO_CLIENT_ID}&client_secret=${ZOHO_CLIENT_SECRET}&refresh_token=${ZOHO_REFRESH_TOKEN}`,
+    { method: "POST" }
+  );
+  const data = await r.json() as any;
+  if (!data.access_token) throw new Error("Zoho token error: " + JSON.stringify(data));
+  return data.access_token;
+}
+
+// ── Zoho: Find lead by phone ───────────────────────────────────────────────────
+async function findLeadByPhone(phone: string, token: string): Promise<string | null> {
+  // Try Mobile field first
+  const r = await fetch(
+    `${ZOHO_API_BASE}/Leads/search?criteria=(Mobile:equals:${phone})&fields=id`,
+    { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
+  );
+  const data = await r.json() as any;
+  if (data?.data?.[0]?.id) return data.data[0].id;
+
+  // Try Phone field as fallback
+  const r2 = await fetch(
+    `${ZOHO_API_BASE}/Leads/search?criteria=(Phone:equals:${phone})&fields=id`,
+    { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
+  );
+  const data2 = await r2.json() as any;
+  return data2?.data?.[0]?.id || null;
+}
+
+// ── Zoho: Update lead intent ───────────────────────────────────────────────────
+async function updateZohoIntent(leadId: string, intent: string, token: string): Promise<void> {
+  const updateData: any = {
+    id: leadId,
+    Last_Intent: intent,
+    Whatsapp_Replied: true,
+  };
+
+  await fetch(`${ZOHO_API_BASE}/Leads`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Zoho-oauthtoken ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ data: [updateData] }),
+  });
+
+  console.log(`[Periskope Webhook] Zoho updated — Lead ${leadId}: Last_Intent=${intent}`);
+}
 
 // ── Save message to Supabase ──────────────────────────────────────────────────
 async function saveMessage(phone: string, direction: "inbound" | "outbound", message: string, sender: string): Promise<void> {
@@ -35,13 +134,6 @@ async function saveMessage(phone: string, direction: "inbound" | "outbound", mes
     console.error("[Periskope Webhook] Failed to save message:", err);
   }
 }
-
-const SENDER_NUMBERS = [
-  "919063141693",
-  "917995284040",
-  "918977537630",
-  "919059555164",
-];
 
 // ── Parse JID → clean phone number ───────────────────────────────────────────
 function parsePhone(jid: string): string | null {
@@ -90,10 +182,7 @@ async function sendReply(phone: string, sender: string, message: string): Promis
       },
       body: JSON.stringify({ chat_id: `${phone}@c.us` }),
     });
-    console.log(`[Periskope Webhook] Typing indicator sent`);
-  } catch {
-    // Typing not critical, continue anyway
-  }
+  } catch { /* not critical */ }
 
   // 2. Wait 10 seconds (human-like delay)
   await new Promise(resolve => setTimeout(resolve, 10000));
@@ -129,55 +218,54 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const data   = body?.data || body;
 
     console.log(`[Periskope Webhook] FULL BODY: ${JSON.stringify(body).slice(0, 2000)}`);
-    console.log(`[Periskope Webhook] Event: ${event}, data keys: ${Object.keys(data).join(",")}`);;
+    console.log(`[Periskope Webhook] Event: ${event}`);
 
     // Only handle message.created / message.received
     if (event !== "message.created" && event !== "message.received") {
-      console.log(`[Periskope Webhook] Skipped event: ${event}`);
       return res.status(200).json({ skipped: true, event });
     }
 
     // Only inbound messages
     if (!isInbound(data)) {
-      console.log("[Periskope Webhook] Outbound message, skipping");
       return res.status(200).json({ skipped: true, reason: "outbound" });
     }
 
-    // Customer phone from chat_id, sender from org_phone
-    const phone  = parsePhone(data?.chat_id);
-    const sender = parsePhone(data?.org_phone);
+    const phone   = parsePhone(data?.chat_id);
+    const sender  = parsePhone(data?.org_phone);
     const message = String(data?.body || "").trim();
 
-    if (!phone) {
-      console.log("[Periskope Webhook] Could not extract customer phone from chat_id");
-      return res.status(200).json({ skipped: true, reason: "no phone" });
-    }
-    if (!sender) {
-      console.log("[Periskope Webhook] Could not extract org_phone (our sender)");
-      return res.status(200).json({ skipped: true, reason: "no sender" });
-    }
-    if (!message) {
-      console.log("[Periskope Webhook] Empty message body, skipping");
-      return res.status(200).json({ skipped: true, reason: "no message" });
-    }
+    if (!phone)   return res.status(200).json({ skipped: true, reason: "no phone" });
+    if (!sender)  return res.status(200).json({ skipped: true, reason: "no sender" });
+    if (!message) return res.status(200).json({ skipped: true, reason: "no message" });
 
-    console.log(`[Periskope Webhook] Inbound from ${phone} → org: ${sender} | msg: ${message.slice(0, 80)}`);
+    console.log(`[Periskope Webhook] Inbound from ${phone} | msg: ${message.slice(0, 80)}`);
 
-    // Save inbound message to Supabase
+    // 1. Detect intent
+    const intent = detectIntent(message);
+    console.log(`[Periskope Webhook] Intent detected: ${intent}`);
+
+    // 2. Save inbound message to Supabase
     await saveMessage(phone, "inbound", message, sender);
 
-    // Call Anandita LLM
+    // 3. Call Anandita LLM for reply
     const reply = await callAnandita(phone, message);
     console.log(`[Periskope Webhook] Anandita reply: ${reply.slice(0, 100)}`);
 
-    // Send reply via Periskope
+    // 4. Send reply via Periskope
     await sendReply(phone, sender, reply);
-    console.log(`[Periskope Webhook] Reply sent to ${phone} via ${sender}`);
 
-    // Save outbound reply to Supabase
+    // 5. Save outbound reply to Supabase
     await saveMessage(phone, "outbound", reply, sender);
 
-    return res.status(200).json({ success: true, phone, sender });
+    // 6. Update Zoho with intent (async — don't block response)
+    getZohoToken()
+      .then(token => findLeadByPhone(phone, token).then(leadId => {
+        if (leadId) return updateZohoIntent(leadId, intent, token);
+        console.log(`[Periskope Webhook] Lead not found in Zoho for phone ${phone}`);
+      }))
+      .catch(err => console.error("[Periskope Webhook] Zoho update error:", err.message));
+
+    return res.status(200).json({ success: true, phone, intent });
 
   } catch (err: any) {
     console.error("[Periskope Webhook] Error:", err.message);
