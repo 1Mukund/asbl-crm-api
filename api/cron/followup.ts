@@ -16,78 +16,78 @@ const SUPABASE_KEY       = process.env.SUPABASE_SECRET_KEY || "";
 const PERISKOPE_API_KEY  = process.env.PERISKOPE_API_KEY || "";
 const PERISKOPE_API_URL  = "https://api.periskope.app/v1/messages/send";
 
-// ── 10 follow-up messages — FOMO-based, no specific prices or market data ────
-// From Anandita — short, conversational, Hindi/English mix
+// ── 10 follow-up messages — professional English, no emojis ─────────────────
+// From Anandita Reddy, Relationship Manager at ASBL
 const FOLLOWUP_MESSAGES: string[] = [
   // Day 1
-  `Hi! Main Aanandita hoon, ASBL se. 😊
+  `Dear Customer,
 
-Bas ek quick update dena chahti thi — abhi ASBL Loft pe ek *exciting offer chal raha hai*. Details share karungi jab baat ho, lekin yeh offer limited time ke liye hai.
+This is Anandita Reddy from ASBL. I wanted to follow up on your recent enquiry regarding ASBL Loft. We currently have a limited-time offer available that I believe would be of interest to you.
 
-Interested hain to ek baar reply zaroor karein! 🏠`,
+Please reply to this message at your convenience and I will be happy to share the details.`,
 
   // Day 2
-  `Namaste! Aanandita yahan. 🙏
+  `Dear Customer,
 
-Suna hai aap ASBL Loft mein interested hain — aaj batana chahti thi ki abhi jo *pricing chal rahi hai*, woh bahut acha deal hai. Bohot log is price point pe booking kar rahe hain.
+I am reaching out again regarding your interest in ASBL Loft. The current pricing is very competitive and we have been receiving a strong response from prospective buyers.
 
-Ek baar baat karte hain? Reply karein! 😊`,
+I would be glad to walk you through the options available. Please feel free to reply and we can take it from there.`,
 
   // Day 3
-  `Hi! Aanandita here.
+  `Dear Customer,
 
-ASBL Loft mein *1695 sq ft west facing units* abhi bahut tezi se bik rahi hain. Yeh size aur facing combination limited hai — jo jaldi decide karta hai usko milta hai.
+I wanted to bring to your attention that the west-facing 1695 sq ft units at ASBL Loft are in high demand. Availability for this particular configuration is limited.
 
-Aapke liye hold karwa sakti hoon — batao! 🏠`,
+If you would like me to reserve a unit for your consideration, please reply and I will arrange it right away.`,
 
   // Day 4
-  `Namaste! Aanandita here. 😊
+  `Dear Customer,
 
-Just checking in — ASBL Loft pe *current offer* aur kuch din hi hai. Price aur terms dono bahut favorable hain abhi.
+Just a quick follow-up to let you know that the current offer at ASBL Loft is available for a limited period. Both the pricing and payment terms are very favorable at this time.
 
-Koi bhi sawaal ho — call karein ya reply karein, main hoon yahan!`,
+Should you have any questions, please do not hesitate to reply or call me directly.`,
 
   // Day 5
-  `Hi! Main Aanandita — ASBL se.
+  `Dear Customer,
 
-Aaj specially isliye message kar rahi hoon ki *west facing 1695 sq ft* mein se kuch units hi bacha hain. Is size ki demand bahut zyada hai Loft mein.
+I am writing to inform you that only a few west-facing 1695 sq ft units remain available at ASBL Loft. This size and orientation has been among the most sought-after in the project.
 
-Agar serious hain to abhi baat karte hain — warna yeh units nahi milenge. 🙏`,
+I would recommend an early decision to secure the unit of your choice. Please reply and I will assist you promptly.`,
 
   // Day 6
-  `Namaste! Aanandita yahan.
+  `Dear Customer,
 
-ASBL Loft mein jo *special pricing* chal rahi hai — woh sirf kuch bookings ke liye aur available hai. Uske baad normal price pe jaayega.
+The special pricing currently available at ASBL Loft is applicable for a limited number of bookings. Once these are utilised, the pricing will revert to standard rates.
 
-Ek baar milte hain ya call karte hain? Reply karein! 😊`,
+If you are considering a purchase, now would be a good time to connect. Please reply at your convenience.`,
 
   // Day 7
-  `Hi! Aanandita here. 🏠
+  `Dear Customer,
 
-Last few days mein *kaafi bookings* ho gayi hain ASBL Loft mein. Floor plan aur unit selection abhi bhi hai, lekin jaldi decision lena theek rahega.
+We have seen considerable booking activity at ASBL Loft over the past few days. While floor plan and unit selection is still available, choices may become limited soon.
 
-Koi doubt ya sawaal ho — seedha reply karein, main personally handle karungi!`,
+Please reply if you would like to discuss further. I am happy to answer any questions you may have.`,
 
   // Day 8
-  `Namaste! Aanandita here.
+  `Dear Customer,
 
-Bas ek baar aur remind karna chahti thi — ASBL Loft ka *current offer* close hone wala hai. Iske baad same deal milna mushkil hoga.
+I wanted to remind you that the current offer at ASBL Loft is nearing its close. Securing the same terms at a later date may not be possible.
 
-Abhi baat karein? 🙏`,
+If now is a good time to connect, please reply and we can schedule a call or a site visit as per your preference.`,
 
   // Day 9
-  `Hi! Aanandita yahan — ASBL se. 😊
+  `Dear Customer,
 
-*1695 west facing* — yeh unit specifically bahut popular hai. Agar aap consider kar rahe hain to please ek baar baat karte hain, main poori detail clearly explain karungi bina kisi pressure ke.
+The west-facing 1695 sq ft configuration at ASBL Loft continues to receive strong interest. If you are evaluating this option, I am happy to provide all the details clearly and without any pressure.
 
-Reply ka wait karungi! 🏠`,
+Please reply whenever you are ready and I will ensure you have everything you need to make an informed decision.`,
 
   // Day 10
-  `Namaste! Main Aanandita — ASBL.
+  `Dear Customer,
 
-Yeh mera aakhri follow-up hai. Koi pressure nahi — bas itna kehna tha ki agar kabhi bhi ASBL Loft ke baare mein baat karni ho, main available hoon.
+This will be my final follow-up message. I completely understand if the timing is not right at the moment.
 
-*Offer abhi bhi chal raha hai* — jab ready ho, reply karein. Hoon yahan! 🙏`,
+Should you ever wish to revisit ASBL Loft or have any questions in the future, please feel free to reach out. The offer remains open and I am always available to assist you.`,
 ];
 
 // ── Supabase helpers ──────────────────────────────────────────────────────────

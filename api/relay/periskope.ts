@@ -60,19 +60,18 @@ function generateMessage(
 
   // Build enquiry detail line
   const details: string[] = [];
-  if (project)        details.push(`*${project}*`);
+  if (project)        details.push(project);
   if (budget)         details.push(`budget ${budget}`);
-  if (sizePreference) details.push(`${sizePreference}`);
+  if (sizePreference) details.push(sizePreference);
 
   const enquiryLine = details.length > 0
-    ? `Aapne hamare ${details.join(", ")} ke liye enquiry ki thi.`
-    : `Aapne hamare ek project ke liye enquiry ki thi.`;
+    ? `I understand you have recently expressed interest in ${details.join(", ")}.`
+    : `I understand you have recently expressed interest in one of our projects.`;
 
   return (
-    `Hi ${name}! 👋\n\n` +
-    `Main Aanandita Reddy hoon, ASBL mein aapki dedicated Relationship Manager. ${enquiryLine}\n\n` +
-    `Aapke ghar kharidne ke safar ko smooth aur easy banana mera kaam hai. ` +
-    `Koi bhi sawaal ho — pricing, location, availability — yahan reply karein, main haazir hoon! 🏠`
+    `Dear ${name},\n\n` +
+    `My name is Anandita Reddy and I am your dedicated Relationship Manager at ASBL. ${enquiryLine}\n\n` +
+    `I am here to assist you through every step of your home buying journey. Please feel free to reply to this message with any questions you may have regarding pricing, availability, floor plans, or anything else, and I will get back to you promptly.`
   );
 }
 
