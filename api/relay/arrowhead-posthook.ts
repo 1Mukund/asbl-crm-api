@@ -43,6 +43,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const callId: string = body.call_id || body.call?.id || "";
 
+    // Recording & transcription — confirmed field names from Arrowhead
+    const recordingUrl: string  = body.recording_url  || body.recording_link || "";
+    const transcription: string = body.transcription   || body.transcript     || "";
+
     if (!externalScheduleId) {
       return res.status(400).json({ error: "Missing external_schedule_id" });
     }
@@ -57,14 +61,26 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const zohoStatus = mapStatus(rawStatus);
 
-    // Update Zoho lead
-    await updateLead(lead.id, {
-      Call_Status: zohoStatus,
+    // Build Zoho update payload
+    const updatePayload: Record<string, any> = {
+      Call_Status:   zohoStatus,
       Call_Duration: callDuration,
-    });
+    };
 
-    console.log(`Updated lead ${lead.id} → ${zohoStatus}`);
-    return res.status(200).json({ status: "ok", lead_id: lead.id, call_status: zohoStatus });
+    // Only send if present — Zoho rejects empty strings for URL-type fields
+    if (recordingUrl)  updatePayload.Call_Recording_URL = recordingUrl;
+    if (transcription) updatePayload.Call_Transcription  = transcription;
+
+    await updateLead(lead.id, updatePayload);
+
+    console.log(`Updated lead ${lead.id} → ${zohoStatus}${recordingUrl ? " + recording" : ""}${transcription ? " + transcription" : ""}`);
+    return res.status(200).json({
+      status:       "ok",
+      lead_id:      lead.id,
+      call_status:  zohoStatus,
+      has_recording:    !!recordingUrl,
+      has_transcription: !!transcription,
+    });
 
   } catch (err: any) {
     console.error("Arrowhead posthook error:", err.message);
