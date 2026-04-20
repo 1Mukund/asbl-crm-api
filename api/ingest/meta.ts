@@ -13,7 +13,8 @@ function handleVerification(req: VercelRequest, res: VercelResponse) {
   const token     = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  if (mode === "subscribe" && token === process.env.META_VERIFY_TOKEN) {
+  const expectedToken = process.env.META_VERIFY_TOKEN || "asbl_meta_verify_2024";
+  if (mode === "subscribe" && token === expectedToken) {
     console.log("Meta webhook verified ✅");
     return res.status(200).send(challenge);
   }
