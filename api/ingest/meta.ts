@@ -33,7 +33,7 @@ async function fetchMetaLeadData(leadgenId: string): Promise<Record<string, any>
   try {
     const res = await axios.get(`${GRAPH_API}/${leadgenId}`, {
       params: {
-        fields: "field_data,created_time,ad_id,ad_name,adset_id,adset_name,campaign_id,campaign_name,form_id,page_id",
+        fields: "field_data,created_time,ad_id,ad_name,adset_id,adset_name,campaign_id,campaign_name,form_id",
         access_token: token,
       },
     });
