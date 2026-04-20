@@ -282,7 +282,7 @@
     showState("state-loading");
 
     try {
-      const r = await fetch(`${API_BASE}/api/whatsapp-history?phone=${rawPhone}`);
+      const r = await fetch(`${API_BASE}/api/chat-history?phone=${rawPhone}&source=supabase`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const data = await r.json();
       const messages = data.messages || [];
