@@ -67,18 +67,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       Call_Duration: callDuration,
     };
 
-    // Only send if present — Zoho rejects empty strings for URL-type fields
-    if (recordingUrl)  updatePayload.Call_Recording_URL = recordingUrl;
-    if (transcription) updatePayload.Call_Transcription  = transcription;
+    // Call_Summary = existing Zoho field
+    // Combine transcription + recording URL into Call_Summary
+    if (transcription || recordingUrl) {
+      const summaryParts: string[] = [];
+      if (transcription) summaryParts.push(transcription);
+      if (recordingUrl)  summaryParts.push(`Recording: ${recordingUrl}`);
+      updatePayload.Call_Summary = summaryParts.join("\n\n");
+    }
 
     await updateLead(lead.id, updatePayload);
 
-    console.log(`Updated lead ${lead.id} → ${zohoStatus}${recordingUrl ? " + recording" : ""}${transcription ? " + transcription" : ""}`);
+    console.log(`Updated lead ${lead.id} → ${zohoStatus}${transcription ? " + transcription" : ""}${recordingUrl ? " + recording" : ""}`);
     return res.status(200).json({
-      status:       "ok",
-      lead_id:      lead.id,
-      call_status:  zohoStatus,
-      has_recording:    !!recordingUrl,
+      status:            "ok",
+      lead_id:           lead.id,
+      call_status:       zohoStatus,
+      has_recording:     !!recordingUrl,
       has_transcription: !!transcription,
     });
 
