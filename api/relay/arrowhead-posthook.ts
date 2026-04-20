@@ -1,5 +1,5 @@
 import { VercelRequest, VercelResponse } from "@vercel/node";
-import { findLeadByArrowheadCallId, updateLead } from "../_utils/zoho";
+import { findLeadByArrowheadCallId, updateLead, createCallLog } from "../_utils/zoho";
 
 // Map Arrowhead call_result_slug → Zoho Call_Status picklist value
 function mapStatus(raw: string): string {
@@ -43,7 +43,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const callId: string = body.call_id || body.call?.id || "";
 
-    // Recording & transcription — confirmed field names from Arrowhead
+    // Recording & transcription — field names confirmed by Arrowhead team
     const recordingUrl: string  = body.recording_url  || body.recording_link || "";
     const transcription: string = body.transcription   || body.transcript     || "";
 
@@ -60,25 +60,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     const zohoStatus = mapStatus(rawStatus);
+    const leadName = [lead.First_Name, lead.Last_Name].filter(Boolean).join(" ") || "Unknown";
 
-    // Build Zoho update payload
-    const updatePayload: Record<string, any> = {
+    // ── Step 1: Update lead-level fields (latest call status) ────────────────
+    await updateLead(lead.id, {
       Call_Status:   zohoStatus,
       Call_Duration: callDuration,
-    };
+    });
 
-    // Call_Summary = existing Zoho field
-    // Combine transcription + recording URL into Call_Summary
-    if (transcription || recordingUrl) {
-      const summaryParts: string[] = [];
-      if (transcription) summaryParts.push(transcription);
-      if (recordingUrl)  summaryParts.push(`Recording: ${recordingUrl}`);
-      updatePayload.Call_Summary = summaryParts.join("\n\n");
-    }
+    // ── Step 2: Create a Call log entry (shows in lead detail view) ───────────
+    // Each call gets its own entry — 4 calls = 4 separate logs with transcription & recording
+    await createCallLog({
+      leadId:       lead.id,
+      leadName,
+      externalId:   externalScheduleId,
+      callStatus:   zohoStatus,
+      durationSecs: callDuration,
+      transcription: transcription || undefined,
+      recordingUrl:  recordingUrl  || undefined,
+    });
 
-    await updateLead(lead.id, updatePayload);
+    console.log(`Lead ${lead.id} updated → ${zohoStatus} | Call log created for ${externalScheduleId}`);
 
-    console.log(`Updated lead ${lead.id} → ${zohoStatus}${transcription ? " + transcription" : ""}${recordingUrl ? " + recording" : ""}`);
     return res.status(200).json({
       status:            "ok",
       lead_id:           lead.id,

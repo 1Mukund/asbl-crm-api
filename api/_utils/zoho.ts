@@ -127,3 +127,55 @@ export async function updateLead(id: string, data: Record<string, any>): Promise
     throw new Error(`Zoho updateLead failed: ${JSON.stringify(detail)}`);
   }
 }
+
+// ─── Create Call Log (Calls module — shows in lead detail view) ──────────────
+export async function createCallLog(params: {
+  leadId:          string;
+  leadName:        string;
+  externalId:      string;  // e.g. "1012-LOFT-1-call-2"
+  callStatus:      string;  // Zoho picklist value e.g. "Connected"
+  durationSecs:    number;
+  transcription?:  string;
+  recordingUrl?:   string;
+}): Promise<void> {
+  const token = await getAccessToken();
+
+  // Format duration as HH:MM:SS for Zoho
+  const h = Math.floor(params.durationSecs / 3600);
+  const m = Math.floor((params.durationSecs % 3600) / 60);
+  const s = params.durationSecs % 60;
+  const durationStr = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+
+  // Build description: transcription + recording link
+  const descParts: string[] = [];
+  if (params.transcription) descParts.push(`📝 Transcription:\n${params.transcription}`);
+  if (params.recordingUrl)  descParts.push(`🎙️ Recording:\n${params.recordingUrl}`);
+  const description = descParts.join("\n\n") || "";
+
+  const callData: Record<string, any> = {
+    Subject:         `Arrowhead Call — ${params.externalId}`,
+    Call_Type:       "Outbound",
+    Call_Status:     "Completed",
+    Call_Result:     params.callStatus,
+    Call_Duration:   durationStr,
+    Description:     description,
+    Call_Start_Time: new Date().toISOString().replace(/\.\d{3}Z$/, "+05:30"),
+    Who_Id: {
+      id:   params.leadId,
+      name: params.leadName,
+    },
+    $se_module: "Leads",
+  };
+
+  try {
+    await axios.post(
+      `${ZOHO_API_BASE}/Calls`,
+      { data: [callData] },
+      { headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" } }
+    );
+  } catch (err: any) {
+    const detail = err.response?.data ?? err.message;
+    // Log but don't throw — call log failure shouldn't block lead update
+    console.error(`Zoho createCallLog failed: ${JSON.stringify(detail)}`);
+  }
+}
