@@ -161,7 +161,6 @@ export async function createCallLog(params: {
     Description:     description,
     Call_Start_Time: new Date().toISOString().replace(/\.\d{3}Z$/, "+05:30"),
     Who_Id:     { id: params.leadId },
-    $se_module: "Leads",
   };
 
   try {
