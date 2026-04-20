@@ -96,16 +96,27 @@ async function findLeadByPhone(phone: string, token: string): Promise<string | n
     `${ZOHO_API_BASE}/Leads/search?criteria=(Mobile:equals:${phone})&fields=id`,
     { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
   );
-  const data = await r.json() as any;
-  if (data?.data?.[0]?.id) return data.data[0].id;
+  if (r.ok && r.status !== 204) {
+    const text = await r.text();
+    if (text) {
+      const data = JSON.parse(text) as any;
+      if (data?.data?.[0]?.id) return data.data[0].id;
+    }
+  }
 
   // Try Phone field as fallback
   const r2 = await fetch(
     `${ZOHO_API_BASE}/Leads/search?criteria=(Phone:equals:${phone})&fields=id`,
     { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
   );
-  const data2 = await r2.json() as any;
-  return data2?.data?.[0]?.id || null;
+  if (r2.ok && r2.status !== 204) {
+    const text2 = await r2.text();
+    if (text2) {
+      const data2 = JSON.parse(text2) as any;
+      return data2?.data?.[0]?.id || null;
+    }
+  }
+  return null;
 }
 
 // ── Zoho: Update lead intent ───────────────────────────────────────────────────
