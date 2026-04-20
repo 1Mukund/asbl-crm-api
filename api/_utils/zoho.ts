@@ -164,11 +164,26 @@ export async function createCallLog(params: {
   };
 
   try {
-    await axios.post(
+    // Step 1: Create the call (without Who_Id — direct creation works)
+    const createRes = await axios.post(
       `${ZOHO_API_BASE}/Calls`,
       { data: [callData] },
       { headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" } }
     );
+
+    const callId: string = createRes.data?.data?.[0]?.details?.id;
+    if (!callId) return;
+
+    // Step 2: PATCH the call to link it to the lead (sometimes accepted as update)
+    await axios.patch(
+      `${ZOHO_API_BASE}/Calls`,
+      { data: [{ id: callId, Who_Id: { id: params.leadId }, $se_module: "Leads" }] },
+      { headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" } }
+    ).catch((patchErr: any) => {
+      // Log but don't throw — call was created, linking is best-effort
+      console.log(`Call created (${callId}) but lead linking failed: ${JSON.stringify(patchErr.response?.data ?? patchErr.message)}`);
+    });
+
   } catch (err: any) {
     const detail = err.response?.data ?? err.message;
     console.error(`Zoho createCallLog failed: ${JSON.stringify(detail)}`);
