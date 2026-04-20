@@ -160,7 +160,7 @@ export async function createCallLog(params: {
     Call_Duration:   durationStr,
     Description:     description,
     Call_Start_Time: new Date().toISOString().replace(/\.\d{3}Z$/, "+05:30"),
-    Who_Id:     { id: params.leadId },
+    // Who_Id linking not supported for Leads in this org — using Notes instead
   };
 
   try {
@@ -171,7 +171,49 @@ export async function createCallLog(params: {
     );
   } catch (err: any) {
     const detail = err.response?.data ?? err.message;
-    // Log but don't throw — call log failure shouldn't block lead update
     console.error(`Zoho createCallLog failed: ${JSON.stringify(detail)}`);
+  }
+}
+
+// ─── Create Note on Lead (shows in Notes section + Timeline of lead detail) ──
+export async function createCallNote(params: {
+  leadId:       string;
+  externalId:   string;
+  callStatus:   string;
+  durationSecs: number;
+  transcription?: string;
+  recordingUrl?:  string;
+}): Promise<void> {
+  const token = await getAccessToken();
+
+  const mins = Math.floor(params.durationSecs / 60);
+  const secs = params.durationSecs % 60;
+  const durStr = `${mins}m ${secs}s`;
+
+  const lines: string[] = [
+    `📞 Call ID: ${params.externalId}`,
+    `📊 Status: ${params.callStatus}`,
+    `⏱️ Duration: ${durStr}`,
+  ];
+  if (params.recordingUrl)  lines.push(`\n🎙️ Recording:\n${params.recordingUrl}`);
+  if (params.transcription) lines.push(`\n📝 Transcription:\n${params.transcription}`);
+
+  const noteData = {
+    Note_Title:   `Arrowhead Call — ${params.externalId}`,
+    Note_Content: lines.join("\n"),
+    Parent_Id:    params.leadId,
+    $se_module:   "Leads",
+  };
+
+  try {
+    await axios.post(
+      `${ZOHO_API_BASE}/Notes`,
+      { data: [noteData] },
+      { headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" } }
+    );
+    console.log(`Call note created for lead ${params.leadId}`);
+  } catch (err: any) {
+    const detail = err.response?.data ?? err.message;
+    console.error(`Zoho createCallNote failed: ${JSON.stringify(detail)}`);
   }
 }

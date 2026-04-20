@@ -1,5 +1,5 @@
 import { VercelRequest, VercelResponse } from "@vercel/node";
-import { findLeadByArrowheadCallId, updateLead, createCallLog } from "../_utils/zoho";
+import { findLeadByArrowheadCallId, updateLead, createCallLog, createCallNote } from "../_utils/zoho";
 
 // Map Arrowhead call_result_slug → Zoho Call_Status picklist value
 function mapStatus(raw: string): string {
@@ -68,14 +68,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       Call_Duration: callDuration,
     });
 
-    // ── Step 2: Create a Call log entry (shows in lead detail view) ───────────
-    // Each call gets its own entry — 4 calls = 4 separate logs with transcription & recording
+    // ── Step 2: Create Call log (global Calls module) ─────────────────────────
     await createCallLog({
-      leadId:       lead.id,
+      leadId:        lead.id,
       leadName,
-      externalId:   externalScheduleId,
-      callStatus:   zohoStatus,
-      durationSecs: callDuration,
+      externalId:    externalScheduleId,
+      callStatus:    zohoStatus,
+      durationSecs:  callDuration,
+      transcription: transcription || undefined,
+      recordingUrl:  recordingUrl  || undefined,
+    });
+
+    // ── Step 3: Create Note on lead (shows in lead detail Notes section) ─────
+    // Notes API reliably links to leads — appears in Notes + Timeline
+    await createCallNote({
+      leadId:        lead.id,
+      externalId:    externalScheduleId,
+      callStatus:    zohoStatus,
+      durationSecs:  callDuration,
       transcription: transcription || undefined,
       recordingUrl:  recordingUrl  || undefined,
     });
