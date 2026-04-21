@@ -114,6 +114,8 @@ export async function createLead(data: Record<string, any>): Promise<string> {
   }
 }
 
+const URL_FIELDS = ["First_Page_Visited", "Last_Page_Visited", "Referrer_URL"];
+
 export async function updateLead(id: string, data: Record<string, any>): Promise<void> {
   const token = await getAccessToken();
   try {
@@ -124,6 +126,27 @@ export async function updateLead(id: string, data: Record<string, any>): Promise
     );
   } catch (err: any) {
     const detail = err.response?.data ?? err.message;
+    // If INVALID_DATA on a URL field, retry without URL fields
+    const hasUrlError = Array.isArray(err.response?.data?.data) &&
+      err.response.data.data.some((d: any) =>
+        d.code === "INVALID_DATA" && URL_FIELDS.includes(d.details?.api_name)
+      );
+    if (hasUrlError) {
+      const cleanData = { ...data };
+      URL_FIELDS.forEach(f => delete cleanData[f]);
+      console.warn(`Retrying updateLead without URL fields for lead ${id}`);
+      try {
+        await axios.patch(
+          `${ZOHO_API_BASE}/Leads`,
+          { data: [{ id, ...cleanData }] },
+          { headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" } }
+        );
+        return;
+      } catch (retryErr: any) {
+        const retryDetail = retryErr.response?.data ?? retryErr.message;
+        throw new Error(`Zoho updateLead failed (retry): ${JSON.stringify(retryDetail)}`);
+      }
+    }
     throw new Error(`Zoho updateLead failed: ${JSON.stringify(detail)}`);
   }
 }
