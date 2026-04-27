@@ -14,8 +14,8 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 const PERISKOPE_API_KEY  = process.env.PERISKOPE_API_KEY  || "";
 const PERISKOPE_API_URL  = "https://api.periskope.app/v1/messages/send";
-const ANANDITA_URL       = process.env.ANANDITA_URL  || "http://35.154.144.37:8080/api/chat/";
-const ANANDITA_API_KEY   = process.env.ANANDITA_API_KEY  || "asbl_9b9b6b7ff1f758be40aca7ceb03d7d0d9c57d788b4457d5ca5819620b25d146a";
+const ANANDITA_URL       = process.env.ANANDITA_URL  || "http://35.154.144.37:8080/api/chat/anandita_rm/";
+const ANANDITA_API_KEY   = process.env.ANANDITA_API_KEY  || "asbl_dccd9fea5d2fe188f5518574354e8fd805f0fd0a507926139fee0f1ae2ff07b1";
 const SUPABASE_URL       = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY       = process.env.SUPABASE_SECRET_KEY || "";
 
