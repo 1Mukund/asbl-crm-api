@@ -1,5 +1,5 @@
 import { VercelRequest, VercelResponse } from "@vercel/node";
-import { findLeadByArrowheadCallId, updateLead, createCallLog, createCallNote } from "../_utils/zoho";
+import { findLeadByArrowheadCallId, updateLead, createCallLog, createCallNote, triggerBlueprintTransition } from "../_utils/zoho";
 
 // Map Arrowhead call_result_slug → Zoho Call_Status picklist value
 function mapStatus(raw: string): string {
@@ -62,11 +62,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const zohoStatus = mapStatus(rawStatus);
     const leadName = [lead.First_Name, lead.Last_Name].filter(Boolean).join(" ") || "Unknown";
 
-    // ── Step 1: Update lead-level fields (latest call status) ────────────────
+    // ── Step 1: Update lead-level fields (latest call status + accumulate duration) ──
+    const prevDuration = Number(lead.Total_Call_Duration_Secs ?? 0);
     await updateLead(lead.id, {
-      Call_Status:   zohoStatus,
-      Call_Duration: callDuration,
+      Call_Status:              zohoStatus,
+      Call_Duration:            callDuration,
+      Total_Call_Duration_Secs: prevDuration + callDuration,
     });
+
+    // ── Step 1b: Blueprint transition if Connected ────────────────────────────
+    if (zohoStatus === "Connected") {
+      await triggerBlueprintTransition(lead.id, "Call Connected");
+    }
 
     // ── Step 2: Create Call log (global Calls module) ─────────────────────────
     await createCallLog({

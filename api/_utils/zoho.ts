@@ -49,7 +49,7 @@ export async function findLeadByArrowheadCallId(callId: string): Promise<any | n
       headers: { Authorization: `Zoho-oauthtoken ${token}` },
       params: {
         criteria: `(Last_Arrowhead_Call_ID:equals:${callId})`,
-        fields: "id,First_Name,Last_Name,Mobile,Master_Lead_ID,Project_Lead_ID,ASBL_Project",
+        fields: "id,First_Name,Last_Name,Mobile,Master_Lead_ID,Project_Lead_ID,ASBL_Project,Total_Call_Duration_Secs",
       },
     });
     return res.data?.data?.[0] ?? null;
@@ -96,6 +96,39 @@ export async function findLeadByPhoneAndProject(phone: string, project: string):
   }
 }
 
+
+// ─── Blueprint Transition ────────────────────────────────────────────────────
+
+export async function triggerBlueprintTransition(
+  leadId: string,
+  transitionName: string
+): Promise<void> {
+  const token = await getAccessToken();
+  try {
+    // Fetch available transitions for this lead
+    const res = await axios.get(
+      `${ZOHO_API_BASE}/Leads/${leadId}/actions/blueprint`,
+      { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
+    );
+    const transitions: any[] = res.data?.blueprint?.transitions ?? [];
+    const match = transitions.find(
+      (t: any) => t.name?.toLowerCase() === transitionName.toLowerCase()
+    );
+    if (!match) {
+      console.log(`Blueprint transition "${transitionName}" not available for lead ${leadId}`);
+      return;
+    }
+    await axios.put(
+      `${ZOHO_API_BASE}/Leads/${leadId}/actions/blueprint`,
+      { blueprint: [{ transition_id: match.id, data: {} }] },
+      { headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" } }
+    );
+    console.log(`Blueprint transition "${transitionName}" triggered for lead ${leadId}`);
+  } catch (err: any) {
+    // Non-fatal — log and continue
+    console.error(`Blueprint transition failed for lead ${leadId}:`, err.response?.data ?? err.message);
+  }
+}
 
 // ─── Create / Update Lead ────────────────────────────────────────────────────
 
