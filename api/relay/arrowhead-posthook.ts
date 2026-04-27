@@ -71,15 +71,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
 
     // ── Step 1b: Blueprint transition based on call outcome ──────────────────
-    // Map every meaningful Arrowhead outcome to its blueprint stage transition
+    // Map every Arrowhead outcome to its actual blueprint transition name.
+    // Transition names must match exactly what's defined in the "ASBL Lead Journey" blueprint.
     const blueprintTransition: Record<string, string> = {
-      "Connected":      "Call Connected",
-      "Pre Site":       "Pre Site",
-      "Virtual Tour":   "Virtual Tour",
-      "Not Interested": "Not Interested",
-      "Not Connected":  "Call Not Connected",
-      "Busy":           "Call Not Connected",
-      "Switched Off":   "Call Not Connected",
+      "Connected":      "Call Connected",        // → Contacted state
+      "Pre Site":       "Site Visit Confirmed",   // → Pre Site state
+      "Virtual Tour":   "Virtual Tour Scheduled", // → Virtual Tour state
+      "Not Interested": "Not Interested",         // → Not Interested state
+      // Not Connected / Busy / Switched Off: no dedicated transition in blueprint — skip
     };
     const transition = blueprintTransition[zohoStatus];
     if (transition) {
