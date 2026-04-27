@@ -70,9 +70,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       Total_Call_Duration_Secs: prevDuration + callDuration,
     });
 
-    // ── Step 1b: Blueprint transition if Connected ────────────────────────────
-    if (zohoStatus === "Connected") {
-      await triggerBlueprintTransition(lead.id, "Call Connected");
+    // ── Step 1b: Blueprint transition based on call outcome ──────────────────
+    // Map every meaningful Arrowhead outcome to its blueprint stage transition
+    const blueprintTransition: Record<string, string> = {
+      "Connected":      "Call Connected",
+      "Pre Site":       "Pre Site",
+      "Virtual Tour":   "Virtual Tour",
+      "Not Interested": "Not Interested",
+      "Not Connected":  "Call Not Connected",
+      "Busy":           "Call Not Connected",
+      "Switched Off":   "Call Not Connected",
+    };
+    const transition = blueprintTransition[zohoStatus];
+    if (transition) {
+      triggerBlueprintTransition(lead.id, transition).catch((err) =>
+        console.error(`Blueprint '${transition}' failed:`, err.message)
+      );
     }
 
     // ── Step 2: Create Call log (global Calls module) ─────────────────────────

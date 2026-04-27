@@ -60,14 +60,17 @@ string automation.triggerArrowheadCall(string lead_id)
     payload.put("agent_id", "ag_crbk86r23fbfdc13f3f");
     payload.put("retell_llm_dynamic_variables", input_vars);
     payload.put("external_schedule_id", external_schedule_id);
+    // _zoho_lead_id is stripped by the relay before forwarding to Arrowhead
+    // — used only to trigger the "Lead Initiated" Blueprint transition
+    payload.put("_zoho_lead_id", lead_id);
 
-    // ── Call Arrowhead API ────────────────────────────────────────────────────
+    // ── Call Arrowhead via Vercel relay ───────────────────────────────────────
     arrowhead_response = invokeurl
     [
-        url: "https://api.arrowhead.ai/v2/schedule-call"
+        url: "https://asbl-crm-api.vercel.app/api/relay/arrowhead"
         type: POST
         parameters: payload.toString()
-        headers: {"Authorization": "Bearer YOUR_ARROWHEAD_API_KEY", "Content-Type": "application/json"}
+        headers: {"Content-Type": "application/json"}
     ];
 
     info "Arrowhead response: " + arrowhead_response;
