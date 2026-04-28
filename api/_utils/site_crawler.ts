@@ -26,74 +26,138 @@ const MAX_DEPTH = 2;
 const MAX_PAGES_PER_PROJECT = 15;
 const FETCH_TIMEOUT_MS = 15000;
 
-// ── Extract STRUCTURED text from HTML (meta + heading hierarchy) ────────────
-// asbl.in is an Angular SPA — most content is rendered client-side. The
-// richest summary content lives in <meta> tags (description, og, keywords)
-// and in <a> nav text. We capture all of these alongside the limited
-// h1/h2/p content present in the static HTML.
-function extractText(html: string): string {
-  const $ = cheerio.load(html);
-
-  const metaParts: string[] = [];
-
-  // 1. Title + meta tags first (often most useful summary)
-  const title = $("title").first().text().trim();
-  if (title) metaParts.push(`# ${title}`);
-
-  const desc =
-    $("meta[name='description']").attr("content") ||
-    $("meta[property='og:description']").attr("content") ||
-    "";
-  if (desc.trim()) metaParts.push(`Description: ${desc.trim()}`);
-
-  const ogTitle = $("meta[property='og:title']").attr("content");
-  if (ogTitle && ogTitle.trim() && ogTitle !== title) metaParts.push(`OG Title: ${ogTitle.trim()}`);
-
-  const keywords = $("meta[name='keywords']").attr("content");
-  if (keywords && keywords.trim()) metaParts.push(`Keywords: ${keywords.trim()}`);
-
-  // 2. Capture nav/section labels — informative even when content is JS-rendered
-  const navLabels = new Set<string>();
-  $("a[href*='asbl.in'], a[href^='/'], a[routerlink]").each((_, el) => {
-    const txt = $(el).text().replace(/\s+/g, " ").trim();
-    if (txt && txt.length > 2 && txt.length < 80 && /[a-zA-Z]/.test(txt)) {
-      navLabels.add(txt);
-    }
-  });
-  if (navLabels.size > 0) {
-    metaParts.push(`Site sections / linked pages: ${Array.from(navLabels).slice(0, 40).join(" | ")}`);
-  }
-
-  // 3. Strip non-content elements before walking content
-  $("script, style, nav, footer, header, noscript, iframe, svg, link, meta, button, form, [aria-hidden='true']").remove();
-  $(".nav, .navbar, .menu, .footer, .header, .sidebar, .cookie, .modal, .breadcrumb").remove();
-
-  // 4. Walk visible heading + paragraph + list-item content
-  const candidates = [$("main").first(), $("article").first(), $("[role=main]").first()];
-  const scope = candidates.find((c) => c.length > 0) || $("body");
-
+// ── Walk ALL elements and extract own-text (not descendant text) ─────────────
+// asbl.in is an Angular SPA — pricing/specs live inside <div>/<span> blocks
+// (not just h/p/li). We walk every element and pull only its DIRECT text
+// nodes so a parent doesn't duplicate the text of its children.
+function extractBodyText($: cheerio.CheerioAPI, scope: cheerio.Cheerio<any>): string {
   const lines: string[] = [];
   const seen = new Set<string>();
 
-  scope.find("h1, h2, h3, h4, h5, h6, p, li").each((_, el) => {
+  scope.find("body *, body").each((_, el) => {
     const tag = ((el as any).tagName || (el as any).name || "").toLowerCase();
-    const raw = $(el).text().replace(/\s+/g, " ").trim();
+    if (["script", "style", "noscript"].includes(tag)) return;
 
-    if (!raw || raw.length < 3) return;
-    if (seen.has(raw)) return;
-    seen.add(raw);
+    // Own text only (direct text nodes, not nested elements' text)
+    const ownText = $(el)
+      .contents()
+      .filter((_, n: any) => n.type === "text")
+      .map((_, n: any) => $(n).text())
+      .get()
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
 
-    const headingMatch = tag.match(/^h(\d)$/);
-    if (headingMatch) {
-      const level = Math.min(parseInt(headingMatch[1], 10), 6);
-      lines.push("\n" + "#".repeat(level) + " " + raw);
+    if (!ownText || ownText.length < 2) return;
+    if (seen.has(ownText)) return;
+    seen.add(ownText);
+
+    const hMatch = tag.match(/^h(\d)$/);
+    if (hMatch) {
+      const lvl = Math.min(parseInt(hMatch[1], 10), 6);
+      lines.push("\n" + "#".repeat(lvl) + " " + ownText);
     } else {
-      lines.push(raw);
+      lines.push(ownText);
     }
   });
 
-  const all = [...metaParts, "", ...lines].join("\n");
-  return all.replace(/\n{3,}/g, "\n\n").trim();
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// ── Extract nav structure (pages + sections) from home HTML ──────────────────
+function extractNavStructure(
+  html: string,
+  projectPath: string,
+): { pages: Array<{ url: string; label: string }>; sectionsByPage: Record<string, string[]> } {
+  const $ = cheerio.load(html);
+  const projectPrefix = projectPath.endsWith("/") ? projectPath : projectPath + "/";
+  const pages = new Map<string, string>(); // pathname → label
+  const sectionsByPage: Record<string, Set<string>> = {};
+
+  $("a[href]").each((_, el) => {
+    const href = ($(el).attr("href") || "").trim();
+    const label = $(el).text().replace(/\s+/g, " ").trim();
+    if (!href || !label || label.length < 2) return;
+
+    let url: URL;
+    try { url = new URL(href, "https://asbl.in"); } catch { return; }
+    if (url.hostname !== "asbl.in") return;
+    if (url.pathname !== projectPath && !url.pathname.startsWith(projectPrefix)) return;
+
+    const scroll = url.searchParams.get("scroll");
+    if (scroll) {
+      const parent = url.pathname;
+      if (!sectionsByPage[parent]) sectionsByPage[parent] = new Set();
+      sectionsByPage[parent].add(label);
+    } else {
+      // Page-level link
+      if (!pages.has(url.pathname) || pages.get(url.pathname)!.length < label.length) {
+        pages.set(url.pathname, label);
+      }
+    }
+  });
+
+  return {
+    pages: Array.from(pages.entries()).map(([url, label]) => ({ url, label })),
+    sectionsByPage: Object.fromEntries(
+      Object.entries(sectionsByPage).map(([k, v]) => [k, Array.from(v)]),
+    ),
+  };
+}
+
+// ── Build structured project content from a single home-page fetch ──────────
+function buildStructuredContent(html: string, project: string, projectPath: string): string {
+  const $ = cheerio.load(html);
+
+  // Meta extraction
+  const title = $("title").first().text().trim();
+  const description =
+    $("meta[name='description']").attr("content") ||
+    $("meta[property='og:description']").attr("content") ||
+    "";
+  const ogTitle = $("meta[property='og:title']").attr("content") || "";
+  const keywords = $("meta[name='keywords']").attr("content") || "";
+
+  const nav = extractNavStructure(html, projectPath);
+
+  // Strip noise before body extraction
+  $("script, style, noscript, iframe, svg, link, meta, button, form, [aria-hidden='true']").remove();
+  $(".nav, .navbar, .menu, .footer, .header, .sidebar, .cookie, .modal, .breadcrumb").remove();
+
+  const body = extractBodyText($, $.root());
+
+  const sections: string[] = [];
+
+  sections.push(`# PROJECT: ${project}`);
+
+  sections.push(`\n## Meta`);
+  if (title) sections.push(`Title: ${title}`);
+  if (ogTitle && ogTitle !== title) sections.push(`OG Title: ${ogTitle.trim()}`);
+  if (description) sections.push(`Description: ${description.trim()}`);
+  if (keywords) sections.push(`Keywords: ${keywords.trim()}`);
+
+  if (nav.pages.length > 0) {
+    sections.push(`\n## Pages on this project's site`);
+    for (const p of nav.pages) {
+      sections.push(`- ${p.label}  (${p.url})`);
+    }
+  }
+
+  const sectionEntries = Object.entries(nav.sectionsByPage);
+  if (sectionEntries.length > 0) {
+    sections.push(`\n## Named sections within each page (from in-page anchors)`);
+    for (const [page, labels] of sectionEntries) {
+      sections.push(`### ${page}`);
+      for (const l of labels) sections.push(`- ${l}`);
+    }
+  }
+
+  if (body) {
+    sections.push(`\n## Body Content (extracted from home page; same shell for all sub-pages on this Angular SPA)`);
+    sections.push(body);
+  }
+
+  return sections.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 // ── Extract internal links — split into HTML-pages-to-crawl vs documents ──
@@ -177,75 +241,57 @@ async function saveDocuments(project: string, urls: string[]): Promise<number> {
   return docs.length;
 }
 
-// ── BFS crawl one project ─────────────────────────────────────────────────────
+// ── Crawl one project — single fetch, structured output ─────────────────────
+// Since asbl.in is an Angular SPA returning identical HTML for every URL
+// under /<project>/*, we fetch the home page ONCE and extract:
+//   - meta tags
+//   - nav-derived page list
+//   - in-page section labels (from ?scroll=xxx-section anchors)
+//   - body text (own-text walk to capture pricing in divs/spans)
+//   - all PDF/doc links anywhere on asbl.in / *.asbl.in
 async function crawlProject(project: string): Promise<{ text: string; urls: string[]; pageCount: number; docsFound: number; error?: string }> {
   const startUrl = PROJECT_URLS[project];
   if (!startUrl) return { text: "", urls: [], pageCount: 0, docsFound: 0, error: `No URL configured for ${project}` };
 
   const startPath = new URL(startUrl).pathname;
-  const visited = new Set<string>();
-  const queue: Array<{ url: string; depth: number }> = [{ url: startUrl, depth: 0 }];
-  const collected: Array<{ url: string; text: string }> = [];
-  const allDocLinks = new Set<string>();
 
-  while (queue.length > 0 && visited.size < MAX_PAGES_PER_PROJECT) {
-    const { url, depth } = queue.shift()!;
-    if (visited.has(url)) continue;
-    visited.add(url);
-
-    try {
-      const r = await axios.get(url, {
-        timeout: FETCH_TIMEOUT_MS,
-        headers: {
-          "User-Agent": "Mozilla/5.0 (compatible; ASBL-Bot/1.0)",
-          "Accept": "text/html,application/xhtml+xml",
-        },
-        maxRedirects: 3,
-        validateStatus: (s) => s >= 200 && s < 400,
-      });
-
-      const html = String(r.data || "");
-      const text = extractText(html);
-
-      if (text.length > 50) {
-        collected.push({ url, text });
-      }
-
-      // Extract both HTML pages and document links
-      const { html: htmlLinks, docs: docLinks } = extractAllLinks(html, startPath, url);
-
-      // Track docs (don't visit, just record)
-      for (const doc of docLinks) allDocLinks.add(doc);
-
-      // Enqueue child HTML pages within depth budget
-      if (depth < MAX_DEPTH) {
-        for (const link of htmlLinks) {
-          if (!visited.has(link)) {
-            queue.push({ url: link, depth: depth + 1 });
-          }
-        }
-      }
-    } catch (err: any) {
-      console.error(`[Crawler] Failed ${url}: ${err.message}`);
-    }
+  let html = "";
+  try {
+    const r = await axios.get(startUrl, {
+      timeout: FETCH_TIMEOUT_MS,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; ASBL-Bot/1.0)",
+        "Accept": "text/html,application/xhtml+xml",
+      },
+      maxRedirects: 3,
+      validateStatus: (s) => s >= 200 && s < 400,
+    });
+    html = String(r.data || "");
+  } catch (err: any) {
+    return { text: "", urls: [], pageCount: 0, docsFound: 0, error: `Fetch failed: ${err.message}` };
   }
 
-  // Save discovered documents to project_documents table
-  const docsArr = Array.from(allDocLinks);
-  const docsFound = await saveDocuments(project, docsArr);
-
-  if (collected.length === 0) {
-    return { text: "", urls: [], pageCount: 0, docsFound, error: "No pages successfully crawled" };
+  if (!html || html.length < 200) {
+    return { text: "", urls: [], pageCount: 0, docsFound: 0, error: "Empty or too-small HTML" };
   }
 
-  const combined = collected
-    .map((p) => `=== ${p.url} ===\n${p.text}`)
-    .join("\n\n");
+  // Build structured content from this single fetch
+  const structured = buildStructuredContent(html, project, startPath);
+
+  // Discover documents (PDFs/DOCs anywhere on asbl.in / *.asbl.in)
+  const { docs } = extractAllLinks(html, startPath, startUrl);
+  const docsFound = await saveDocuments(project, docs);
+
+  // List of nav page URLs (for dashboard reference; we don't refetch them)
+  const nav = extractNavStructure(html, startPath);
+  const urlsCrawled = [startUrl, ...nav.pages.map((p) => "https://asbl.in" + p.url)].filter(
+    (v, i, arr) => arr.indexOf(v) === i,
+  );
 
   return {
-    text: combined,
-    urls: collected.map((p) => p.url),
-    pageCount: collected.length,
+    text: structured,
+    urls: urlsCrawled,
+    pageCount: 1, // we only fetch once; the SPA serves identical HTML for sub-paths
     docsFound,
   };
 }
