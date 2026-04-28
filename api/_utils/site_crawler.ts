@@ -1,16 +1,15 @@
 /**
- * Site crawler — fetches asbl.in/<project> + internal sub-pages,
- * extracts plain text, caches in Supabase site_cache table.
+ * Site crawler — fetches asbl.in/<project> + sub-pages with a real
+ * headless Chromium (so Angular SPA content is fully JS-rendered),
+ * extracts structured per-page text, caches in Supabase site_cache.
  *
  * Strict scope:
- *   - Only domain: asbl.in
- *   - Only paths starting with /<project> (e.g. /loft, /loft/anything)
- *   - Max depth: 2
- *   - Max pages per project: 15
- *   - Skip PDFs/images/binary
+ *   - Only domain: asbl.in (HTML pages)
+ *   - PDF/DOC links allowed from asbl.in or *.asbl.in (e.g. media.asbl.in)
  */
 import axios from "axios";
 import * as cheerio from "cheerio";
+import { renderPage, closeBrowser } from "./site_renderer";
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || "";
@@ -22,17 +21,32 @@ const PROJECT_URLS: Record<string, string> = {
   LANDMARK: "https://asbl.in/landmark",
 };
 
-const MAX_DEPTH = 2;
-const MAX_PAGES_PER_PROJECT = 15;
+// Pages we render per project (each has unique JS-rendered content)
+const SUB_PAGES: Array<{ path: string; label: string }> = [
+  { path: "",                label: "Home" },
+  { path: "/plan",           label: "Plans (Unit / Master / Tower / Clubhouse / Urban Corridor)" },
+  { path: "/amenities",      label: "Amenities (Fitness / Kids / Practical / Social)" },
+  { path: "/location",       label: "Location (Connectivity / Why this area / Nearby)" },
+  { path: "/price",          label: "Price (Price Sheet / Payment Structure / Pre-EMI)" },
+  { path: "/specifications", label: "Specifications" },
+];
+
 const FETCH_TIMEOUT_MS = 15000;
 
 // ── Walk ALL elements and extract own-text (not descendant text) ─────────────
 // asbl.in is an Angular SPA — pricing/specs live inside <div>/<span> blocks
 // (not just h/p/li). We walk every element and pull only its DIRECT text
 // nodes so a parent doesn't duplicate the text of its children.
-function extractBodyText($: cheerio.CheerioAPI, scope: cheerio.Cheerio<any>): string {
+//
+// `dedupSet` (optional) lets the caller share a Set across multiple page
+// extractions so common nav/footer text only appears in the first page.
+function extractBodyText(
+  $: cheerio.CheerioAPI,
+  scope: cheerio.Cheerio<any>,
+  dedupSet?: Set<string>,
+): string {
   const lines: string[] = [];
-  const seen = new Set<string>();
+  const seen = dedupSet ?? new Set<string>();
 
   scope.find("body *, body").each((_, el) => {
     const tag = ((el as any).tagName || (el as any).name || "").toLowerCase();
@@ -241,23 +255,13 @@ async function saveDocuments(project: string, urls: string[]): Promise<number> {
   return docs.length;
 }
 
-// ── Crawl one project — single fetch, structured output ─────────────────────
-// Since asbl.in is an Angular SPA returning identical HTML for every URL
-// under /<project>/*, we fetch the home page ONCE and extract:
-//   - meta tags
-//   - nav-derived page list
-//   - in-page section labels (from ?scroll=xxx-section anchors)
-//   - body text (own-text walk to capture pricing in divs/spans)
-//   - all PDF/doc links anywhere on asbl.in / *.asbl.in
-async function crawlProject(project: string): Promise<{ text: string; urls: string[]; pageCount: number; docsFound: number; error?: string }> {
-  const startUrl = PROJECT_URLS[project];
-  if (!startUrl) return { text: "", urls: [], pageCount: 0, docsFound: 0, error: `No URL configured for ${project}` };
-
-  const startPath = new URL(startUrl).pathname;
-
-  let html = "";
+// ── Render one page with Puppeteer; fall back to axios if Puppeteer fails ───
+async function fetchPageHtml(url: string): Promise<string> {
   try {
-    const r = await axios.get(startUrl, {
+    return await renderPage(url);
+  } catch (err: any) {
+    console.error(`[Crawler] Puppeteer failed for ${url}: ${err.message} — falling back to axios`);
+    const r = await axios.get(url, {
       timeout: FETCH_TIMEOUT_MS,
       headers: {
         "User-Agent": "Mozilla/5.0 (compatible; ASBL-Bot/1.0)",
@@ -266,32 +270,106 @@ async function crawlProject(project: string): Promise<{ text: string; urls: stri
       maxRedirects: 3,
       validateStatus: (s) => s >= 200 && s < 400,
     });
-    html = String(r.data || "");
-  } catch (err: any) {
-    return { text: "", urls: [], pageCount: 0, docsFound: 0, error: `Fetch failed: ${err.message}` };
+    return String(r.data || "");
+  }
+}
+
+// ── Crawl one project — render every sub-page with JS, build structure ──────
+// Output structure:
+//   # PROJECT: <name>
+//   ## Meta  (title / description / keywords from home page)
+//   ## Page: Home  (/loft)
+//   <unique content>
+//   ## Page: Plans  (/loft/plan)
+//   <unique content>
+//   ...
+async function crawlProject(project: string): Promise<{ text: string; urls: string[]; pageCount: number; docsFound: number; error?: string }> {
+  const startUrl = PROJECT_URLS[project];
+  if (!startUrl) return { text: "", urls: [], pageCount: 0, docsFound: 0, error: `No URL configured for ${project}` };
+
+  const startPath = new URL(startUrl).pathname;
+  const allDocs = new Set<string>();
+  const urlsCrawled: string[] = [];
+  const pageBlocks: string[] = [];
+  const seenLines = new Set<string>(); // global dedup so nav/footer only appear once
+
+  let homeHtml = "";
+
+  for (const sub of SUB_PAGES) {
+    const fullUrl = `https://asbl.in${startPath}${sub.path}`;
+    let html = "";
+    try {
+      console.log(`[Crawler] Rendering ${fullUrl}`);
+      html = await fetchPageHtml(fullUrl);
+    } catch (err: any) {
+      console.error(`[Crawler] ${project} ${sub.path}: ${err.message}`);
+      continue;
+    }
+
+    if (!html || html.length < 200) {
+      console.warn(`[Crawler] ${fullUrl} returned empty/short HTML`);
+      continue;
+    }
+
+    if (sub.path === "") homeHtml = html;
+    urlsCrawled.push(fullUrl);
+
+    // Discover docs from this rendered page
+    const { docs } = extractAllLinks(html, startPath, fullUrl);
+    for (const d of docs) allDocs.add(d);
+
+    // Extract page-specific text (with global dedup so common nav/footer only on first page)
+    const $ = cheerio.load(html);
+    $("script, style, noscript, iframe, svg, link, meta, button, form, [aria-hidden='true']").remove();
+    $(".nav, .navbar, .menu, .footer, .header, .sidebar, .cookie, .modal, .breadcrumb").remove();
+    const pageText = extractBodyText($, $.root(), seenLines);
+
+    if (pageText && pageText.length > 30) {
+      pageBlocks.push(`## Page: ${sub.label}\n   URL: ${fullUrl}\n\n${pageText}`);
+    } else {
+      pageBlocks.push(`## Page: ${sub.label}\n   URL: ${fullUrl}\n   (no unique content beyond what was already shown)`);
+    }
   }
 
-  if (!html || html.length < 200) {
-    return { text: "", urls: [], pageCount: 0, docsFound: 0, error: "Empty or too-small HTML" };
+  if (urlsCrawled.length === 0) {
+    return { text: "", urls: [], pageCount: 0, docsFound: 0, error: "All page renders failed" };
   }
 
-  // Build structured content from this single fetch
-  const structured = buildStructuredContent(html, project, startPath);
+  // Build meta block from home HTML (title, description, keywords)
+  const $h = cheerio.load(homeHtml || "");
+  const title = $h("title").first().text().trim();
+  const description =
+    $h("meta[name='description']").attr("content") ||
+    $h("meta[property='og:description']").attr("content") ||
+    "";
+  const ogTitle = $h("meta[property='og:title']").attr("content") || "";
+  const keywords = $h("meta[name='keywords']").attr("content") || "";
 
-  // Discover documents (PDFs/DOCs anywhere on asbl.in / *.asbl.in)
-  const { docs } = extractAllLinks(html, startPath, startUrl);
-  const docsFound = await saveDocuments(project, docs);
+  const metaLines: string[] = [];
+  if (title) metaLines.push(`Title: ${title}`);
+  if (ogTitle && ogTitle !== title) metaLines.push(`OG Title: ${ogTitle.trim()}`);
+  if (description) metaLines.push(`Description: ${description.trim()}`);
+  if (keywords) metaLines.push(`Keywords: ${keywords.trim()}`);
 
-  // List of nav page URLs (for dashboard reference; we don't refetch them)
-  const nav = extractNavStructure(html, startPath);
-  const urlsCrawled = [startUrl, ...nav.pages.map((p) => "https://asbl.in" + p.url)].filter(
-    (v, i, arr) => arr.indexOf(v) === i,
-  );
+  const text = [
+    `# PROJECT: ${project}`,
+    "",
+    "## Meta",
+    ...metaLines,
+    "",
+    ...pageBlocks,
+  ]
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  // Persist documents discovered across all pages
+  const docsFound = await saveDocuments(project, Array.from(allDocs));
 
   return {
-    text: structured,
+    text,
     urls: urlsCrawled,
-    pageCount: 1, // we only fetch once; the SPA serves identical HTML for sub-paths
+    pageCount: urlsCrawled.length,
     docsFound,
   };
 }
@@ -327,21 +405,26 @@ async function updateCache(project: string, content: string, urls: string[], pag
 export async function refreshAllSites(): Promise<Array<{ project: string; pageCount: number; bytes: number; docsFound: number; error?: string }>> {
   const results: Array<{ project: string; pageCount: number; bytes: number; docsFound: number; error?: string }> = [];
 
-  for (const project of Object.keys(PROJECT_URLS)) {
-    console.log(`[Crawler] Refreshing ${project}...`);
-    const result = await crawlProject(project);
-    try {
-      await updateCache(project, result.text, result.urls, result.pageCount, result.error || null);
-    } catch (err: any) {
-      console.error(`[Crawler] Cache update failed for ${project}: ${err.message}`);
+  try {
+    for (const project of Object.keys(PROJECT_URLS)) {
+      console.log(`[Crawler] Refreshing ${project}...`);
+      const result = await crawlProject(project);
+      try {
+        await updateCache(project, result.text, result.urls, result.pageCount, result.error || null);
+      } catch (err: any) {
+        console.error(`[Crawler] Cache update failed for ${project}: ${err.message}`);
+      }
+      results.push({
+        project,
+        pageCount: result.pageCount,
+        bytes: result.text.length,
+        docsFound: result.docsFound,
+        error: result.error,
+      });
     }
-    results.push({
-      project,
-      pageCount: result.pageCount,
-      bytes: result.text.length,
-      docsFound: result.docsFound,
-      error: result.error,
-    });
+  } finally {
+    // Always close the headless browser to free memory at end of cron run
+    try { await closeBrowser(); } catch { /* ignore */ }
   }
 
   return results;

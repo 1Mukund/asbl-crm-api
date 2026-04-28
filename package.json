@@ -5,9 +5,11 @@
     "dev": "ts-node api/index.ts"
   },
   "dependencies": {
+    "@sparticuz/chromium": "^148.0.0",
     "@supabase/supabase-js": "^2.103.3",
     "axios": "^1.6.0",
-    "cheerio": "^1.2.0"
+    "cheerio": "^1.2.0",
+    "puppeteer-core": "^24.42.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

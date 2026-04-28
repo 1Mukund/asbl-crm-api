@@ -1,5 +1,11 @@
 {
   "version": 2,
+  "functions": {
+    "api/cron/followup.ts": {
+      "maxDuration": 300,
+      "memory": 1024
+    }
+  },
   "crons": [
     {
       "path": "/api/cron/followup",
