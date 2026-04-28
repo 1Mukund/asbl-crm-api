@@ -296,7 +296,9 @@ async function crawlProject(project: string): Promise<{ text: string; urls: stri
   const allDocs = new Set<string>();
   const urlsCrawled: string[] = [];
   const pageBlocks: string[] = [];
-  const seenLines = new Set<string>(); // global dedup so nav/footer only appear once
+  // Each page does its own per-page dedup inside extractBodyText.
+  // We skip cross-page dedup because some pages share short labels with
+  // home (Plans, Master Plan, etc.) and dedup blanked them out.
 
   let homeHtml = "";
 
@@ -323,11 +325,11 @@ async function crawlProject(project: string): Promise<{ text: string; urls: stri
     const { docs } = extractAllLinks(html, startPath, fullUrl);
     for (const d of docs) allDocs.add(d);
 
-    // Extract page-specific text (with global dedup so common nav/footer only on first page)
+    // Extract page-specific text — per-page dedup only (shared nav stays per page)
     const $ = cheerio.load(html);
     $("script, style, noscript, iframe, svg, link, meta, button, form, [aria-hidden='true']").remove();
     $(".nav, .navbar, .menu, .footer, .header, .sidebar, .cookie, .modal, .breadcrumb").remove();
-    const pageText = extractBodyText($, $.root(), seenLines);
+    const pageText = extractBodyText($, $.root());
 
     if (pageText && pageText.length > 30) {
       // Run through KB formatter so the LLM sees clean section/bullet structure
