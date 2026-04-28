@@ -66,14 +66,14 @@ async function renderDashboard(): Promise<string> {
   const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
   const [siteRows, msgs24h, intentRows, cronRows, docRows] = await Promise.all([
-    sb(`site_cache?select=project,page_count,fetched_at,error,content_text&order=project.asc`),
+    sb(`site_cache?select=project,page_count,fetched_at,error,content_text,urls_crawled&order=project.asc`),
     sb(`whatsapp_messages?created_at=gte.${since24h}&select=phone,direction,message,project,intent,sender,created_at&order=created_at.desc&limit=300`),
     sb(`whatsapp_messages?created_at=gte.${since24h}&direction=eq.inbound&intent=not.is.null&select=intent,project`),
     sb(`cron_log?select=task,ran_at,duration_ms,result,error&order=ran_at.desc&limit=20`),
     sb(`project_documents?select=project,doc_type,filename,url,fetched_at&order=fetched_at.desc&limit=50`),
   ]);
 
-  // ── Section 1: Crawled data ────────────────────────────────────────────
+  // ── Section 1: Crawled data summary ────────────────────────────────────
   const siteHtml = siteRows
     .map((r: any) => {
       const bytes = (r.content_text || "").length;
@@ -87,7 +87,40 @@ async function renderDashboard(): Promise<string> {
         <td>${esc(r.fetched_at ? new Date(r.fetched_at).toLocaleString("en-IN") : "—")}</td>
         <td>${timeAgo(r.fetched_at)}</td>
         <td>${status}</td>
+        <td><a href="#content-${esc(r.project)}">view ↓</a></td>
       </tr>`;
+    })
+    .join("");
+
+  // ── Section 1b: Per-project stored content + structure stats ──────────
+  function parseStructure(content: string): { metaCount: number; headings: string[]; lineCount: number; uniqueLines: number; navLine: string | null } {
+    if (!content) return { metaCount: 0, headings: [], lineCount: 0, uniqueLines: 0, navLine: null };
+    const lines = content.split("\n").map((l) => l.trim()).filter(Boolean);
+    const metaCount = lines.filter((l) => /^(Description|OG Title|Keywords):/.test(l)).length;
+    const headings = lines.filter((l) => /^#{1,6}\s+/.test(l)).map((l) => l.replace(/^#+\s*/, "").trim());
+    const navLine = lines.find((l) => l.startsWith("Site sections / linked pages:")) || null;
+    const uniqueLines = new Set(lines).size;
+    return { metaCount, headings, lineCount: lines.length, uniqueLines, navLine };
+  }
+
+  const contentSectionsHtml = siteRows
+    .map((r: any) => {
+      const content = r.content_text || "";
+      const stats = parseStructure(content);
+      const headingPreview = stats.headings.slice(0, 12).map((h) => esc(h)).join(", ") + (stats.headings.length > 12 ? `, …${stats.headings.length - 12} more` : "");
+      const navPreview = stats.navLine
+        ? esc(stats.navLine.replace("Site sections / linked pages:", "").trim().slice(0, 400)) + (stats.navLine.length > 400 ? "…" : "")
+        : "—";
+      const fetched = r.fetched_at ? new Date(r.fetched_at).toLocaleString("en-IN") : "never";
+      return `<details id="content-${esc(r.project)}" class="proj-content">
+        <summary><strong>${esc(r.project)}</strong> — ${(content.length / 1024).toFixed(1)} KB · ${stats.lineCount} lines (${stats.uniqueLines} unique) · ${stats.headings.length} headings · ${stats.metaCount} meta blocks · fetched ${esc(fetched)}</summary>
+        <div class="proj-stats">
+          <div><b>Sample headings:</b> ${headingPreview || "—"}</div>
+          <div style="margin-top:6px"><b>Linked sections (nav):</b> <span style="color:#555">${navPreview}</span></div>
+          <div style="margin-top:6px"><b>Source URLs crawled:</b> ${(r.urls_crawled || []).slice(0, 8).map((u: string) => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u.replace("https://asbl.in", ""))}</a>`).join(" · ") || "—"}${(r.urls_crawled || []).length > 8 ? ` · …${(r.urls_crawled || []).length - 8} more` : ""}</div>
+        </div>
+        <pre class="proj-text">${esc(content) || "(no content stored yet)"}</pre>
+      </details>`;
     })
     .join("");
 
@@ -218,6 +251,16 @@ code { background: #f0f0f3; padding: 2px 5px; border-radius: 4px; font-size: 12p
 .full { grid-column: span 2; }
 @media (max-width: 1100px) { .full { grid-column: span 1; } }
 .empty { color: #888; font-style: italic; padding: 12px 0; }
+.proj-content { border: 1px solid #e5e5ea; border-radius: 8px; margin: 8px 0; padding: 0; }
+.proj-content summary { cursor: pointer; padding: 12px 14px; font-size: 13px; user-select: none; }
+.proj-content summary:hover { background: #fafbfc; }
+.proj-content[open] summary { border-bottom: 1px solid #e5e5ea; background: #fafbfc; }
+.proj-stats { padding: 10px 14px; background: #f9fafb; font-size: 12px; color: #444; border-bottom: 1px solid #e5e5ea; }
+.proj-stats a { color: #007aff; text-decoration: none; }
+.proj-stats a:hover { text-decoration: underline; }
+.proj-text { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11.5px; line-height: 1.45; padding: 14px; background: #fcfcfd; max-height: 480px; overflow: auto; margin: 0; white-space: pre-wrap; word-break: break-word; }
+.proj-help { font-size: 12.5px; color: #555; margin-bottom: 12px; line-height: 1.5; padding: 10px 12px; background: #fafbfc; border-left: 3px solid #007aff; border-radius: 4px; }
+.proj-help code { background: #e5e5ea; padding: 1px 6px; border-radius: 3px; font-size: 11.5px; }
 </style>
 </head><body>
 <h1>ASBL CRM Dashboard</h1>
@@ -226,11 +269,21 @@ code { background: #f0f0f3; padding: 2px 5px; border-radius: 4px; font-size: 12p
 <div class="grid">
 
   <div class="card full">
-    <h2>1. Crawled Data (per project)</h2>
+    <h2>1. Crawled Data Summary (per project)</h2>
     ${siteRows.length ? `<table>
-      <tr><th>Project</th><th>Pages</th><th>Size</th><th>Last fetched</th><th>Age</th><th>Status</th></tr>
+      <tr><th>Project</th><th>Pages</th><th>Size</th><th>Last fetched</th><th>Age</th><th>Status</th><th>Content</th></tr>
       ${siteHtml}
     </table>` : `<div class="empty">No crawl data yet.</div>`}
+  </div>
+
+  <div class="card full">
+    <h2>1b. Stored Crawl Content (full structure per project)</h2>
+    <div class="proj-help">
+      Each project below shows what is actually stored in <code>site_cache.content_text</code>: meta tags
+      (Title / Description / OG Title / Keywords) + nav labels + h1..h6 headings + paragraph text in
+      document order. The LLM sees this exact text as <code>&lt;PROJECT_CONTEXT&gt;</code> on every reply.
+    </div>
+    ${contentSectionsHtml || `<div class="empty">No content cached yet.</div>`}
   </div>
 
   <div class="card full">
