@@ -115,6 +115,33 @@ async function supabasePost(table: string, body: object): Promise<void> {
   });
 }
 
+// ── Log a cron run (best-effort, never throws) ────────────────────────────────
+async function logCronRun(
+  task: string,
+  durationMs: number,
+  result: any,
+  error: string | null,
+): Promise<void> {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/cron_log`, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        apikey:          SUPABASE_KEY,
+        Authorization:   `Bearer ${SUPABASE_KEY}`,
+      },
+      body: JSON.stringify({
+        task,
+        duration_ms: durationMs,
+        result,
+        error,
+      }),
+    });
+  } catch (err: any) {
+    console.error(`[CronLog] log failed: ${err.message}`);
+  }
+}
+
 // ── Get sender for phone from whatsapp_sender_map ─────────────────────────────
 async function getSender(phone: string): Promise<string | null> {
   const rows = await supabaseGet(
@@ -167,17 +194,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // Task router: ?task=refresh-sites runs the weekly site crawler
   const task = String(req.query.task || "").toLowerCase();
   if (task === "refresh-sites") {
+    const startTs = Date.now();
     try {
       console.log("[Cron] Starting site refresh...");
       const results = await refreshAllSites();
+      const durationMs = Date.now() - startTs;
       console.log("[Cron] Site refresh complete:", JSON.stringify(results));
-      return res.status(200).json({ success: true, task: "refresh-sites", results });
+      await logCronRun("refresh-sites", durationMs, results, null);
+      return res.status(200).json({ success: true, task: "refresh-sites", durationMs, results });
     } catch (err: any) {
+      const durationMs = Date.now() - startTs;
       console.error("[Cron] Site refresh error:", err.message);
+      await logCronRun("refresh-sites", durationMs, null, err.message);
       return res.status(500).json({ error: err.message, task: "refresh-sites" });
     }
   }
 
+  // Default task: followup sequence
+  const followupStartTs = Date.now();
   try {
     const now = Date.now();
     const ONE_DAY_MS = 24 * 60 * 60 * 1000;
@@ -264,14 +298,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
+    const durationMs = Date.now() - followupStartTs;
+    await logCronRun("followup", durationMs, { processed: results.length, results }, null);
+
     return res.status(200).json({
       success: true,
       processed: results.length,
+      durationMs,
       results,
     });
 
   } catch (err: any) {
+    const durationMs = Date.now() - followupStartTs;
     console.error("[Followup Cron] Error:", err.message);
+    await logCronRun("followup", durationMs, null, err.message);
     return res.status(500).json({ error: err.message });
   }
 }

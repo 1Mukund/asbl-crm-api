@@ -22,6 +22,8 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { resolveProject, Project } from "../_utils/project_detection";
 import { getCachedContent, refreshSingleProject } from "../_utils/site_crawler";
 import { getConversationContext } from "../_utils/conversation_context";
+import { sanitizeReply } from "../_utils/sanitizer";
+import { getDocumentFor, sendDocViaPeriskope } from "../_utils/document_dispatcher";
 
 const PERISKOPE_API_KEY = process.env.PERISKOPE_API_KEY || "";
 const PERISKOPE_API_URL = "https://api.periskope.app/v1/messages/send";
@@ -141,17 +143,19 @@ async function updateZohoIntent(leadId: string, intent: string, token: string): 
   console.log(`[Periskope Webhook] Zoho updated — Lead ${leadId}: Last_Intent=${intent}`);
 }
 
-// ── Save message to Supabase (with optional project tag) ─────────────────────
+// ── Save message to Supabase (with optional project + intent tags) ───────────
 async function saveMessage(
   phone: string,
   direction: "inbound" | "outbound",
   message: string,
   sender: string,
   project: Project | null,
+  intent: string | null = null,
 ): Promise<void> {
   try {
     const body: any = { phone, direction, message, sender };
     if (project) body.project = project;
+    if (intent)  body.intent  = intent;
     await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_messages`, {
       method: "POST",
       headers: {
@@ -353,8 +357,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ]);
     console.log(`[Periskope Webhook] Intent: ${intent} | history: ${conversation.totalMessages} msgs | days since last: ${conversation.daysSinceLast}`);
 
-    // 4. Save inbound message with project tag
-    await saveMessage(phone, "inbound", message, sender, project);
+    // 4. Save inbound message with project + intent tags
+    await saveMessage(phone, "inbound", message, sender, project, intent);
 
     // 5. Build structured message
     const customerName =
@@ -371,12 +375,33 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       userMessage: message,
     });
 
-    // 6. Call Anandita with structured message
-    const reply = await callAnandita(phone, structuredMsg);
-    console.log(`[Periskope Webhook] Anandita reply: ${reply.slice(0, 100)}`);
+    // 6. Call Anandita + sanitize reply
+    const rawReply = await callAnandita(phone, structuredMsg);
+    const reply = sanitizeReply(rawReply);
+    console.log(`[Periskope Webhook] Anandita reply (sanitized): ${reply.slice(0, 100)}`);
 
-    // 7. Send reply via Periskope
+    // 7. Send text reply via Periskope
     await sendReply(phone, sender, reply);
+
+    // 7b. If intent calls for a doc (brochure/price) and we have one cached, send it too
+    let docSent: { doc_type: string; url: string } | null = null;
+    if (project && (intent === "brochure" || intent === "price")) {
+      try {
+        const doc = await getDocumentFor(project, intent);
+        if (doc) {
+          const caption = intent === "brochure"
+            ? `${project} brochure as discussed.`
+            : `${project} price sheet as discussed.`;
+          await sendDocViaPeriskope(phone, sender, doc.url, doc.filename, caption);
+          docSent = { doc_type: doc.doc_type, url: doc.url };
+          console.log(`[Periskope Webhook] Doc sent: ${doc.doc_type} → ${doc.url}`);
+        } else {
+          console.log(`[Periskope Webhook] No ${intent} doc cached for ${project}`);
+        }
+      } catch (err: any) {
+        console.error(`[Periskope Webhook] Doc send failed: ${err.message}`);
+      }
+    }
 
     // 8. Save outbound reply (tag with same project for analytics continuity)
     await saveMessage(phone, "outbound", reply, sender, project);
@@ -398,6 +423,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       project,
       intent,
       historyMessages: conversation.totalMessages,
+      docSent,
     });
 
   } catch (err: any) {
