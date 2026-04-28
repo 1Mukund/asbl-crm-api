@@ -26,15 +26,49 @@ const MAX_DEPTH = 2;
 const MAX_PAGES_PER_PROJECT = 15;
 const FETCH_TIMEOUT_MS = 15000;
 
-// ── Extract STRUCTURED text from HTML (preserves heading hierarchy) ─────────
+// ── Extract STRUCTURED text from HTML (meta + heading hierarchy) ────────────
+// asbl.in is an Angular SPA — most content is rendered client-side. The
+// richest summary content lives in <meta> tags (description, og, keywords)
+// and in <a> nav text. We capture all of these alongside the limited
+// h1/h2/p content present in the static HTML.
 function extractText(html: string): string {
   const $ = cheerio.load(html);
 
-  // Strip non-content elements aggressively
+  const metaParts: string[] = [];
+
+  // 1. Title + meta tags first (often most useful summary)
+  const title = $("title").first().text().trim();
+  if (title) metaParts.push(`# ${title}`);
+
+  const desc =
+    $("meta[name='description']").attr("content") ||
+    $("meta[property='og:description']").attr("content") ||
+    "";
+  if (desc.trim()) metaParts.push(`Description: ${desc.trim()}`);
+
+  const ogTitle = $("meta[property='og:title']").attr("content");
+  if (ogTitle && ogTitle.trim() && ogTitle !== title) metaParts.push(`OG Title: ${ogTitle.trim()}`);
+
+  const keywords = $("meta[name='keywords']").attr("content");
+  if (keywords && keywords.trim()) metaParts.push(`Keywords: ${keywords.trim()}`);
+
+  // 2. Capture nav/section labels — informative even when content is JS-rendered
+  const navLabels = new Set<string>();
+  $("a[href*='asbl.in'], a[href^='/'], a[routerlink]").each((_, el) => {
+    const txt = $(el).text().replace(/\s+/g, " ").trim();
+    if (txt && txt.length > 2 && txt.length < 80 && /[a-zA-Z]/.test(txt)) {
+      navLabels.add(txt);
+    }
+  });
+  if (navLabels.size > 0) {
+    metaParts.push(`Site sections / linked pages: ${Array.from(navLabels).slice(0, 40).join(" | ")}`);
+  }
+
+  // 3. Strip non-content elements before walking content
   $("script, style, nav, footer, header, noscript, iframe, svg, link, meta, button, form, [aria-hidden='true']").remove();
   $(".nav, .navbar, .menu, .footer, .header, .sidebar, .cookie, .modal, .breadcrumb").remove();
 
-  // Find content scope (prefer semantic landmarks)
+  // 4. Walk visible heading + paragraph + list-item content
   const candidates = [$("main").first(), $("article").first(), $("[role=main]").first()];
   const scope = candidates.find((c) => c.length > 0) || $("body");
 
@@ -46,7 +80,7 @@ function extractText(html: string): string {
     const raw = $(el).text().replace(/\s+/g, " ").trim();
 
     if (!raw || raw.length < 3) return;
-    if (seen.has(raw)) return;     // dedup nested duplicates (e.g. <li><p>x</p></li>)
+    if (seen.has(raw)) return;
     seen.add(raw);
 
     const headingMatch = tag.match(/^h(\d)$/);
@@ -58,12 +92,8 @@ function extractText(html: string): string {
     }
   });
 
-  if (lines.length === 0) {
-    // Fallback: body text collapsed
-    return scope.text().replace(/\s+/g, " ").trim();
-  }
-
-  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  const all = [...metaParts, "", ...lines].join("\n");
+  return all.replace(/\n{3,}/g, "\n\n").trim();
 }
 
 // ── Extract internal links — split into HTML-pages-to-crawl vs documents ──
@@ -80,22 +110,19 @@ function extractAllLinks(html: string, projectPath: string, baseUrl: string): { 
     let absUrl: URL;
     try { absUrl = new URL(href, baseUrl); } catch { return; }
 
-    // Domain whitelist: only asbl.in (PDFs hosted on cdn/storage subdomains
-    // could be relaxed later, but for now strict-same-domain)
-    if (absUrl.hostname !== "asbl.in") return;
-
     const lower = absUrl.pathname.toLowerCase();
     absUrl.hash = "";
 
-    // Document: PDF or DOC anywhere on asbl.in (project-tagged via heuristic later)
-    if (/\.(pdf|doc|docx)(\?|$)/i.test(lower)) {
+    // Document: PDF/DOC on asbl.in OR any *.asbl.in subdomain (e.g. media.asbl.in)
+    const isAsblHost = absUrl.hostname === "asbl.in" || absUrl.hostname.endsWith(".asbl.in");
+    if (isAsblHost && /\.(pdf|doc|docx)(\?|$)/i.test(lower)) {
       docLinks.add(absUrl.toString());
       return;
     }
 
-    // HTML page: must be under project subpath
+    // HTML page: strict — only asbl.in (no subdomains) AND under project subpath
+    if (absUrl.hostname !== "asbl.in") return;
     if (absUrl.pathname !== projectPath && !absUrl.pathname.startsWith(projectPrefix)) return;
-    // Skip image/media files
     if (/\.(jpg|jpeg|png|gif|svg|webp|mp4|mp3|zip|css|js)$/i.test(lower)) return;
 
     htmlLinks.add(absUrl.toString());
