@@ -21,14 +21,18 @@ const PROJECT_URLS: Record<string, string> = {
   LANDMARK: "https://asbl.in/landmark",
 };
 
-// Pages we render per project (each has unique JS-rendered content)
+// Pages we render per project (each has unique JS-rendered content).
+// Note: /price/pricesheet is the actual route that shows pricing — /price
+// alone redirects/gates the values in headless.
 const SUB_PAGES: Array<{ path: string; label: string }> = [
-  { path: "",                label: "Home" },
-  { path: "/plan",           label: "Plans (Unit / Master / Tower / Clubhouse / Urban Corridor)" },
-  { path: "/amenities",      label: "Amenities (Fitness / Kids / Practical / Social)" },
-  { path: "/location",       label: "Location (Connectivity / Why this area / Nearby)" },
-  { path: "/price",          label: "Price (Price Sheet / Payment Structure / Pre-EMI)" },
-  { path: "/specifications", label: "Specifications" },
+  { path: "",                       label: "Home" },
+  { path: "/plan",                  label: "Plans (Unit / Master / Tower / Clubhouse / Urban Corridor)" },
+  { path: "/amenities",             label: "Amenities (Fitness / Kids / Practical / Social)" },
+  { path: "/location",              label: "Location (Connectivity / Why this area / Nearby)" },
+  { path: "/price/pricesheet",      label: "Price Sheet (per-sqft rates, charges)" },
+  { path: "/price/paymentstructure", label: "Payment Structure (milestones)" },
+  { path: "/price/preemioffer",     label: "Pre-EMI Offer" },
+  { path: "/specifications",        label: "Specifications" },
 ];
 
 const FETCH_TIMEOUT_MS = 15000;
