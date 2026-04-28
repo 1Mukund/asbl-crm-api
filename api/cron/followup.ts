@@ -1,8 +1,11 @@
 /**
  * GET /api/cron/followup
- * Vercel Cron — runs daily at 04:30 UTC (10:00 AM IST)
+ *   - Daily at 04:30 UTC (10:00 AM IST) — runs followup sequence
  *
- * Logic:
+ * GET /api/cron/followup?task=refresh-sites
+ *   - Weekly Sat 22:30 UTC / Sun 04:00 IST — re-crawls 4 ASBL project sites
+ *
+ * Followup logic:
  *   1. Get all phones we contacted (outbound messages in whatsapp_messages)
  *   2. Filter: no inbound reply ever received
  *   3. For each, check how many follow-ups already sent (follow_up_log)
@@ -10,6 +13,7 @@
  *   5. Log to follow_up_log
  */
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+import { refreshAllSites } from "../_utils/site_crawler";
 
 const SUPABASE_URL       = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY       = process.env.SUPABASE_SECRET_KEY || "";
@@ -158,6 +162,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const authHeader = req.headers.authorization;
   if (authHeader !== `Bearer ${process.env.CRON_SECRET}` && req.method !== "GET") {
     return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  // Task router: ?task=refresh-sites runs the weekly site crawler
+  const task = String(req.query.task || "").toLowerCase();
+  if (task === "refresh-sites") {
+    try {
+      console.log("[Cron] Starting site refresh...");
+      const results = await refreshAllSites();
+      console.log("[Cron] Site refresh complete:", JSON.stringify(results));
+      return res.status(200).json({ success: true, task: "refresh-sites", results });
+    } catch (err: any) {
+      console.error("[Cron] Site refresh error:", err.message);
+      return res.status(500).json({ error: err.message, task: "refresh-sites" });
+    }
   }
 
   try {

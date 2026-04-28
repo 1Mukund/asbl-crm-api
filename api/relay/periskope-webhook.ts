@@ -1,18 +1,27 @@
 /**
- * Periskope → Anandita LLM → Periskope reply handler
+ * Periskope → Anandita LLM (with grounded context) → Periskope reply handler
  *
  * Flow:
  *   1. Customer replies on WhatsApp
  *   2. Periskope fires webhook here (event_type: "message.created")
  *   3. Filter inbound messages only
- *   4. Detect intent from customer message
- *   5. Call Anandita LLM for reply
- *   6. Send reply via Periskope
- *   7. Update Zoho: Last_Intent (triggers Workflow → Blueprint stage change)
+ *   4. Look up Zoho lead (name, ASBL_Project)
+ *   5. Resolve project (message keyword > Zoho field > last asked)
+ *   6. Fetch site content from cache (or LEGACY teaser)
+ *   7. Fetch last 30 days conversation history from Supabase
+ *   8. Build structured message with <CUSTOMER>, <PROJECT_CONTEXT>,
+ *      <CONVERSATION_HISTORY>, <USER_MESSAGE> blocks
+ *   9. Call Anandita with structured message
+ *  10. Send reply via Periskope
+ *  11. Save inbound + outbound to Supabase with project tag
+ *  12. Update Zoho: Last_Intent + Whatsapp_Replied
  *
  * Webhook URL: https://asbl-crm-api.vercel.app/api/relay/periskope-webhook
  */
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+import { resolveProject, Project } from "../_utils/project_detection";
+import { getCachedContent, refreshSingleProject } from "../_utils/site_crawler";
+import { getConversationContext } from "../_utils/conversation_context";
 
 const PERISKOPE_API_KEY = process.env.PERISKOPE_API_KEY || "";
 const PERISKOPE_API_URL = "https://api.periskope.app/v1/messages/send";
@@ -25,60 +34,51 @@ const ZOHO_CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET || "";
 const ZOHO_REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN || "";
 const ZOHO_API_BASE      = "https://www.zohoapis.in/crm/v3";
 
-// ── Intent classification via LLM ────────────────────────────────────────────
-// Uses Anandita LLM to semantically classify customer intent.
-// No regex — handles any phrasing in Hindi, English, or Hinglish.
+// LEGACY teaser — hardcoded, project name NEVER appears in system context
+const LEGACY_TEASER =
+  "RTC X Roads upcoming pre-RERA project. Detailed pricing, floor plans, " +
+  "and possession dates will be shared during a site visit only. " +
+  "The project is in early stage and not yet RERA-registered.";
+
+// ── Intent classification via LLM (best-effort, regex fallback) ──────────────
 async function classifyIntent(message: string): Promise<string> {
   const VALID_INTENTS = ["site_visit", "virtual_tour", "not_interested", "price", "brochure", "call_me", "general"];
+  const lower = message.toLowerCase();
 
-  const classificationPrompt = `You are an intent classifier for a real estate company's WhatsApp bot in India. Customers speak Hindi, English, or Hinglish.
+  // Quick regex pass for obvious intents
+  if (/\b(price|cost|emi|loan|kimat|kimmat|kitn[ae]|pricing|kharcha)\b/.test(lower)) return "price";
+  if (/\b(brochure|pdf|floor plan|floorplan|details send|details bhej|brochure send)\b/.test(lower)) return "brochure";
+  if (/\b(call me|callback|call back|phone|call|baat kar|call kar|kar lo)\b/.test(lower)) return "call_me";
+  if (/\b(site visit|visit|see project|aana|aaunga|aaungi|come|aata|aati|location)\b/.test(lower)) return "site_visit";
+  if (/\b(virtual tour|video call|virtual)\b/.test(lower)) return "virtual_tour";
+  if (/\b(not interested|nahi chahiye|nahin chahiye|no thanks|stop|band)\b/.test(lower)) return "not_interested";
 
-Classify this customer message into EXACTLY ONE of these intents:
-- site_visit: wants to physically come and see the property/project
-- virtual_tour: wants online viewing, video call, virtual walkthrough
-- not_interested: wants to stop communication, not interested
-- price: asking about price, cost, EMI, budget, loan
-- brochure: wants brochure, PDF, floor plan, project details sent
-- call_me: wants a callback or phone call
-- general: anything else — general interest, questions, greetings
-
-Customer message: "${message.replace(/"/g, "'")}"
-
-Reply with ONLY the intent label. Nothing else. No explanation.`;
-
+  // Fallback: ask Anandita as classifier (it might break with new prompt — graceful default)
   try {
+    const classificationPrompt = `Classify this customer message into ONE of: site_visit, virtual_tour, not_interested, price, brochure, call_me, general. Reply with ONLY the label.\n\nMessage: "${message.replace(/"/g, "'")}"`;
     const r = await fetch(ANANDITA_URL, {
       method: "POST",
       headers: {
-        "Content-Type":  "application/json",
-        "Authorization": `Bearer ${ANANDITA_API_KEY}`,
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${ANANDITA_API_KEY}`,
       },
       body: JSON.stringify({
-        phone:   "+910000000001", // dedicated classification phone (no history)
+        phone: "+910000000001", // dedicated classifier phone (no history)
         message: classificationPrompt,
       }),
     });
-
-    if (!r.ok) throw new Error(`LLM ${r.status}`);
-
-    const data = await r.json() as any;
-    const raw  = (data?.message || data?.reply || "").trim().toLowerCase();
-
-    // Find which valid intent appears in the response
+    if (!r.ok) return "general";
+    const data = (await r.json()) as any;
+    const raw = (data?.message || "").toLowerCase();
     for (const intent of VALID_INTENTS) {
       if (raw.includes(intent)) return intent;
     }
+  } catch { /* fall through */ }
 
-    console.log(`[Intent] LLM returned unexpected: "${raw}", defaulting to general`);
-    return "general";
-
-  } catch (err: any) {
-    console.error(`[Intent] LLM classification failed: ${err.message}, defaulting to general`);
-    return "general";
-  }
+  return "general";
 }
 
-// ── Zoho: Get access token ─────────────────────────────────────────────────────
+// ── Zoho: Get access token ────────────────────────────────────────────────────
 async function getZohoToken(): Promise<string> {
   const r = await fetch(
     `https://accounts.zoho.in/oauth/v2/token?grant_type=refresh_token&client_id=${ZOHO_CLIENT_ID}&client_secret=${ZOHO_CLIENT_SECRET}&refresh_token=${ZOHO_REFRESH_TOKEN}`,
@@ -89,67 +89,77 @@ async function getZohoToken(): Promise<string> {
   return data.access_token;
 }
 
-// ── Zoho: Find lead by phone ───────────────────────────────────────────────────
-async function findLeadByPhone(phone: string, token: string): Promise<string | null> {
-  // Try Mobile field first
-  const r = await fetch(
-    `${ZOHO_API_BASE}/Leads/search?criteria=(Mobile:equals:${phone})&fields=id`,
-    { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
-  );
-  if (r.ok && r.status !== 204) {
-    const text = await r.text();
-    if (text) {
-      const data = JSON.parse(text) as any;
-      if (data?.data?.[0]?.id) return data.data[0].id;
-    }
-  }
-
-  // Try Phone field as fallback
-  const r2 = await fetch(
-    `${ZOHO_API_BASE}/Leads/search?criteria=(Phone:equals:${phone})&fields=id`,
-    { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
-  );
-  if (r2.ok && r2.status !== 204) {
-    const text2 = await r2.text();
-    if (text2) {
-      const data2 = JSON.parse(text2) as any;
-      return data2?.data?.[0]?.id || null;
-    }
-  }
-  return null;
+// ── Zoho: Find lead with detail fields ────────────────────────────────────────
+interface LeadDetails {
+  id: string;
+  firstName: string;
+  lastName: string;
+  asblProject: string | null;
 }
 
-// ── Zoho: Update lead intent ───────────────────────────────────────────────────
-async function updateZohoIntent(leadId: string, intent: string, token: string): Promise<void> {
-  const updateData: any = {
-    id: leadId,
-    Last_Intent: intent,
-    Whatsapp_Replied: true,
+async function findLeadDetailsByPhone(phone: string, token: string): Promise<LeadDetails | null> {
+  const fields = "id,First_Name,Last_Name,ASBL_Project";
+
+  const tryFetch = async (criteria: string): Promise<any | null> => {
+    const r = await fetch(
+      `${ZOHO_API_BASE}/Leads/search?criteria=${encodeURIComponent(criteria)}&fields=${fields}`,
+      { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
+    );
+    if (!r.ok || r.status === 204) return null;
+    const text = await r.text();
+    if (!text) return null;
+    try {
+      const data = JSON.parse(text);
+      return data?.data?.[0] || null;
+    } catch { return null; }
   };
 
+  let row = await tryFetch(`(Mobile:equals:${phone})`);
+  if (!row) row = await tryFetch(`(Phone:equals:${phone})`);
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    firstName: row.First_Name || "",
+    lastName: row.Last_Name || "",
+    asblProject: row.ASBL_Project || null,
+  };
+}
+
+// ── Zoho: Update lead intent ──────────────────────────────────────────────────
+async function updateZohoIntent(leadId: string, intent: string, token: string): Promise<void> {
   await fetch(`${ZOHO_API_BASE}/Leads`, {
     method: "PATCH",
     headers: {
       Authorization: `Zoho-oauthtoken ${token}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ data: [updateData] }),
+    body: JSON.stringify({
+      data: [{ id: leadId, Last_Intent: intent, Whatsapp_Replied: true }],
+    }),
   });
-
   console.log(`[Periskope Webhook] Zoho updated — Lead ${leadId}: Last_Intent=${intent}`);
 }
 
-// ── Save message to Supabase ──────────────────────────────────────────────────
-async function saveMessage(phone: string, direction: "inbound" | "outbound", message: string, sender: string): Promise<void> {
+// ── Save message to Supabase (with optional project tag) ─────────────────────
+async function saveMessage(
+  phone: string,
+  direction: "inbound" | "outbound",
+  message: string,
+  sender: string,
+  project: Project | null,
+): Promise<void> {
   try {
+    const body: any = { phone, direction, message, sender };
+    if (project) body.project = project;
     await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_messages`, {
       method: "POST",
       headers: {
         "Content-Type":  "application/json",
-        "apikey":        SUPABASE_KEY,
-        "Authorization": `Bearer ${SUPABASE_KEY}`,
+        apikey:          SUPABASE_KEY,
+        Authorization:   `Bearer ${SUPABASE_KEY}`,
       },
-      body: JSON.stringify({ phone, direction, message, sender }),
+      body: JSON.stringify(body),
     });
   } catch (err) {
     console.error("[Periskope Webhook] Failed to save message:", err);
@@ -166,6 +176,63 @@ function parsePhone(jid: string): string | null {
 // ── Is this an inbound (customer) message? ────────────────────────────────────
 function isInbound(data: any): boolean {
   return data?.from_me !== true;
+}
+
+// ── Resolve project context text (from cache or LEGACY teaser) ───────────────
+async function getProjectContextText(project: Project | null): Promise<string> {
+  if (!project) return "no specific project resolved";
+  if (project === "LEGACY") return LEGACY_TEASER;
+
+  const cached = await getCachedContent(project);
+  if (cached.text) {
+    // Trim to ~12 KB to keep prompt size reasonable
+    return cached.text.length > 12000 ? cached.text.slice(0, 12000) + "\n... (content truncated)" : cached.text;
+  }
+
+  // Cache empty — try lazy refresh (fire-and-forget, return placeholder)
+  console.log(`[Periskope Webhook] Cache empty for ${project}, lazy refresh dispatched`);
+  refreshSingleProject(project).catch((err) =>
+    console.error(`[Periskope Webhook] Lazy crawl failed for ${project}:`, err.message)
+  );
+  return `Project ${project} content is being refreshed. Please share general ASBL information for now.`;
+}
+
+// ── Build structured message for the LLM ─────────────────────────────────────
+function buildStructuredMessage(opts: {
+  customerName: string;
+  phone: string;
+  project: Project | null;
+  daysSinceLast: number | null;
+  lastProject: string | null;
+  projectContext: string;
+  history: string;
+  userMessage: string;
+}): string {
+  const lastProjectTag = opts.lastProject || "none";
+  const daysTag = opts.daysSinceLast === null ? "first time" : String(opts.daysSinceLast);
+  const currentProjectTag = opts.project || "not specified";
+
+  return [
+    `<CUSTOMER>`,
+    `Name: ${opts.customerName || "(not provided)"}`,
+    `Phone: ${opts.phone}`,
+    `Last asked project: ${lastProjectTag}`,
+    `Currently asking about project: ${currentProjectTag}`,
+    `Days since last interaction: ${daysTag}`,
+    `</CUSTOMER>`,
+    ``,
+    `<PROJECT_CONTEXT>`,
+    opts.projectContext,
+    `</PROJECT_CONTEXT>`,
+    ``,
+    `<CONVERSATION_HISTORY>`,
+    opts.history,
+    `</CONVERSATION_HISTORY>`,
+    ``,
+    `<USER_MESSAGE>`,
+    opts.userMessage,
+    `</USER_MESSAGE>`,
+  ].join("\n");
 }
 
 // ── Call Anandita LLM ─────────────────────────────────────────────────────────
@@ -234,11 +301,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST")   return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    const body   = req.body || {};
-    const event  = String(body?.event_type || body?.event || body?.type || "");
-    const data   = body?.data || body;
+    const body  = req.body || {};
+    const event = String(body?.event_type || body?.event || body?.type || "");
+    const data  = body?.data || body;
 
-    console.log(`[Periskope Webhook] FULL BODY: ${JSON.stringify(body).slice(0, 2000)}`);
     console.log(`[Periskope Webhook] Event: ${event}`);
 
     // Only handle message.created / message.received
@@ -261,37 +327,78 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     console.log(`[Periskope Webhook] Inbound from ${phone} | msg: ${message.slice(0, 80)}`);
 
-    // 1. Classify intent via LLM (handles any phrasing — Hindi, English, Hinglish)
-    const intent = await classifyIntent(message);
-    console.log(`[Periskope Webhook] Intent classified: ${intent}`);
-
-    // 2. Save inbound message to Supabase
-    await saveMessage(phone, "inbound", message, sender);
-
-    // 3. Call Anandita LLM for reply
-    const reply = await callAnandita(phone, message);
-    console.log(`[Periskope Webhook] Anandita reply: ${reply.slice(0, 100)}`);
-
-    // 4. Send reply via Periskope
-    await sendReply(phone, sender, reply);
-
-    // 5. Save outbound reply to Supabase
-    await saveMessage(phone, "outbound", reply, sender);
-
-    // 6. Update Zoho with intent — awaited before response (fire-and-forget gets killed by Vercel)
+    // 1. Zoho lookup (name + ASBL_Project) — best-effort, parallel with rest
+    let leadDetails: LeadDetails | null = null;
+    let zohoToken = "";
     try {
-      const token  = await getZohoToken();
-      const leadId = await findLeadByPhone(phone, token);
-      if (leadId) {
-        await updateZohoIntent(leadId, intent, token);
-      } else {
-        console.log(`[Periskope Webhook] Lead not found in Zoho for phone ${phone}`);
-      }
+      zohoToken = await getZohoToken();
+      leadDetails = await findLeadDetailsByPhone(phone, zohoToken);
     } catch (err: any) {
-      console.error("[Periskope Webhook] Zoho update error:", err.message);
+      console.error(`[Periskope Webhook] Zoho lookup failed: ${err.message}`);
     }
 
-    return res.status(200).json({ success: true, phone, intent });
+    // 2. Resolve project (message > Zoho > last asked)
+    const project = await resolveProject({
+      message,
+      zohoProject: leadDetails?.asblProject || null,
+      phone,
+    });
+    console.log(`[Periskope Webhook] Resolved project: ${project || "(none)"}`);
+
+    // 3. Fetch in parallel: site content + conversation history + intent
+    const [projectContext, conversation, intent] = await Promise.all([
+      getProjectContextText(project),
+      getConversationContext(phone),
+      classifyIntent(message),
+    ]);
+    console.log(`[Periskope Webhook] Intent: ${intent} | history: ${conversation.totalMessages} msgs | days since last: ${conversation.daysSinceLast}`);
+
+    // 4. Save inbound message with project tag
+    await saveMessage(phone, "inbound", message, sender, project);
+
+    // 5. Build structured message
+    const customerName =
+      [leadDetails?.firstName, leadDetails?.lastName].filter(Boolean).join(" ").trim();
+
+    const structuredMsg = buildStructuredMessage({
+      customerName,
+      phone,
+      project,
+      daysSinceLast: conversation.daysSinceLast,
+      lastProject: conversation.lastProject,
+      projectContext,
+      history: conversation.formatted,
+      userMessage: message,
+    });
+
+    // 6. Call Anandita with structured message
+    const reply = await callAnandita(phone, structuredMsg);
+    console.log(`[Periskope Webhook] Anandita reply: ${reply.slice(0, 100)}`);
+
+    // 7. Send reply via Periskope
+    await sendReply(phone, sender, reply);
+
+    // 8. Save outbound reply (tag with same project for analytics continuity)
+    await saveMessage(phone, "outbound", reply, sender, project);
+
+    // 9. Update Zoho: Last_Intent + Whatsapp_Replied
+    if (leadDetails && zohoToken) {
+      try {
+        await updateZohoIntent(leadDetails.id, intent, zohoToken);
+      } catch (err: any) {
+        console.error(`[Periskope Webhook] Zoho update error: ${err.message}`);
+      }
+    } else {
+      console.log(`[Periskope Webhook] Skipping Zoho update — lead not found`);
+    }
+
+    return res.status(200).json({
+      success: true,
+      phone,
+      project,
+      intent,
+      historyMessages: conversation.totalMessages,
+    });
 
   } catch (err: any) {
     console.error("[Periskope Webhook] Error:", err.message);
