@@ -10,6 +10,7 @@
 import axios from "axios";
 import * as cheerio from "cheerio";
 import { renderPage, closeBrowser } from "./site_renderer";
+import { formatPageAsKB } from "./kb_formatter";
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || "";
@@ -329,7 +330,9 @@ async function crawlProject(project: string): Promise<{ text: string; urls: stri
     const pageText = extractBodyText($, $.root(), seenLines);
 
     if (pageText && pageText.length > 30) {
-      pageBlocks.push(`## Page: ${sub.label}\n   URL: ${fullUrl}\n\n${pageText}`);
+      // Run through KB formatter so the LLM sees clean section/bullet structure
+      const formatted = formatPageAsKB(pageText, { pageLabel: sub.label, pageUrl: fullUrl });
+      pageBlocks.push(formatted);
     } else {
       pageBlocks.push(`## Page: ${sub.label}\n   URL: ${fullUrl}\n   (no unique content beyond what was already shown)`);
     }
