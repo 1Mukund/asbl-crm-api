@@ -1,19 +1,9 @@
 {
   "version": 2,
-  "functions": {
-    "api/cron/followup.ts": {
-      "maxDuration": 300,
-      "memory": 1024
-    }
-  },
   "crons": [
     {
       "path": "/api/cron/followup",
       "schedule": "30 4 * * *"
-    },
-    {
-      "path": "/api/cron/followup?task=refresh-sites",
-      "schedule": "30 22 * * 6"
     }
   ]
 }

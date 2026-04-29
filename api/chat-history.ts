@@ -1,4 +1,5 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+import { listAllProjectFacts, getProjectFacts, saveProjectFacts, KNOWN_PROJECTS } from "./_utils/project_facts";
 
 const LAZYBOT_URL = process.env.LAZYBOT_URL || "https://lazybot-whatsapp-crm.onrender.com";
 const LAZYBOT_API_KEY = process.env.LAZYBOT_API_KEY || "";
@@ -65,61 +66,58 @@ function nextCronRun(schedule: string): string {
 async function renderDashboard(): Promise<string> {
   const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
-  const [siteRows, msgs24h, intentRows, cronRows, docRows] = await Promise.all([
-    sb(`site_cache?select=project,page_count,fetched_at,error,content_text,urls_crawled&order=project.asc`),
+  const [factsRows, msgs24h, intentRows, cronRows, docRows] = await Promise.all([
+    listAllProjectFacts(),
     sb(`whatsapp_messages?created_at=gte.${since24h}&select=phone,direction,message,project,intent,sender,created_at&order=created_at.desc&limit=300`),
     sb(`whatsapp_messages?created_at=gte.${since24h}&direction=eq.inbound&intent=not.is.null&select=intent,project`),
     sb(`cron_log?select=task,ran_at,duration_ms,result,error&order=ran_at.desc&limit=20`),
     sb(`project_documents?select=project,doc_type,filename,url,fetched_at&order=fetched_at.desc&limit=50`),
   ]);
 
-  // ── Section 1: Crawled data summary ────────────────────────────────────
-  const siteHtml = siteRows
-    .map((r: any) => {
-      const bytes = (r.content_text || "").length;
-      const status = r.error
-        ? `<span style="color:#c00">${esc(r.error)}</span>`
-        : `<span style="color:#080">ok</span>`;
+  // Pad facts list with empty rows for any missing known project
+  const factsByProject = new Map<string, { project: string; facts_text: string; updated_at: string | null }>();
+  for (const f of factsRows) factsByProject.set(f.project, f);
+  for (const p of KNOWN_PROJECTS) {
+    if (!factsByProject.has(p)) {
+      factsByProject.set(p, { project: p, facts_text: "", updated_at: null });
+    }
+  }
+  const allFacts = Array.from(factsByProject.values()).sort((a, b) => a.project.localeCompare(b.project));
+
+  // ── Section 1: KB Status (per project) ────────────────────────────────
+  const kbStatusHtml = allFacts
+    .map((r) => {
+      const bytes = (r.facts_text || "").length;
+      const lineCount = (r.facts_text || "").split("\n").filter((l) => l.trim()).length;
+      const status = bytes > 100
+        ? `<span style="color:#080">uploaded</span>`
+        : `<span style="color:#c80">empty</span>`;
       return `<tr>
-        <td>${esc(r.project)}</td>
-        <td>${esc(r.page_count || 0)}</td>
+        <td><strong>${esc(r.project)}</strong></td>
         <td>${(bytes / 1024).toFixed(1)} KB</td>
-        <td>${esc(r.fetched_at ? new Date(r.fetched_at).toLocaleString("en-IN") : "—")}</td>
-        <td>${timeAgo(r.fetched_at)}</td>
+        <td>${lineCount}</td>
+        <td>${esc(r.updated_at ? new Date(r.updated_at).toLocaleString("en-IN") : "never")}</td>
+        <td>${timeAgo(r.updated_at)}</td>
         <td>${status}</td>
-        <td><a href="#content-${esc(r.project)}">view ↓</a></td>
+        <td>
+          <a href="#kb-${esc(r.project)}">view ↓</a>
+          ·
+          <a href="?view=edit-facts&project=${esc(r.project)}">edit ✎</a>
+        </td>
       </tr>`;
     })
     .join("");
 
-  // ── Section 1b: Per-project stored content + structure stats ──────────
-  function parseStructure(content: string): { metaCount: number; headings: string[]; lineCount: number; uniqueLines: number; navLine: string | null } {
-    if (!content) return { metaCount: 0, headings: [], lineCount: 0, uniqueLines: 0, navLine: null };
-    const lines = content.split("\n").map((l) => l.trim()).filter(Boolean);
-    const metaCount = lines.filter((l) => /^(Description|OG Title|Keywords):/.test(l)).length;
-    const headings = lines.filter((l) => /^#{1,6}\s+/.test(l)).map((l) => l.replace(/^#+\s*/, "").trim());
-    const navLine = lines.find((l) => l.startsWith("Site sections / linked pages:")) || null;
-    const uniqueLines = new Set(lines).size;
-    return { metaCount, headings, lineCount: lines.length, uniqueLines, navLine };
-  }
-
-  const contentSectionsHtml = siteRows
-    .map((r: any) => {
-      const content = r.content_text || "";
-      const stats = parseStructure(content);
-      const headingPreview = stats.headings.slice(0, 12).map((h) => esc(h)).join(", ") + (stats.headings.length > 12 ? `, …${stats.headings.length - 12} more` : "");
-      const navPreview = stats.navLine
-        ? esc(stats.navLine.replace("Site sections / linked pages:", "").trim().slice(0, 400)) + (stats.navLine.length > 400 ? "…" : "")
-        : "—";
-      const fetched = r.fetched_at ? new Date(r.fetched_at).toLocaleString("en-IN") : "never";
-      return `<details id="content-${esc(r.project)}" class="proj-content">
-        <summary><strong>${esc(r.project)}</strong> — ${(content.length / 1024).toFixed(1)} KB · ${stats.lineCount} lines (${stats.uniqueLines} unique) · ${stats.headings.length} headings · ${stats.metaCount} meta blocks · fetched ${esc(fetched)}</summary>
-        <div class="proj-stats">
-          <div><b>Sample headings:</b> ${headingPreview || "—"}</div>
-          <div style="margin-top:6px"><b>Linked sections (nav):</b> <span style="color:#555">${navPreview}</span></div>
-          <div style="margin-top:6px"><b>Source URLs crawled:</b> ${(r.urls_crawled || []).slice(0, 8).map((u: string) => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u.replace("https://asbl.in", ""))}</a>`).join(" · ") || "—"}${(r.urls_crawled || []).length > 8 ? ` · …${(r.urls_crawled || []).length - 8} more` : ""}</div>
-        </div>
-        <pre class="proj-text">${esc(content) || "(no content stored yet)"}</pre>
+  // ── Section 1b: KB content viewer per project ─────────────────────────
+  const kbContentHtml = allFacts
+    .map((r) => {
+      const content = r.facts_text || "";
+      const updated = r.updated_at ? new Date(r.updated_at).toLocaleString("en-IN") : "never uploaded";
+      const sizeKb = (content.length / 1024).toFixed(1);
+      const lines = content.split("\n").filter((l) => l.trim()).length;
+      return `<details id="kb-${esc(r.project)}" class="proj-content">
+        <summary><strong>${esc(r.project)}</strong> — ${sizeKb} KB · ${lines} lines · last updated ${esc(updated)} · <a href="?view=edit-facts&project=${esc(r.project)}" style="color:#007aff">edit ✎</a></summary>
+        <pre class="proj-text">${esc(content) || "(no KB uploaded — click 'edit ✎' to add one)"}</pre>
       </details>`;
     })
     .join("");
@@ -190,8 +188,7 @@ async function renderDashboard(): Promise<string> {
     if (!lastByTask.has(r.task)) lastByTask.set(r.task, r);
   }
   const cronTasks = [
-    { name: "followup",       schedule: "30 4 * * *",   label: "Daily 10:00 IST" },
-    { name: "refresh-sites",  schedule: "30 22 * * 6",  label: "Sun 04:00 IST"   },
+    { name: "followup", schedule: "30 4 * * *", label: "Daily 10:00 IST" },
   ];
   const cronHtml = cronTasks
     .map((t) => {
@@ -269,21 +266,21 @@ code { background: #f0f0f3; padding: 2px 5px; border-radius: 4px; font-size: 12p
 <div class="grid">
 
   <div class="card full">
-    <h2>1. Crawled Data Summary (per project)</h2>
-    ${siteRows.length ? `<table>
-      <tr><th>Project</th><th>Pages</th><th>Size</th><th>Last fetched</th><th>Age</th><th>Status</th><th>Content</th></tr>
-      ${siteHtml}
-    </table>` : `<div class="empty">No crawl data yet.</div>`}
+    <h2>1. Knowledge Base Status (per project)</h2>
+    <div class="proj-help">
+      Each project's KB is the <strong>single source of truth</strong> the bot uses as
+      <code>&lt;PROJECT_CONTEXT&gt;</code> on every reply. Click <strong>edit ✎</strong> to upload or update
+      a project's KB (paste the full text). Larger / richer KB = more accurate, less hallucinated answers.
+    </div>
+    <table>
+      <tr><th>Project</th><th>Size</th><th>Lines</th><th>Last updated</th><th>Age</th><th>Status</th><th>Actions</th></tr>
+      ${kbStatusHtml}
+    </table>
   </div>
 
   <div class="card full">
-    <h2>1b. Stored Crawl Content (full structure per project)</h2>
-    <div class="proj-help">
-      Each project below shows what is actually stored in <code>site_cache.content_text</code>: meta tags
-      (Title / Description / OG Title / Keywords) + nav labels + h1..h6 headings + paragraph text in
-      document order. The LLM sees this exact text as <code>&lt;PROJECT_CONTEXT&gt;</code> on every reply.
-    </div>
-    ${contentSectionsHtml || `<div class="empty">No content cached yet.</div>`}
+    <h2>1b. Knowledge Base Content (what the bot sees per project)</h2>
+    ${kbContentHtml || `<div class="empty">No KBs yet.</div>`}
   </div>
 
   <div class="card full">
@@ -330,6 +327,112 @@ code { background: #f0f0f3; padding: 2px 5px; border-radius: 4px; font-size: 12p
 </body></html>`;
 }
 
+// ── Render edit-facts form ────────────────────────────────────────────────
+async function renderEditForm(project: string, message: string = ""): Promise<string> {
+  const facts = await getProjectFacts(project);
+  const text = facts?.facts_text || "";
+  const updated = facts?.updated_at ? new Date(facts.updated_at).toLocaleString("en-IN") : "never";
+
+  return `<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>Edit ${esc(project)} KB — ASBL CRM</title>
+<style>
+* { box-sizing: border-box; }
+body { font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f7; color: #1d1d1f; margin: 0; padding: 24px; max-width: 1100px; margin: 0 auto; }
+h1 { font-size: 22px; margin: 0 0 4px; font-weight: 600; }
+.sub { color: #666; font-size: 13px; margin-bottom: 20px; }
+.card { background: white; border-radius: 12px; padding: 24px; border: 1px solid #e5e5ea; }
+.help { font-size: 12.5px; color: #555; margin-bottom: 16px; line-height: 1.5; padding: 12px 14px; background: #fafbfc; border-left: 3px solid #007aff; border-radius: 4px; }
+label { display: block; font-weight: 600; margin: 12px 0 6px; font-size: 13px; }
+textarea { width: 100%; min-height: 600px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px; line-height: 1.5; padding: 14px; border: 1px solid #d1d1d6; border-radius: 8px; resize: vertical; }
+.actions { margin-top: 16px; display: flex; gap: 12px; align-items: center; }
+button { background: #007aff; color: white; border: none; padding: 10px 22px; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; }
+button:hover { background: #0066d6; }
+.btn-secondary { background: white; color: #1d1d1f; border: 1px solid #d1d1d6; }
+.btn-secondary:hover { background: #f5f5f7; }
+.flash { padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 13px; }
+.flash-success { background: #34c75914; color: #1f6f3a; border: 1px solid #34c75940; }
+.flash-error { background: #ff3b3014; color: #b71c1c; border: 1px solid #ff3b3040; }
+a { color: #007aff; text-decoration: none; }
+a:hover { text-decoration: underline; }
+.meta { font-size: 12px; color: #888; margin-top: 8px; }
+code { background: #f0f0f3; padding: 2px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head><body>
+<h1>Edit Knowledge Base — ${esc(project)}</h1>
+<div class="sub">
+  <a href="?view=dashboard">← back to dashboard</a> · last updated: ${esc(updated)}
+</div>
+
+${message ? `<div class="flash ${message.startsWith("Saved") ? "flash-success" : "flash-error"}">${esc(message)}</div>` : ""}
+
+<div class="card">
+  <div class="help">
+    Paste the full KB text for <strong>${esc(project)}</strong> below. This becomes the bot's <code>&lt;PROJECT_CONTEXT&gt;</code>
+    on every reply for this project. Use clear sections (Project Overview, Location, Master Plan, Pricing, etc.) — the bot
+    will ground all its answers in this text only. Plain text, markdown, bullet lists — all fine.
+  </div>
+  <form method="POST" action="?action=save-facts">
+    <input type="hidden" name="project" value="${esc(project)}" />
+    <label for="facts_text">Facts text (size: ${(text.length / 1024).toFixed(1)} KB)</label>
+    <textarea id="facts_text" name="facts_text" placeholder="# PROJECT: ${esc(project)}
+
+## Project Overview
+- Name: ASBL ${esc(project)}
+- Location: ...
+- RERA Number: ...
+- Configuration: ...
+- Possession: ...
+
+## Location & Connectivity
+### Schools nearby
+- ...
+
+### Offices nearby
+- ...
+
+## Master Plan
+...
+
+## Pricing
+- Box price 1695 sqft: ₹1.94 Cr + GST
+- Box price 1870 sqft: ₹2.15 Cr + GST
+
+## Other Charges
+- ...
+
+## Documents
+- Brochure: <link>
+- Price Sheet: <link>
+- Specifications: <link>
+">${esc(text)}</textarea>
+    <div class="actions">
+      <button type="submit">Save KB</button>
+      <a href="?view=dashboard" class="btn-secondary" style="text-decoration:none;padding:10px 22px;border-radius:8px;border:1px solid #d1d1d6;color:#1d1d1f;background:white">Cancel</a>
+      <span class="meta">Saving will overwrite the current KB for this project.</span>
+    </div>
+  </form>
+</div>
+</body></html>`;
+}
+
+// ── Parse application/x-www-form-urlencoded body ──────────────────────────
+function parseFormBody(body: any): Record<string, string> {
+  if (!body) return {};
+  if (typeof body === "object" && !Array.isArray(body)) return body as any;
+  if (typeof body === "string") {
+    const out: Record<string, string> = {};
+    for (const pair of body.split("&")) {
+      const [k, v] = pair.split("=");
+      if (!k) continue;
+      out[decodeURIComponent(k.replace(/\+/g, " "))] = decodeURIComponent((v || "").replace(/\+/g, " "));
+    }
+    return out;
+  }
+  return {};
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // Allow iframe embedding from Zoho
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -347,6 +450,33 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     } catch (err: any) {
       return res.status(500).send(`<pre>Dashboard error: ${err.message}</pre>`);
     }
+  }
+
+  // Edit KB form (HTML)
+  if (req.method === "GET" && req.query.view === "edit-facts") {
+    const project = String(req.query.project || "").toUpperCase();
+    if (!KNOWN_PROJECTS.includes(project as any)) {
+      return res.status(400).send(`<pre>Unknown project: ${esc(project)}. Valid: ${KNOWN_PROJECTS.join(", ")}</pre>`);
+    }
+    const flash = (req.query.msg as string) || "";
+    const html = await renderEditForm(project, flash);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).send(html);
+  }
+
+  // Save KB action (POST form)
+  if (req.method === "POST" && req.query.action === "save-facts") {
+    const body = parseFormBody(req.body);
+    const project = String(body.project || "").toUpperCase();
+    const factsText = String(body.facts_text || "");
+    if (!KNOWN_PROJECTS.includes(project as any)) {
+      return res.status(400).send(`Unknown project: ${esc(project)}`);
+    }
+    const result = await saveProjectFacts(project, factsText);
+    const msg = result.ok ? `Saved (${(factsText.length / 1024).toFixed(1)} KB).` : `Error: ${result.error}`;
+    res.setHeader("Location", `?view=edit-facts&project=${encodeURIComponent(project)}&msg=${encodeURIComponent(msg)}`);
+    return res.status(303).end();
   }
 
   if (req.method === "GET") {

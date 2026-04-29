@@ -20,7 +20,7 @@
  */
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { resolveProject, Project } from "../_utils/project_detection";
-import { getCachedContent, refreshSingleProject } from "../_utils/site_crawler";
+import { getProjectFacts } from "../_utils/project_facts";
 import { getConversationContext } from "../_utils/conversation_context";
 import { sanitizeReply } from "../_utils/sanitizer";
 import { getDocumentFor, sendDocViaPeriskope } from "../_utils/document_dispatcher";
@@ -182,23 +182,19 @@ function isInbound(data: any): boolean {
   return data?.from_me !== true;
 }
 
-// ── Resolve project context text (from cache or LEGACY teaser) ───────────────
+// ── Resolve project context text from manually-curated project_facts ──────
 async function getProjectContextText(project: Project | null): Promise<string> {
   if (!project) return "no specific project resolved";
   if (project === "LEGACY") return LEGACY_TEASER;
 
-  const cached = await getCachedContent(project);
-  if (cached.text) {
-    // Trim to ~12 KB to keep prompt size reasonable
-    return cached.text.length > 12000 ? cached.text.slice(0, 12000) + "\n... (content truncated)" : cached.text;
+  const facts = await getProjectFacts(project);
+  if (facts && facts.facts_text && facts.facts_text.trim().length > 0) {
+    // Trim to ~16 KB so the prompt stays a manageable size
+    const text = facts.facts_text.trim();
+    return text.length > 16000 ? text.slice(0, 16000) + "\n... (content truncated)" : text;
   }
 
-  // Cache empty — try lazy refresh (fire-and-forget, return placeholder)
-  console.log(`[Periskope Webhook] Cache empty for ${project}, lazy refresh dispatched`);
-  refreshSingleProject(project).catch((err) =>
-    console.error(`[Periskope Webhook] Lazy crawl failed for ${project}:`, err.message)
-  );
-  return `Project ${project} content is being refreshed. Please share general ASBL information for now.`;
+  return `No knowledge base uploaded for ${project} yet. Please tell the customer you'll have a sales executive share the details shortly.`;
 }
 
 // ── Build structured message for the LLM ─────────────────────────────────────

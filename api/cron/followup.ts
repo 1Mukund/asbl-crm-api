@@ -2,9 +2,6 @@
  * GET /api/cron/followup
  *   - Daily at 04:30 UTC (10:00 AM IST) — runs followup sequence
  *
- * GET /api/cron/followup?task=refresh-sites
- *   - Weekly Sat 22:30 UTC / Sun 04:00 IST — re-crawls 4 ASBL project sites
- *
  * Followup logic:
  *   1. Get all phones we contacted (outbound messages in whatsapp_messages)
  *   2. Filter: no inbound reply ever received
@@ -13,7 +10,6 @@
  *   5. Log to follow_up_log
  */
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { refreshAllSites } from "../_utils/site_crawler";
 
 const SUPABASE_URL       = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY       = process.env.SUPABASE_SECRET_KEY || "";
@@ -191,26 +187,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  // Task router: ?task=refresh-sites runs the weekly site crawler
-  const task = String(req.query.task || "").toLowerCase();
-  if (task === "refresh-sites") {
-    const startTs = Date.now();
-    try {
-      console.log("[Cron] Starting site refresh...");
-      const results = await refreshAllSites();
-      const durationMs = Date.now() - startTs;
-      console.log("[Cron] Site refresh complete:", JSON.stringify(results));
-      await logCronRun("refresh-sites", durationMs, results, null);
-      return res.status(200).json({ success: true, task: "refresh-sites", durationMs, results });
-    } catch (err: any) {
-      const durationMs = Date.now() - startTs;
-      console.error("[Cron] Site refresh error:", err.message);
-      await logCronRun("refresh-sites", durationMs, null, err.message);
-      return res.status(500).json({ error: err.message, task: "refresh-sites" });
-    }
-  }
+  // Project KBs are now manually curated via the dashboard's Edit KB form,
+  // so the auto-crawl task has been removed. Only the followup task remains.
 
-  // Default task: followup sequence
   const followupStartTs = Date.now();
   try {
     const now = Date.now();
