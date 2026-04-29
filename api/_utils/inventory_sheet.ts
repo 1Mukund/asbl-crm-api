@@ -83,6 +83,28 @@ function normalizeProject(name: string): string {
     .trim();
 }
 
+// ── Format raw rupee amount to "₹X.XX Cr" so the LLM doesn't mis-scale it.
+// Inputs from the sheet: "21772465", "19400000", "8,599", "11,209.43" etc.
+function formatRupees(raw: string): string {
+  if (!raw) return "";
+  const cleaned = raw.replace(/[,\s₹]/g, "");
+  if (!cleaned || cleaned.toUpperCase() === "NA") return raw;
+  const n = parseFloat(cleaned);
+  if (!isFinite(n) || n <= 0) return raw;
+
+  // Per-sqft rates (4-5 digit numbers) → keep as ₹X
+  if (n < 100000) {
+    return "₹" + Math.round(n).toLocaleString("en-IN");
+  }
+  // Lakh range
+  if (n < 10000000) {
+    return `₹${(n / 100000).toFixed(2)} Lakh`;
+  }
+  // Crore range — drop trailing zeros for cleaner output
+  const cr = n / 10000000;
+  return `₹${cr.toFixed(2)} Cr`;
+}
+
 // ── Fetch + parse + cache ─────────────────────────────────────────────────
 async function fetchAllRows(force = false): Promise<InventoryRow[]> {
   if (!force && cache && Date.now() - cache.fetchedAt < CACHE_TTL_MS) {
@@ -162,8 +184,12 @@ export async function getInventoryForProject(project: string): Promise<ProjectIn
     parts.push(`${r.sizeSft} sft`);
     parts.push(r.bhk);
     parts.push(r.facing);
-    if (r.allInclusive && r.allInclusive !== "NA") parts.push(`All-inclusive: ₹${r.allInclusive}`);
-    if (r.pricePerSft && r.pricePerSft !== "NA") parts.push(`Per sft: ₹${r.pricePerSft}`);
+    if (r.allInclusive && r.allInclusive !== "NA") {
+      parts.push(`All-inclusive: ${formatRupees(r.allInclusive)}`);
+    }
+    if (r.pricePerSft && r.pricePerSft !== "NA") {
+      parts.push(`Per sft: ${formatRupees(r.pricePerSft)}`);
+    }
     if (r.offer && r.offer !== "NA") parts.push(`Offer: ${r.offer}`);
     return "- " + parts.join(" | ");
   };
