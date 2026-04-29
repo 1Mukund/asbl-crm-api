@@ -387,31 +387,42 @@ function lastNHistoryLines(fullHistory: string, n: number): string {
   return lines.slice(-n).join("\n");
 }
 
-// ── Call Anandita LLM ─────────────────────────────────────────────────────────
+// ── Call Anandita main LLM with timeout ──────────────────────────────────────
 async function callAnandita(phone: string, message: string): Promise<string> {
-  const r = await fetch(ANANDITA_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type":  "application/json",
-      "Authorization": `Bearer ${ANANDITA_API_KEY}`,
-    },
-    body: JSON.stringify({ phone: `+${phone}`, message }),
-  });
+  const TIMEOUT_MS = 20000; // 20s — fail fast if model hangs
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
 
-  if (!r.ok) {
-    const err = await r.text();
-    throw new Error(`Anandita error ${r.status}: ${err}`);
+  try {
+    const r = await fetch(ANANDITA_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "Authorization": `Bearer ${ANANDITA_API_KEY}`,
+      },
+      body: JSON.stringify({ phone: `+${phone}`, message }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+
+    if (!r.ok) {
+      const err = await r.text();
+      throw new Error(`Anandita error ${r.status}: ${err}`);
+    }
+    const data = await r.json() as any;
+    const reply: string = data?.message || data?.reply || "";
+    if (!reply.trim()) throw new Error("Anandita returned empty reply");
+    return reply.trim();
+  } catch (err: any) {
+    clearTimeout(timer);
+    if (err.name === "AbortError") throw new Error(`Anandita timeout after ${TIMEOUT_MS}ms`);
+    throw err;
   }
-
-  const data = await r.json() as any;
-  const reply: string = data?.message || data?.reply || "";
-  if (!reply.trim()) throw new Error("Anandita returned empty reply");
-  return reply.trim();
 }
 
-// ── Send via Periskope with typing delay ──────────────────────────────────────
+// ── Send via Periskope with typing delay + retry on transient failure ──────
 async function sendReply(phone: string, sender: string, message: string): Promise<void> {
-  // 1. Send typing indicator
+  // 1. Send typing indicator (non-critical)
   try {
     await fetch(`https://api.periskope.app/v1/chats/typing`, {
       method: "POST",
@@ -424,20 +435,36 @@ async function sendReply(phone: string, sender: string, message: string): Promis
     });
   } catch { /* not critical */ }
 
-  // 2. Short human-like pause (3s — long enough to feel natural, short
-  //    enough that a fast follow-up customer message doesn't race past us)
-  await new Promise(resolve => setTimeout(resolve, 3000));
+  // 2. Short human-like pause (1.5s — keeps it natural while shrinking the
+  //    fast-follow-up race window)
+  await new Promise(resolve => setTimeout(resolve, 1500));
 
-  // 3. Send actual message
-  const r = await fetch(PERISKOPE_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type":  "application/json",
-      "Authorization": `Bearer ${PERISKOPE_API_KEY}`,
-      "x-phone":       sender,
-    },
-    body: JSON.stringify({ chat_id: phone, message }),
-  });
+  // 3. Send actual message — with 1 retry on 5xx / network failure
+  const sendOnce = async () => {
+    return fetch(PERISKOPE_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "Authorization": `Bearer ${PERISKOPE_API_KEY}`,
+        "x-phone":       sender,
+      },
+      body: JSON.stringify({ chat_id: phone, message }),
+    });
+  };
+
+  let r: Response;
+  try {
+    r = await sendOnce();
+    if (!r.ok && r.status >= 500) {
+      console.warn(`[Periskope] first send returned ${r.status}, retrying...`);
+      await new Promise(resolve => setTimeout(resolve, 800));
+      r = await sendOnce();
+    }
+  } catch (err: any) {
+    console.warn(`[Periskope] first send threw (${err.message}), retrying...`);
+    await new Promise(resolve => setTimeout(resolve, 800));
+    r = await sendOnce();
+  }
 
   if (!r.ok) {
     const text = await r.text();
@@ -548,8 +575,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     //     Periskope's typing-indicator delay hasn't fired the actual send yet.
     await saveMessage(phone, "outbound", reply, sender, project);
 
-    // 11. Send text reply via Periskope (3s typing delay inside)
-    await sendReply(phone, sender, reply);
+    // 11. Send text reply via Periskope (1.5s typing delay + 1 retry inside)
+    let sendOk = true;
+    try {
+      await sendReply(phone, sender, reply);
+    } catch (err: any) {
+      sendOk = false;
+      console.error(`[Periskope Webhook] Periskope send failed (reply saved to DB but not delivered): ${err.message}`);
+    }
 
     // 12. Auto-deliver document via Periskope when classifier signals a doc-type intent
     let docSent: { doc_type: string; url: string } | null = null;
@@ -591,6 +624,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       zohoIntent,
       historyMessages: conversation.totalMessages,
       docSent,
+      delivered: sendOk,
     });
 
   } catch (err: any) {
