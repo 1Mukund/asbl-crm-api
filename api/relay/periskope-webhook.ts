@@ -272,8 +272,9 @@ async function sendReply(phone: string, sender: string, message: string): Promis
     });
   } catch { /* not critical */ }
 
-  // 2. Wait 10 seconds (human-like delay)
-  await new Promise(resolve => setTimeout(resolve, 10000));
+  // 2. Short human-like pause (3s — long enough to feel natural, short
+  //    enough that a fast follow-up customer message doesn't race past us)
+  await new Promise(resolve => setTimeout(resolve, 3000));
 
   // 3. Send actual message
   const r = await fetch(PERISKOPE_API_URL, {
@@ -376,10 +377,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const reply = sanitizeReply(rawReply);
     console.log(`[Periskope Webhook] Anandita reply (sanitized): ${reply.slice(0, 100)}`);
 
-    // 7. Send text reply via Periskope
+    // 7. Save outbound IMMEDIATELY so a fast follow-up message from the
+    //    customer sees the bot's reply in CONVERSATION_HISTORY, even if
+    //    Periskope's typing-indicator delay hasn't fired the actual send yet.
+    await saveMessage(phone, "outbound", reply, sender, project);
+
+    // 8. Send text reply via Periskope (3s typing delay inside)
     await sendReply(phone, sender, reply);
 
-    // 7b. If intent calls for a doc (brochure/price) and we have one cached, send it too
+    // 9. If intent calls for a doc (brochure/price) and we have one cached, send it too
     let docSent: { doc_type: string; url: string } | null = null;
     if (project && (intent === "brochure" || intent === "price")) {
       try {
@@ -398,9 +404,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         console.error(`[Periskope Webhook] Doc send failed: ${err.message}`);
       }
     }
-
-    // 8. Save outbound reply (tag with same project for analytics continuity)
-    await saveMessage(phone, "outbound", reply, sender, project);
 
     // 9. Update Zoho: Last_Intent + Whatsapp_Replied
     if (leadDetails && zohoToken) {
