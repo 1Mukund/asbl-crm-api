@@ -20,11 +20,18 @@ const SUPABASE_URL       = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY       = process.env.SUPABASE_SECRET_KEY || "";
 
 // Round-robin sender numbers (stored without + prefix)
+// All 10 connected Periskope senders — Anandita LLM RM team
 const SENDER_NUMBERS = [
-  "919063141693",
-  "917995284040",
+  "919063141693", // Angad
+  "917794028484", // Kapil
+  "917396077334", // Bala SK
+  "919059555164", // Reddy
   "918977537630",
-  "919059555164",
+  "917207048181", // Varun
+  "917396130606", // Mayur
+  "917386023002",
+  "919247524774",
+  "917995284040", // Anandita
 ];
 
 // Get next sender via atomic Supabase RPC (true round-robin)
