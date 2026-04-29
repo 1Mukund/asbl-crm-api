@@ -21,6 +21,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { resolveProject, Project } from "../_utils/project_detection";
 import { getProjectFacts } from "../_utils/project_facts";
+import { getInventoryForProject } from "../_utils/inventory_sheet";
 import { getConversationContext } from "../_utils/conversation_context";
 import { sanitizeReply } from "../_utils/sanitizer";
 import { getDocumentFor, sendDocViaPeriskope } from "../_utils/document_dispatcher";
@@ -182,19 +183,39 @@ function isInbound(data: any): boolean {
   return data?.from_me !== true;
 }
 
-// ── Resolve project context text from manually-curated project_facts ──────
+// ── Resolve project context text — manual KB notes + LIVE inventory sheet ─
 async function getProjectContextText(project: Project | null): Promise<string> {
   if (!project) return "no specific project resolved";
   if (project === "LEGACY") return LEGACY_TEASER;
 
+  const parts: string[] = [];
+
+  // 1. Manual project notes (from dashboard's Edit KB form, if any)
   const facts = await getProjectFacts(project);
-  if (facts && facts.facts_text && facts.facts_text.trim().length > 0) {
-    // Trim to ~16 KB so the prompt stays a manageable size
-    const text = facts.facts_text.trim();
-    return text.length > 16000 ? text.slice(0, 16000) + "\n... (content truncated)" : text;
+  if (facts?.facts_text?.trim()) {
+    parts.push("## PROJECT NOTES (manually curated)");
+    parts.push(facts.facts_text.trim());
   }
 
-  return `No knowledge base uploaded for ${project} yet. Please tell the customer you'll have a sales executive share the details shortly.`;
+  // 2. Live inventory + pricing from the master Google Sheet
+  try {
+    const inv = await getInventoryForProject(project);
+    if (inv.markdown) {
+      parts.push("");
+      parts.push("## CURRENT INVENTORY & PRICING");
+      parts.push(inv.markdown);
+    }
+  } catch (err: any) {
+    console.error(`[Webhook] Inventory fetch failed: ${err.message}`);
+  }
+
+  if (parts.length === 0) {
+    return `No knowledge base or inventory available for ${project} yet. Tell the customer you'll have a sales executive revert with details.`;
+  }
+
+  const combined = parts.join("\n").trim();
+  // Trim to ~18 KB to keep prompt size reasonable
+  return combined.length > 18000 ? combined.slice(0, 18000) + "\n... (truncated)" : combined;
 }
 
 // ── Build structured message for the LLM ─────────────────────────────────────

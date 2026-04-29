@@ -1,5 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { listAllProjectFacts, getProjectFacts, saveProjectFacts, KNOWN_PROJECTS } from "./_utils/project_facts";
+import { getAllInventoryRows, refreshInventoryCache, INVENTORY_SHEET_URL } from "./_utils/inventory_sheet";
 
 const LAZYBOT_URL = process.env.LAZYBOT_URL || "https://lazybot-whatsapp-crm.onrender.com";
 const LAZYBOT_API_KEY = process.env.LAZYBOT_API_KEY || "";
@@ -66,12 +67,16 @@ function nextCronRun(schedule: string): string {
 async function renderDashboard(): Promise<string> {
   const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
-  const [factsRows, msgs24h, intentRows, cronRows, docRows] = await Promise.all([
+  const [factsRows, msgs24h, intentRows, cronRows, docRows, inventory] = await Promise.all([
     listAllProjectFacts(),
     sb(`whatsapp_messages?created_at=gte.${since24h}&select=phone,direction,message,project,intent,sender,created_at&order=created_at.desc&limit=300`),
     sb(`whatsapp_messages?created_at=gte.${since24h}&direction=eq.inbound&intent=not.is.null&select=intent,project`),
     sb(`cron_log?select=task,ran_at,duration_ms,result,error&order=ran_at.desc&limit=20`),
     sb(`project_documents?select=project,doc_type,filename,url,fetched_at&order=fetched_at.desc&limit=50`),
+    getAllInventoryRows().catch((err: any) => {
+      console.error("[Dashboard] Inventory fetch failed:", err.message);
+      return { rows: [], fetchedAt: 0 };
+    }),
   ]);
 
   // Pad facts list with empty rows for any missing known project
@@ -84,13 +89,13 @@ async function renderDashboard(): Promise<string> {
   }
   const allFacts = Array.from(factsByProject.values()).sort((a, b) => a.project.localeCompare(b.project));
 
-  // ── Section 1: KB Status (per project) ────────────────────────────────
-  const kbStatusHtml = allFacts
+  // ── Section 1: Project Offer Details (per project) ────────────────────
+  const offerStatusHtml = allFacts
     .map((r) => {
       const bytes = (r.facts_text || "").length;
       const lineCount = (r.facts_text || "").split("\n").filter((l) => l.trim()).length;
       const status = bytes > 100
-        ? `<span style="color:#080">uploaded</span>`
+        ? `<span style="color:#080">written</span>`
         : `<span style="color:#c80">empty</span>`;
       return `<tr>
         <td><strong>${esc(r.project)}</strong></td>
@@ -100,7 +105,7 @@ async function renderDashboard(): Promise<string> {
         <td>${timeAgo(r.updated_at)}</td>
         <td>${status}</td>
         <td>
-          <a href="#kb-${esc(r.project)}">view ↓</a>
+          <a href="#offer-${esc(r.project)}">view ↓</a>
           ·
           <a href="?view=edit-facts&project=${esc(r.project)}">edit ✎</a>
         </td>
@@ -108,16 +113,72 @@ async function renderDashboard(): Promise<string> {
     })
     .join("");
 
-  // ── Section 1b: KB content viewer per project ─────────────────────────
-  const kbContentHtml = allFacts
+  // ── Section 1b: Offer details viewer per project ──────────────────────
+  const offerContentHtml = allFacts
     .map((r) => {
       const content = r.facts_text || "";
-      const updated = r.updated_at ? new Date(r.updated_at).toLocaleString("en-IN") : "never uploaded";
+      const updated = r.updated_at ? new Date(r.updated_at).toLocaleString("en-IN") : "never written";
       const sizeKb = (content.length / 1024).toFixed(1);
       const lines = content.split("\n").filter((l) => l.trim()).length;
-      return `<details id="kb-${esc(r.project)}" class="proj-content">
+      return `<details id="offer-${esc(r.project)}" class="proj-content">
         <summary><strong>${esc(r.project)}</strong> — ${sizeKb} KB · ${lines} lines · last updated ${esc(updated)} · <a href="?view=edit-facts&project=${esc(r.project)}" style="color:#007aff">edit ✎</a></summary>
-        <pre class="proj-text">${esc(content) || "(no KB uploaded — click 'edit ✎' to add one)"}</pre>
+        <pre class="proj-text">${esc(content) || "(no offer details written — click 'edit ✎' to add)"}</pre>
+      </details>`;
+    })
+    .join("");
+
+  // ── Section 1c: Live Inventory + Pricing (from Google Sheet) ──────────
+  const invByProject: Record<string, typeof inventory.rows> = {};
+  for (const row of inventory.rows) {
+    if (!invByProject[row.project]) invByProject[row.project] = [];
+    invByProject[row.project].push(row);
+  }
+  const invFetchedAt = inventory.fetchedAt ? new Date(inventory.fetchedAt).toLocaleString("en-IN") : "never";
+  const invFetchedAgo = inventory.fetchedAt ? timeAgo(new Date(inventory.fetchedAt).toISOString()) : "—";
+
+  const inventoryStatusHtml = KNOWN_PROJECTS.map((p) => {
+    const rows = invByProject[p] || [];
+    if (p === "LEGACY") return ""; // LEGACY not in sheet
+    const available = rows.filter((r) => /^available/i.test(r.availability)).length;
+    const limited = rows.filter((r) => /not selling/i.test(r.availability)).length;
+    const sold = rows.filter((r) => /sold\s*out/i.test(r.availability)).length;
+    return `<tr>
+      <td><strong>${esc(p)}</strong></td>
+      <td>${rows.length}</td>
+      <td><span style="color:#080">${available}</span></td>
+      <td><span style="color:#c80">${limited}</span></td>
+      <td><span style="color:#888">${sold}</span></td>
+      <td><a href="#inv-${esc(p)}">view ↓</a></td>
+    </tr>`;
+  }).filter(Boolean).join("");
+
+  const inventoryDetailHtml = KNOWN_PROJECTS.filter((p) => p !== "LEGACY")
+    .map((p) => {
+      const rows = invByProject[p] || [];
+      if (rows.length === 0) {
+        return `<details id="inv-${esc(p)}" class="proj-content">
+          <summary><strong>${esc(p)}</strong> — no rows in sheet</summary>
+        </details>`;
+      }
+      const tbody = rows
+        .map((r) => {
+          const availColor = /^available/i.test(r.availability) ? "#080"
+            : /sold/i.test(r.availability) ? "#888" : "#c80";
+          return `<tr>
+            <td>${esc(r.tower)}</td>
+            <td>${esc(r.sizeSft)}</td>
+            <td>${esc(r.bhk)}</td>
+            <td>${esc(r.facing)}</td>
+            <td style="color:${availColor}">${esc(r.availability)}</td>
+            <td>${esc(r.pricePerSft)}</td>
+            <td>${esc(r.allInclusive)}</td>
+            <td>${esc(r.offer)}</td>
+          </tr>`;
+        })
+        .join("");
+      return `<details id="inv-${esc(p)}" class="proj-content">
+        <summary><strong>${esc(p)}</strong> — ${rows.length} units</summary>
+        <table style="margin-top:8px"><tr><th>Tower</th><th>SFT</th><th>BHK</th><th>Facing</th><th>Availability</th><th>₹/sft</th><th>All-inclusive</th><th>Offer</th></tr>${tbody}</table>
       </details>`;
     })
     .join("");
@@ -266,21 +327,41 @@ code { background: #f0f0f3; padding: 2px 5px; border-radius: 4px; font-size: 12p
 <div class="grid">
 
   <div class="card full">
-    <h2>1. Knowledge Base Status (per project)</h2>
+    <h2>1. Project Offer Details (per project)</h2>
     <div class="proj-help">
-      Each project's KB is the <strong>single source of truth</strong> the bot uses as
-      <code>&lt;PROJECT_CONTEXT&gt;</code> on every reply. Click <strong>edit ✎</strong> to upload or update
-      a project's KB (paste the full text). Larger / richer KB = more accurate, less hallucinated answers.
+      Static project KBs are uploaded directly to the <strong>Anandita agent</strong> console.
+      This section is only for <strong>offer explanations</strong> — pricing offers, rental schemes,
+      pre-EMI offers, limited-time deals — anything the bot should explain when a customer asks
+      about offers for a project. Click <strong>edit ✎</strong> to write or update.
     </div>
     <table>
       <tr><th>Project</th><th>Size</th><th>Lines</th><th>Last updated</th><th>Age</th><th>Status</th><th>Actions</th></tr>
-      ${kbStatusHtml}
+      ${offerStatusHtml}
     </table>
   </div>
 
   <div class="card full">
-    <h2>1b. Knowledge Base Content (what the bot sees per project)</h2>
-    ${kbContentHtml || `<div class="empty">No KBs yet.</div>`}
+    <h2>1b. Offer Details Content (what the bot sees per project)</h2>
+    ${offerContentHtml || `<div class="empty">No offer details yet.</div>`}
+  </div>
+
+  <div class="card full">
+    <h2>1c. Live Inventory &amp; Pricing (from <a href="${esc(INVENTORY_SHEET_URL)}" target="_blank" rel="noopener">master sheet</a>)</h2>
+    <div class="proj-help">
+      Edit the <a href="${esc(INVENTORY_SHEET_URL)}" target="_blank" rel="noopener">master Google Sheet</a> —
+      changes propagate to the bot within ~5 minutes (or instantly if you hit the refresh button below).
+      The bot uses this as the source of truth for unit availability, per-sft rates, all-inclusive prices,
+      and active offers.
+      <form method="POST" action="?action=refresh-inventory" style="display:inline-block;margin-left:12px">
+        <button type="submit" style="background:#007aff;color:white;border:none;padding:4px 12px;border-radius:6px;font-size:12px;cursor:pointer">↻ Refresh now</button>
+      </form>
+      Last fetched: <strong>${esc(invFetchedAt)}</strong> (${esc(invFetchedAgo)}) · ${inventory.rows.length} units in sheet.
+    </div>
+    ${inventoryStatusHtml ? `<table>
+      <tr><th>Project</th><th>Total units</th><th>Available</th><th>Limited</th><th>Sold out</th><th>Detail</th></tr>
+      ${inventoryStatusHtml}
+    </table>` : `<div class="empty">No inventory rows fetched.</div>`}
+    <div style="margin-top:16px">${inventoryDetailHtml}</div>
   </div>
 
   <div class="card full">
@@ -327,7 +408,7 @@ code { background: #f0f0f3; padding: 2px 5px; border-radius: 4px; font-size: 12p
 </body></html>`;
 }
 
-// ── Render edit-facts form ────────────────────────────────────────────────
+// ── Render edit-offer-details form ────────────────────────────────────────
 async function renderEditForm(project: string, message: string = ""): Promise<string> {
   const facts = await getProjectFacts(project);
   const text = facts?.facts_text || "";
@@ -336,7 +417,7 @@ async function renderEditForm(project: string, message: string = ""): Promise<st
   return `<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
-<title>Edit ${esc(project)} KB — ASBL CRM</title>
+<title>Edit ${esc(project)} Offer Details — ASBL CRM</title>
 <style>
 * { box-sizing: border-box; }
 body { font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f7; color: #1d1d1f; margin: 0; padding: 24px; max-width: 1100px; margin: 0 auto; }
@@ -360,7 +441,7 @@ a:hover { text-decoration: underline; }
 code { background: #f0f0f3; padding: 2px 5px; border-radius: 4px; font-size: 12px; }
 </style>
 </head><body>
-<h1>Edit Knowledge Base — ${esc(project)}</h1>
+<h1>Edit Offer Details — ${esc(project)}</h1>
 <div class="sub">
   <a href="?view=dashboard">← back to dashboard</a> · last updated: ${esc(updated)}
 </div>
@@ -369,48 +450,37 @@ ${message ? `<div class="flash ${message.startsWith("Saved") ? "flash-success" :
 
 <div class="card">
   <div class="help">
-    Paste the full KB text for <strong>${esc(project)}</strong> below. This becomes the bot's <code>&lt;PROJECT_CONTEXT&gt;</code>
-    on every reply for this project. Use clear sections (Project Overview, Location, Master Plan, Pricing, etc.) — the bot
-    will ground all its answers in this text only. Plain text, markdown, bullet lists — all fine.
+    Write the <strong>offer explanation</strong> for ${esc(project)} below — pricing offers, rental schemes,
+    pre-EMI offers, limited-time deals, etc. The bot will use this when a customer asks about offers for this
+    project. Static project KBs (overview, location, master plan) are uploaded separately to the Anandita
+    agent — this is only for offer details.
   </div>
   <form method="POST" action="?action=save-facts">
     <input type="hidden" name="project" value="${esc(project)}" />
-    <label for="facts_text">Facts text (size: ${(text.length / 1024).toFixed(1)} KB)</label>
-    <textarea id="facts_text" name="facts_text" placeholder="# PROJECT: ${esc(project)}
+    <label for="facts_text">Offer details (size: ${(text.length / 1024).toFixed(1)} KB)</label>
+    <textarea id="facts_text" name="facts_text" placeholder="# ${esc(project)} — OFFERS
 
-## Project Overview
-- Name: ASBL ${esc(project)}
-- Location: ...
-- RERA Number: ...
-- Configuration: ...
-- Possession: ...
+## Active Offer
+- Name: <e.g. Rental Offer>
+- What it is: <plain-language explainer the bot can read out>
+- Eligibility: <who qualifies>
+- Booking amount: <e.g. ₹10L>
+- Returns / discount: <e.g. ₹50/sqft/month till Dec 2026>
+- Validity: <until when>
+- Key terms: <any caveats>
 
-## Location & Connectivity
-### Schools nearby
+## Past Offers (for reference)
+- 25:75 offer — discontinued from 11 February 2026
 - ...
 
-### Offices nearby
-- ...
-
-## Master Plan
-...
-
-## Pricing
-- Box price 1695 sqft: ₹1.94 Cr + GST
-- Box price 1870 sqft: ₹2.15 Cr + GST
-
-## Other Charges
-- ...
-
-## Documents
-- Brochure: <link>
-- Price Sheet: <link>
-- Specifications: <link>
+## Notes for the bot
+- If asked about the rental offer, explain in 2-3 lines and offer to share the calculation for their unit size.
+- Always confirm exact terms over a call with the executive.
 ">${esc(text)}</textarea>
     <div class="actions">
-      <button type="submit">Save KB</button>
+      <button type="submit">Save offer details</button>
       <a href="?view=dashboard" class="btn-secondary" style="text-decoration:none;padding:10px 22px;border-radius:8px;border:1px solid #d1d1d6;color:#1d1d1f;background:white">Cancel</a>
-      <span class="meta">Saving will overwrite the current KB for this project.</span>
+      <span class="meta">Saving will overwrite the current offer details for this project.</span>
     </div>
   </form>
 </div>
@@ -465,7 +535,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(200).send(html);
   }
 
-  // Save KB action (POST form)
+  // Save offer details action (POST form)
   if (req.method === "POST" && req.query.action === "save-facts") {
     const body = parseFormBody(req.body);
     const project = String(body.project || "").toUpperCase();
@@ -476,6 +546,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const result = await saveProjectFacts(project, factsText);
     const msg = result.ok ? `Saved (${(factsText.length / 1024).toFixed(1)} KB).` : `Error: ${result.error}`;
     res.setHeader("Location", `?view=edit-facts&project=${encodeURIComponent(project)}&msg=${encodeURIComponent(msg)}`);
+    return res.status(303).end();
+  }
+
+  // Manual inventory refresh (POST form from dashboard)
+  if (req.method === "POST" && req.query.action === "refresh-inventory") {
+    try {
+      const result = await refreshInventoryCache();
+      console.log(`[Inventory] manual refresh: ${result.count} rows`);
+    } catch (err: any) {
+      console.error(`[Inventory] manual refresh failed: ${err.message}`);
+    }
+    res.setHeader("Location", `?view=dashboard`);
     return res.status(303).end();
   }
 
