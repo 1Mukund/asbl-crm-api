@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { listAllProjectFacts, getProjectFacts, saveProjectFacts, KNOWN_PROJECTS } from "./_utils/project_facts";
-import { getAllInventoryRows, refreshInventoryCache, INVENTORY_SHEET_URL } from "./_utils/inventory_sheet";
+import { getAllInventoryRows, refreshInventoryCache, INVENTORY_SHEET_URL, InventoryRow } from "./_utils/inventory_sheet";
 
 const LAZYBOT_URL = process.env.LAZYBOT_URL || "https://lazybot-whatsapp-crm.onrender.com";
 const LAZYBOT_API_KEY = process.env.LAZYBOT_API_KEY || "";
@@ -128,7 +128,7 @@ async function renderDashboard(): Promise<string> {
     .join("");
 
   // ── Section 1c: Live Inventory + Pricing (from Google Sheet) ──────────
-  const invByProject: Record<string, typeof inventory.rows> = {};
+  const invByProject: Record<string, InventoryRow[]> = {};
   for (const row of inventory.rows) {
     if (!invByProject[row.project]) invByProject[row.project] = [];
     invByProject[row.project].push(row);

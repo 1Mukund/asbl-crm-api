@@ -209,7 +209,8 @@ export async function getAllInventoryRows(): Promise<{ rows: InventoryRow[]; fet
 export async function refreshInventoryCache(): Promise<{ count: number; fetchedAt: number }> {
   cache = null;
   const rows = await fetchAllRows(true);
-  return { count: rows.length, fetchedAt: cache?.fetchedAt || Date.now() };
+  const fetchedAt = (cache as { fetchedAt: number; rows: InventoryRow[] } | null)?.fetchedAt || Date.now();
+  return { count: rows.length, fetchedAt };
 }
 
 // Sheet ID exported for dashboard to link back to the source
