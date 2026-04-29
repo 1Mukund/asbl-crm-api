@@ -30,6 +30,10 @@ const PERISKOPE_API_KEY = process.env.PERISKOPE_API_KEY || "";
 const PERISKOPE_API_URL = "https://api.periskope.app/v1/messages/send";
 const ANANDITA_URL      = process.env.ANANDITA_URL || "http://35.154.144.37:8080/api/chat/anandita_rm/";
 const ANANDITA_API_KEY  = process.env.ANANDITA_API_KEY || "asbl_dccd9fea5d2fe188f5518574354e8fd805f0fd0a507926139fee0f1ae2ff07b1";
+// Intent classifier — uses the Free RAG endpoint with periskope_intent_classifier slug
+const ANANDITA_INTENT_URL =
+  process.env.ANANDITA_INTENT_URL ||
+  "http://35.154.144.37:8080/api/chat_rag/periskope_intent_classifier/";
 const SUPABASE_URL      = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY      = process.env.SUPABASE_SECRET_KEY || "";
 const ZOHO_CLIENT_ID     = process.env.ZOHO_CLIENT_ID || "";
@@ -43,42 +47,156 @@ const LEGACY_TEASER =
   "and possession dates will be shared during a site visit only. " +
   "The project is in early stage and not yet RERA-registered.";
 
-// ── Intent classification via LLM (best-effort, regex fallback) ──────────────
-async function classifyIntent(message: string): Promise<string> {
-  const VALID_INTENTS = ["site_visit", "virtual_tour", "not_interested", "price", "brochure", "call_me", "general"];
-  const lower = message.toLowerCase();
+// ── Intent classifier (LLM-based, structured JSON output) ───────────────────
+// Calls the periskope_intent_classifier RAG agent on the Anandita server.
+// The agent's system prompt is configured to output strict JSON like:
+//   {"intent":"PRICE_QUERY","flags":["hinglish_roman","has_project"],"project":"loft","cache_key":"loft_price_1695"}
+//
+// We pass the customer message + last 3 history messages as context so the
+// classifier can disambiguate single-word replies (numbers, "yes", etc.).
 
-  // Quick regex pass for obvious intents
-  if (/\b(price|cost|emi|loan|kimat|kimmat|kitn[ae]|pricing|kharcha)\b/.test(lower)) return "price";
-  if (/\b(brochure|pdf|floor plan|floorplan|details send|details bhej|brochure send)\b/.test(lower)) return "brochure";
-  if (/\b(call me|callback|call back|phone|call|baat kar|call kar|kar lo)\b/.test(lower)) return "call_me";
-  if (/\b(site visit|visit|see project|aana|aaunga|aaungi|come|aata|aati|location)\b/.test(lower)) return "site_visit";
-  if (/\b(virtual tour|video call|virtual)\b/.test(lower)) return "virtual_tour";
-  if (/\b(not interested|nahi chahiye|nahin chahiye|no thanks|stop|band)\b/.test(lower)) return "not_interested";
+export interface IntentClassification {
+  intent: string;          // one of 19 labels (PRICE_QUERY, UNIT_QUERY, ... GENERAL)
+  flags: string[];         // hinglish_roman, has_project, multi_question, etc.
+  project: string | null;  // loft / broadway / spectra / landmark / rtc / null
+  cacheKey: string;
+}
 
-  // Fallback: ask Anandita as classifier (it might break with new prompt — graceful default)
+// Regex-based fallback classifier — fast, used when LLM classifier times out
+function regexFallbackClassify(message: string): IntentClassification {
+  const m = message.toLowerCase();
+  const flags: string[] = [];
+  if (/[a-zA-Z]/.test(message)) flags.push("hinglish_roman");
+  if (/[ऀ-ॿ]/.test(message)) flags.push("hindi_devanagari");
+  if (/\b\d{3,4}\s*(?:sft|sqft|sq\.\s*ft)\b/i.test(message)) flags.push("has_unit_size");
+  if (/\b(east|west|north|south|purvi|pashchim)\b/i.test(message)) flags.push("has_facing");
+  if (/\b(cr|crore|lakh|lakhs|₹)\b/i.test(message)) flags.push("has_budget");
+
+  let project: string | null = null;
+  if (/\bloft\b/i.test(message)) project = "loft";
+  else if (/\bspectra\b/i.test(message)) project = "spectra";
+  else if (/\bbroadway\b/i.test(message)) project = "broadway";
+  else if (/\blandmark\b/i.test(message)) project = "landmark";
+  else if (/\b(rtc|x\s*roads|upcoming|pre[-\s]?rera|new\s+launch)\b/i.test(m)) project = "rtc";
+  if (project) flags.push("has_project");
+
+  let intent = "GENERAL";
+  if (project === "rtc") intent = "RTC_QUERY";
+  else if (/\b(not interested|nahi chahiye|stop|band karo|don'?t message|remove me)\b/i.test(m)) intent = "REJECTION";
+  else if (/\b(brochure|pdf|floor\s*plan|cost\s*sheet|price\s*sheet|specifications?|details|layout|master\s*plan)\b/i.test(m)) intent = "DOCUMENT_REQUEST";
+  else if (/\b(swimming\s*pool|gym|spa|pool|amenities|clubhouse|features?|sauna|jacuzzi|kids?\s*play|tennis|squash)\b/i.test(m)) intent = "FEATURE_QUERY";
+  else if (/\b(rental|monthly\s*return|rent\s*offer|rental\s*offer)\b/i.test(m)) intent = "RENTAL_QUERY";
+  else if (/\b(loan|emi|eligibility|home\s*loan|bank)\b/i.test(m)) intent = "LOAN_QUERY";
+  else if (/\b(price|cost|kimat|kitn[ae]|kharcha|pricing|all\s*inclusive|per\s*sqft)\b/i.test(m)) intent = "PRICE_QUERY";
+  else if (/\b(site\s*visit|visit|aana|aaunga|come\s+see)\b/i.test(m)) intent = "SITE_VISIT";
+  else if (/\b(virtual\s*tour|video\s*call|virtual)\b/i.test(m)) intent = "GENERAL";  // virtual tour not a separate intent label
+  else if (/\b(call\s*me|callback|call\s*back|phone\s*kar|baat\s*kar)\b/i.test(m)) intent = "CALLBACK";
+  else if (/\b(nri|overseas|abroad|dubai|usa|uk|oci|foreign)\b/i.test(m)) intent = "NRI_QUERY";
+  else if (/\b(possession|ready|construction|progress|when\s+ready|kab\s+ready)\b/i.test(m)) intent = "CONSTRUCTION_QUERY";
+  else if (/\b(location|kahan|where|nearby|connectivity|distance)\b/i.test(m)) intent = "LOCATION_QUERY";
+  else if (/\b(loft|broadway|spectra|landmark)\b.*\bvs\b|\bcompare|kaunsa\s*better\b/i.test(m)) intent = "COMPARISON";
+  else if (/\b(too\s*much|expensive|mehnga|bahut|over\s*budget|kam\s+karo|reduce|discount)\b/i.test(m)) intent = "OBJECTION";
+  else if (/^(hi|hello|hey|namaste|hii+|hola|yo)\b/i.test(m.trim())) {
+    intent = "GREETING";
+    flags.push("is_single_word");
+  } else if (/^[a-z\s]{0,4}$/i.test(m.trim()) && m.trim().length <= 4) {
+    flags.push("is_single_word");
+    if (!/[a-zA-Z]/.test(message)) intent = "GIBBERISH";
+  } else if (/^[^a-zA-Zऀ-ॿఀ-౿\d\s\W]+$/.test(message) || (message.length > 4 && !/[aeiouAEIOUऀ-ॿ]/.test(message))) {
+    intent = "GIBBERISH";
+  }
+
+  return { intent, flags, project, cacheKey: `fallback_${intent.toLowerCase()}` };
+}
+
+async function classifyIntentLLM(message: string, last3Msgs: string): Promise<IntentClassification> {
+  // The classifier prompt expects MESSAGE + LAST_3_MESSAGES.
+  // We compose them into the message body since Anandita API doesn't have separate history params.
+  const composed =
+    `MESSAGE: ${message}\n\n` +
+    `LAST_3_MESSAGES:\n${last3Msgs && last3Msgs.trim() ? last3Msgs : "(no prior conversation)"}`;
+
+  // 8s timeout — if the qwen2.5:1.5b RAG agent hangs, fall back to regex
+  const TIMEOUT_MS = 8000;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+
   try {
-    const classificationPrompt = `Classify this customer message into ONE of: site_visit, virtual_tour, not_interested, price, brochure, call_me, general. Reply with ONLY the label.\n\nMessage: "${message.replace(/"/g, "'")}"`;
-    const r = await fetch(ANANDITA_URL, {
+    const r = await fetch(ANANDITA_INTENT_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${ANANDITA_API_KEY}`,
       },
       body: JSON.stringify({
-        phone: "+910000000001", // dedicated classifier phone (no history)
-        message: classificationPrompt,
+        phone: "+910000000099", // dedicated classifier phone (no history pollution)
+        message: composed,
       }),
+      signal: ctrl.signal,
     });
-    if (!r.ok) return "general";
-    const data = (await r.json()) as any;
-    const raw = (data?.message || "").toLowerCase();
-    for (const intent of VALID_INTENTS) {
-      if (raw.includes(intent)) return intent;
-    }
-  } catch { /* fall through */ }
+    clearTimeout(timer);
 
-  return "general";
+    if (!r.ok) {
+      const errText = await r.text();
+      console.error(`[IntentClassifier] HTTP ${r.status}: ${errText.slice(0, 200)} — falling back to regex`);
+      return regexFallbackClassify(message);
+    }
+
+    const data = (await r.json()) as any;
+    const raw = String(data?.message || data?.reply || "").trim();
+
+    // Strip optional markdown fencing: ```json ... ```
+    let cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+    // If model added preamble before JSON, try to find the first { ... } object
+    const firstBrace = cleaned.indexOf("{");
+    const lastBrace = cleaned.lastIndexOf("}");
+    if (firstBrace > 0 && lastBrace > firstBrace) {
+      cleaned = cleaned.slice(firstBrace, lastBrace + 1);
+    }
+
+    const parsed = JSON.parse(cleaned);
+    return {
+      intent: String(parsed.intent || "GENERAL").toUpperCase(),
+      flags: Array.isArray(parsed.flags) ? parsed.flags.map((f: any) => String(f)) : [],
+      project: parsed.project ? String(parsed.project).toLowerCase() : null,
+      cacheKey: String(parsed.cache_key || ""),
+    };
+  } catch (err: any) {
+    clearTimeout(timer);
+    console.error(`[IntentClassifier] failed (${err.name || "error"}): ${err.message} — falling back to regex`);
+    return regexFallbackClassify(message);
+  }
+}
+
+// ── Map 19 fine-grained intent labels → Zoho's 6-value Last_Intent picklist ──
+function mapIntentToZoho(intent: string): string {
+  const map: Record<string, string> = {
+    PRICE_QUERY:        "price",
+    UNIT_QUERY:         "price",
+    OBJECTION:          "price",
+    RENTAL_QUERY:       "price",
+    LOAN_QUERY:         "price",
+    DOCUMENT_REQUEST:   "brochure",
+    SITE_VISIT:         "site_visit",
+    CONSTRUCTION_QUERY: "site_visit",
+    CALLBACK:           "call_me",
+    NRI_QUERY:          "call_me",
+    REJECTION:          "not_interested",
+    // Everything else → general
+  };
+  return map[intent] || "general";
+}
+
+// ── Map classifier's project hint to our Project enum (uppercase) ───────────
+function projectHintToProject(hint: string | null): Project | null {
+  if (!hint) return null;
+  const h = hint.toLowerCase();
+  if (h === "loft") return "LOFT";
+  if (h === "spectra") return "SPECTRA";
+  if (h === "broadway") return "BROADWAY";
+  if (h === "landmark") return "LANDMARK";
+  if (h === "rtc" || h === "legacy") return "LEGACY";
+  return null;
 }
 
 // ── Zoho: Get access token ────────────────────────────────────────────────────
@@ -228,10 +346,13 @@ function buildStructuredMessage(opts: {
   projectContext: string;
   history: string;
   userMessage: string;
+  intent: string;
+  flags: string[];
 }): string {
   const lastProjectTag = opts.lastProject || "none";
   const daysTag = opts.daysSinceLast === null ? "first time" : String(opts.daysSinceLast);
   const currentProjectTag = opts.project || "not specified";
+  const flagsTag = opts.flags.length > 0 ? opts.flags.join(", ") : "(none)";
 
   return [
     `<CUSTOMER>`,
@@ -241,6 +362,9 @@ function buildStructuredMessage(opts: {
     `Currently asking about project: ${currentProjectTag}`,
     `Days since last interaction: ${daysTag}`,
     `</CUSTOMER>`,
+    ``,
+    `<INTENT>${opts.intent}</INTENT>`,
+    `<FLAGS>${flagsTag}</FLAGS>`,
     ``,
     `<PROJECT_CONTEXT>`,
     opts.projectContext,
@@ -254,6 +378,13 @@ function buildStructuredMessage(opts: {
     opts.userMessage,
     `</USER_MESSAGE>`,
   ].join("\n");
+}
+
+// ── Pull last N messages from full conversation history (for classifier) ────
+function lastNHistoryLines(fullHistory: string, n: number): string {
+  if (!fullHistory || fullHistory === "no prior conversation") return "";
+  const lines = fullHistory.split("\n").filter((l) => l.trim());
+  return lines.slice(-n).join("\n");
 }
 
 // ── Call Anandita LLM ─────────────────────────────────────────────────────────
@@ -359,26 +490,38 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       console.error(`[Periskope Webhook] Zoho lookup failed: ${err.message}`);
     }
 
-    // 2. Resolve project (message > Zoho > last asked)
-    const project = await resolveProject({
-      message,
-      zohoProject: leadDetails?.asblProject || null,
-      phone,
-    });
+    // 2. Fetch conversation history first (needed for classifier context)
+    const conversation = await getConversationContext(phone);
+    const last3 = lastNHistoryLines(conversation.formatted, 3);
+
+    // 3. Run intent classifier (gets project hint) in parallel with regex-based fallback
+    const classification = await classifyIntentLLM(message, last3);
+    console.log(
+      `[Periskope Webhook] Intent: ${classification.intent} | flags: ${classification.flags.join(",") || "(none)"} | project hint: ${classification.project || "(none)"}`
+    );
+
+    // 4. Resolve project: classifier hint > regex on message > Zoho lead > last asked
+    const projectFromClassifier = projectHintToProject(classification.project);
+    const project =
+      projectFromClassifier ||
+      (await resolveProject({
+        message,
+        zohoProject: leadDetails?.asblProject || null,
+        phone,
+      }));
     console.log(`[Periskope Webhook] Resolved project: ${project || "(none)"}`);
 
-    // 3. Fetch in parallel: site content + conversation history + intent
-    const [projectContext, conversation, intent] = await Promise.all([
-      getProjectContextText(project),
-      getConversationContext(phone),
-      classifyIntent(message),
-    ]);
-    console.log(`[Periskope Webhook] Intent: ${intent} | history: ${conversation.totalMessages} msgs | days since last: ${conversation.daysSinceLast}`);
+    // 5. Fetch project context (KB + live inventory)
+    const projectContext = await getProjectContextText(project);
+    console.log(`[Periskope Webhook] history: ${conversation.totalMessages} msgs | days since last: ${conversation.daysSinceLast}`);
 
-    // 4. Save inbound message with project + intent tags
-    await saveMessage(phone, "inbound", message, sender, project, intent);
+    // 6. Map fine-grained intent → Zoho's 6-value picklist (for analytics)
+    const zohoIntent = mapIntentToZoho(classification.intent);
 
-    // 5. Build structured message
+    // 7. Save inbound message with project + (Zoho-mapped) intent tags
+    await saveMessage(phone, "inbound", message, sender, project, zohoIntent);
+
+    // 8. Build structured message — pass classifier intent + flags to main agent
     const customerName =
       [leadDetails?.firstName, leadDetails?.lastName].filter(Boolean).join(" ").trim();
 
@@ -391,45 +534,47 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       projectContext,
       history: conversation.formatted,
       userMessage: message,
+      intent: classification.intent,
+      flags: classification.flags,
     });
 
-    // 6. Call Anandita + sanitize reply
+    // 9. Call Anandita main agent + sanitize reply
     const rawReply = await callAnandita(phone, structuredMsg);
     const reply = sanitizeReply(rawReply);
     console.log(`[Periskope Webhook] Anandita reply (sanitized): ${reply.slice(0, 100)}`);
 
-    // 7. Save outbound IMMEDIATELY so a fast follow-up message from the
-    //    customer sees the bot's reply in CONVERSATION_HISTORY, even if
-    //    Periskope's typing-indicator delay hasn't fired the actual send yet.
+    // 10. Save outbound IMMEDIATELY so a fast follow-up message from the
+    //     customer sees the bot's reply in CONVERSATION_HISTORY, even if
+    //     Periskope's typing-indicator delay hasn't fired the actual send yet.
     await saveMessage(phone, "outbound", reply, sender, project);
 
-    // 8. Send text reply via Periskope (3s typing delay inside)
+    // 11. Send text reply via Periskope (3s typing delay inside)
     await sendReply(phone, sender, reply);
 
-    // 9. If intent calls for a doc (brochure/price) and we have one cached, send it too
+    // 12. Auto-deliver document via Periskope when classifier signals a doc-type intent
     let docSent: { doc_type: string; url: string } | null = null;
-    if (project && (intent === "brochure" || intent === "price")) {
+    if (project && (classification.intent === "DOCUMENT_REQUEST" || zohoIntent === "brochure" || zohoIntent === "price")) {
       try {
-        const doc = await getDocumentFor(project, intent);
+        // Map fine-grained intent → doc_type lookup (brochure / price_sheet)
+        const docType = classification.intent === "DOCUMENT_REQUEST" ? "brochure" : zohoIntent;
+        const doc = await getDocumentFor(project, docType);
         if (doc) {
-          const caption = intent === "brochure"
-            ? `${project} brochure as discussed.`
-            : `${project} price sheet as discussed.`;
+          const caption = `${project} ${doc.doc_type} as discussed.`;
           await sendDocViaPeriskope(phone, sender, doc.url, doc.filename, caption);
           docSent = { doc_type: doc.doc_type, url: doc.url };
           console.log(`[Periskope Webhook] Doc sent: ${doc.doc_type} → ${doc.url}`);
         } else {
-          console.log(`[Periskope Webhook] No ${intent} doc cached for ${project}`);
+          console.log(`[Periskope Webhook] No ${docType} doc cached for ${project}`);
         }
       } catch (err: any) {
         console.error(`[Periskope Webhook] Doc send failed: ${err.message}`);
       }
     }
 
-    // 9. Update Zoho: Last_Intent + Whatsapp_Replied
+    // 13. Update Zoho: Last_Intent + Whatsapp_Replied (with mapped picklist value)
     if (leadDetails && zohoToken) {
       try {
-        await updateZohoIntent(leadDetails.id, intent, zohoToken);
+        await updateZohoIntent(leadDetails.id, zohoIntent, zohoToken);
       } catch (err: any) {
         console.error(`[Periskope Webhook] Zoho update error: ${err.message}`);
       }
@@ -441,7 +586,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       success: true,
       phone,
       project,
-      intent,
+      intent: classification.intent,
+      flags: classification.flags,
+      zohoIntent,
       historyMessages: conversation.totalMessages,
       docSent,
     });
