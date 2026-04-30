@@ -25,6 +25,8 @@ import { getInventoryForProject } from "../_utils/inventory_sheet";
 import { getConversationContext } from "../_utils/conversation_context";
 import { sanitizeReply } from "../_utils/sanitizer";
 import { getDocumentFor, sendDocViaPeriskope } from "../_utils/document_dispatcher";
+import { callGemini } from "../_utils/gemini_chat";
+import { customerWordToDocType } from "../_utils/kb_doc_extractor";
 
 const PERISKOPE_API_KEY = process.env.PERISKOPE_API_KEY || "";
 const PERISKOPE_API_URL = "https://api.periskope.app/v1/messages/send";
@@ -565,10 +567,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       flags: classification.flags,
     });
 
-    // 9. Call Anandita main agent + sanitize reply
-    const rawReply = await callAnandita(phone, structuredMsg);
+    // 9. Call Gemini 3 Pro main agent (with grounding) + sanitize reply
+    let rawReply: string;
+    try {
+      rawReply = await callGemini(structuredMsg, { enableGrounding: true });
+    } catch (err: any) {
+      console.error(`[Periskope Webhook] Gemini failed (${err.message}) — falling back to local Anandita`);
+      rawReply = await callAnandita(phone, structuredMsg);
+    }
     const reply = sanitizeReply(rawReply);
-    console.log(`[Periskope Webhook] Anandita reply (sanitized): ${reply.slice(0, 100)}`);
+    console.log(`[Periskope Webhook] Gemini reply (sanitized): ${reply.slice(0, 100)}`);
 
     // 10. Save outbound IMMEDIATELY so a fast follow-up message from the
     //     customer sees the bot's reply in CONVERSATION_HISTORY, even if
@@ -584,20 +592,37 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       console.error(`[Periskope Webhook] Periskope send failed (reply saved to DB but not delivered): ${err.message}`);
     }
 
-    // 12. Auto-deliver document via Periskope when classifier signals a doc-type intent
-    let docSent: { doc_type: string; url: string } | null = null;
-    if (project && (classification.intent === "DOCUMENT_REQUEST" || zohoIntent === "brochure" || zohoIntent === "price")) {
+    // 12. Auto-deliver document via Periskope when intent is DOCUMENT_REQUEST.
+    //     Pick doc_type by scanning the customer's message for keywords
+    //     (brochure / price sheet / specs / payment / floor plan / etc).
+    //     Falls back to "brochure" if no specific keyword matched.
+    let docSent: { doc_type: string; url: string; source?: string } | null = null;
+    const isDocRequest =
+      classification.intent === "DOCUMENT_REQUEST" ||
+      zohoIntent === "brochure" ||
+      zohoIntent === "price";
+
+    if (project && isDocRequest) {
+      const docTypeFromMsg = customerWordToDocType(message) || "brochure";
       try {
-        // Map fine-grained intent → doc_type lookup (brochure / price_sheet)
-        const docType = classification.intent === "DOCUMENT_REQUEST" ? "brochure" : zohoIntent;
-        const doc = await getDocumentFor(project, docType);
+        const doc = await getDocumentFor(project, docTypeFromMsg);
         if (doc) {
-          const caption = `${project} ${doc.doc_type} as discussed.`;
+          const captionMap: Record<string, string> = {
+            brochure: `${project} brochure as discussed.`,
+            price_sheet: `${project} price sheet as discussed.`,
+            specifications: `${project} specifications as discussed.`,
+            master_plan: `${project} master plan as discussed.`,
+            tower_plan: `${project} tower plan as discussed.`,
+            floor_plan: `${project} floor plan as discussed.`,
+            payment_structure: `${project} payment structure as discussed.`,
+            amenities: `${project} amenities sheet as discussed.`,
+          };
+          const caption = captionMap[doc.doc_type] || `${project} ${doc.doc_type} as discussed.`;
           await sendDocViaPeriskope(phone, sender, doc.url, doc.filename, caption);
-          docSent = { doc_type: doc.doc_type, url: doc.url };
-          console.log(`[Periskope Webhook] Doc sent: ${doc.doc_type} → ${doc.url}`);
+          docSent = { doc_type: doc.doc_type, url: doc.url, source: doc.source };
+          console.log(`[Periskope Webhook] Doc sent (source=${doc.source}): ${doc.doc_type} → ${doc.url}`);
         } else {
-          console.log(`[Periskope Webhook] No ${docType} doc cached for ${project}`);
+          console.log(`[Periskope Webhook] No ${docTypeFromMsg} doc found for ${project} (table or KB)`);
         }
       } catch (err: any) {
         console.error(`[Periskope Webhook] Doc send failed: ${err.message}`);
