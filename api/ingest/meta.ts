@@ -111,17 +111,34 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const body = req.body;
 
     // ── Format A: Native Meta Webhook ─────────────────────────────────────────
-    // Meta sends: { object: "page", entry: [{ changes: [{ value: { leadgen_id, page_id, ... } }] }] }
+    // Meta sends: { object: "page", entry: [{ changes: [{ value: { leadgen_id, form_id, page_id, ... } }] }] }
     if (body.object === "page" && Array.isArray(body.entry)) {
-      const results = [];
-      const errors  = [];
+      // Optional comma-separated allowlist of form IDs that should sync to Zoho.
+      // If unset/empty, ALL forms on the subscribed page sync. Useful when you
+      // want only specific campaigns (e.g. "High Intent" form) to flow into CRM.
+      const formAllowlistRaw = process.env.META_FORM_IDS_ALLOWLIST || "";
+      const formAllowlist = new Set(
+        formAllowlistRaw.split(",").map((s) => s.trim()).filter(Boolean),
+      );
+
+      const results: any[] = [];
+      const errors: any[]  = [];
+      const skipped: any[] = [];
 
       for (const entry of body.entry) {
         for (const change of (entry.changes ?? [])) {
           if (change.field !== "leadgen") continue;
 
           const leadgenId = change.value?.leadgen_id;
+          const formId    = change.value?.form_id ? String(change.value.form_id) : "";
           if (!leadgenId) continue;
+
+          // Form-allowlist filter — return 200 to Meta but skip processing
+          if (formAllowlist.size > 0 && formId && !formAllowlist.has(formId)) {
+            console.log(`[Meta] skip leadgen ${leadgenId}: form_id ${formId} not in allowlist`);
+            skipped.push({ leadgen_id: leadgenId, form_id: formId, reason: "form_id_not_allowlisted" });
+            continue;
+          }
 
           try {
             // Fetch full lead data from Graph API
@@ -134,7 +151,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             }
 
             const result = await ingestLead(lead);
-            results.push({ leadgen_id: leadgenId, ...result });
+            results.push({ leadgen_id: leadgenId, form_id: formId, ...result });
           } catch (err: any) {
             console.error(`Error processing leadgen_id ${leadgenId}:`, err.message);
             errors.push({ leadgen_id: leadgenId, error: err.message });
@@ -145,8 +162,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({
         success: true,
         processed: results.length,
+        skipped: skipped.length,
         errors: errors.length,
         results,
+        ...(skipped.length > 0 ? { skipped_details: skipped } : {}),
         ...(errors.length > 0 ? { error_details: errors } : {}),
       });
     }
