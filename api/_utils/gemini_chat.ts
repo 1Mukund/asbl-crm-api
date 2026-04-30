@@ -232,7 +232,10 @@ export async function callGemini(
 
   const model = opts.model || GEMINI_MODEL;
   const temperature = opts.temperature ?? 0.6;
-  const maxOutputTokens = opts.maxOutputTokens ?? 800;
+  // Gemini 3 Pro REQUIRES thinking mode (~1000-1500 thinking tokens consumed
+  // before visible output). Need a generous total budget so the visible
+  // reply isn't truncated. 4000 leaves room for ~3 KB of WhatsApp text.
+  const maxOutputTokens = opts.maxOutputTokens ?? 4000;
   const enableGrounding = opts.enableGrounding ?? true;
 
   const body: any = {
