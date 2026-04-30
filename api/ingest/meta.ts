@@ -57,6 +57,22 @@ function parseFieldData(fieldData: Array<{ name: string; values: string[] }>): R
   return fields;
 }
 
+// ─── Parse Graph API's created_time which arrives as ISO string OR Unix epoch
+function parseLeadTime(t: any): string {
+  if (!t) return new Date().toISOString();
+  // Number → Unix epoch seconds
+  if (typeof t === "number" && isFinite(t)) {
+    return new Date(t * 1000).toISOString();
+  }
+  // Numeric string ("1745837455") → Unix epoch seconds
+  if (typeof t === "string" && /^\d{10}$/.test(t.trim())) {
+    return new Date(parseInt(t, 10) * 1000).toISOString();
+  }
+  // ISO string ("2026-04-28T08:30:55+0000") or anything Date can parse
+  const d = new Date(t);
+  return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+}
+
 // ─── Build NormalizedLead from Meta data ─────────────────────────────────────
 
 function buildNormalizedLead(data: Record<string, any>): NormalizedLead | null {
@@ -84,9 +100,7 @@ function buildNormalizedLead(data: Record<string, any>): NormalizedLead | null {
     campaign_name: campaignName,
     ad_set_name: data.adset_name || data.ad_set_name || "",
     ad_name: data.ad_name || "",
-    lead_received_at: data.created_time
-      ? new Date(data.created_time * 1000).toISOString()
-      : new Date().toISOString(),
+    lead_received_at: parseLeadTime(data.created_time),
     project,
     budget: fields["budget"] || "",
     size_preference: fields["size_preference"] || fields["configuration"] || "",
