@@ -103,36 +103,70 @@ export async function getDocumentFor(
 }
 
 // ── Send document via Periskope ────────────────────────────────────────────
-// Periskope's media-send contract may differ; this uses the canonical shape
-// most BSPs follow. If Periskope rejects, log shows the exact response so we
-// can adapt the body format.
+// Per Periskope docs: POST /v1/message/send with nested `media` object and
+// chat_id in `<phone>@c.us` form. We try the documented endpoint first; if
+// it 404s (some accounts may still be on the older /messages/send path), we
+// fall back to that. Errors propagate to the caller, where they're logged.
 export async function sendDocViaPeriskope(
   phone: string,
   sender: string,
   docUrl: string,
   filename: string | null,
   caption: string,
+  mimeType: string = "application/pdf"
 ): Promise<void> {
-  const body: Record<string, unknown> = {
-    chat_id: phone,
-    type: "document",
-    media: docUrl,
-    caption,
-  };
-  if (filename) body.filename = filename;
+  const cleanPhone = String(phone).replace(/\D/g, "");
+  const chatId = cleanPhone.includes("@") ? cleanPhone : `${cleanPhone}@c.us`;
+  const safeFilename = filename || "document.pdf";
 
-  const r = await fetch("https://api.periskope.app/v1/messages/send", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${PERISKOPE_API_KEY}`,
-      "x-phone": sender,
+  const body = {
+    chat_id: chatId,
+    message: caption,
+    media: {
+      type: "document",
+      filename: safeFilename,
+      mimetype: mimeType,
+      url: docUrl,
     },
-    body: JSON.stringify(body),
-  });
+  };
 
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`Periskope doc send error ${r.status}: ${t}`);
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${PERISKOPE_API_KEY}`,
+    "x-phone": sender,
+  };
+
+  const endpoints = [
+    "https://api.periskope.app/v1/message/send",   // documented
+    "https://api.periskope.app/v1/messages/send",  // legacy / plural alias
+  ];
+
+  let lastErr = "";
+  for (const url of endpoints) {
+    try {
+      const r = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
+      if (r.ok) {
+        console.log(`[DocDispatcher] sent doc via ${url} → ${docUrl}`);
+        return;
+      }
+      const t = await r.text();
+      lastErr = `${r.status} from ${url}: ${t.slice(0, 300)}`;
+      // Only fall through to next endpoint on 404 (path mismatch)
+      if (r.status !== 404) {
+        throw new Error(`Periskope doc send error ${lastErr}`);
+      }
+      console.warn(`[DocDispatcher] ${url} returned 404, trying fallback`);
+    } catch (err: any) {
+      // Re-throw the last attempt's error so the caller can log it
+      if (url === endpoints[endpoints.length - 1]) {
+        throw err instanceof Error ? err : new Error(String(err));
+      }
+      lastErr = err?.message || String(err);
+    }
   }
+  throw new Error(`Periskope doc send failed: ${lastErr}`);
 }
