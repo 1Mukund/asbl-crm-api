@@ -339,6 +339,9 @@ async function getProjectContextText(project: Project | null): Promise<string> {
 }
 
 // ── Build structured message for the LLM ─────────────────────────────────────
+// Gemini decides intent/flags itself in its structured output, so we no longer
+// pass <INTENT>/<FLAGS> blocks. The signature still accepts them for the
+// fallback Anandita call, but they're not rendered into the message.
 function buildStructuredMessage(opts: {
   customerName: string;
   phone: string;
@@ -348,13 +351,12 @@ function buildStructuredMessage(opts: {
   projectContext: string;
   history: string;
   userMessage: string;
-  intent: string;
-  flags: string[];
+  intent?: string;
+  flags?: string[];
 }): string {
   const lastProjectTag = opts.lastProject || "none";
   const daysTag = opts.daysSinceLast === null ? "first time" : String(opts.daysSinceLast);
   const currentProjectTag = opts.project || "not specified";
-  const flagsTag = opts.flags.length > 0 ? opts.flags.join(", ") : "(none)";
 
   return [
     `<CUSTOMER>`,
@@ -364,9 +366,6 @@ function buildStructuredMessage(opts: {
     `Currently asking about project: ${currentProjectTag}`,
     `Days since last interaction: ${daysTag}`,
     `</CUSTOMER>`,
-    ``,
-    `<INTENT>${opts.intent}</INTENT>`,
-    `<FLAGS>${flagsTag}</FLAGS>`,
     ``,
     `<PROJECT_CONTEXT>`,
     opts.projectContext,
@@ -519,38 +518,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       console.error(`[Periskope Webhook] Zoho lookup failed: ${err.message}`);
     }
 
-    // 2. Fetch conversation history first (needed for classifier context)
+    // 2. Fetch conversation history (needed as context for Gemini)
     const conversation = await getConversationContext(phone);
-    const last3 = lastNHistoryLines(conversation.formatted, 3);
 
-    // 3. Run intent classifier (gets project hint) in parallel with regex-based fallback
-    const classification = await classifyIntentLLM(message, last3);
-    console.log(
-      `[Periskope Webhook] Intent: ${classification.intent} | flags: ${classification.flags.join(",") || "(none)"} | project hint: ${classification.project || "(none)"}`
-    );
+    // 3. Resolve project (regex on message > Zoho field > last asked).
+    //    Gemini may also identify the project itself from its output;
+    //    we'll override below if Gemini's project hint is more specific.
+    let project = await resolveProject({
+      message,
+      zohoProject: leadDetails?.asblProject || null,
+      phone,
+    });
+    console.log(`[Periskope Webhook] Initial project resolution: ${project || "(none)"}`);
 
-    // 4. Resolve project: classifier hint > regex on message > Zoho lead > last asked
-    const projectFromClassifier = projectHintToProject(classification.project);
-    const project =
-      projectFromClassifier ||
-      (await resolveProject({
-        message,
-        zohoProject: leadDetails?.asblProject || null,
-        phone,
-      }));
-    console.log(`[Periskope Webhook] Resolved project: ${project || "(none)"}`);
-
-    // 5. Fetch project context (KB + live inventory)
+    // 4. Fetch project context (KB + live inventory)
     const projectContext = await getProjectContextText(project);
-    console.log(`[Periskope Webhook] history: ${conversation.totalMessages} msgs | days since last: ${conversation.daysSinceLast}`);
 
-    // 6. Map fine-grained intent → Zoho's 6-value picklist (for analytics)
-    const zohoIntent = mapIntentToZoho(classification.intent);
-
-    // 7. Save inbound message with project + (Zoho-mapped) intent tags
-    await saveMessage(phone, "inbound", message, sender, project, zohoIntent);
-
-    // 8. Build structured message — pass classifier intent + flags to main agent
+    // 5. Build structured message — Gemini will classify + reply in one call.
+    //    No <INTENT>/<FLAGS> blocks because Gemini decides those itself.
     const customerName =
       [leadDetails?.firstName, leadDetails?.lastName].filter(Boolean).join(" ").trim();
 
@@ -563,19 +548,52 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       projectContext,
       history: conversation.formatted,
       userMessage: message,
-      intent: classification.intent,
-      flags: classification.flags,
+      intent: "(to be classified by Gemini)",
+      flags: [],
     });
 
-    // 9. Call Gemini 3 Pro main agent (with grounding) + sanitize reply
-    let rawReply: string;
+    // 6. Single Gemini call: classifies + composes reply (structured JSON output).
+    //    On failure, fall back to local Anandita reply + regex-based classifier.
+    let geminiOutput: Awaited<ReturnType<typeof callGemini>>;
     try {
-      rawReply = await callGemini(structuredMsg, { enableGrounding: true });
+      geminiOutput = await callGemini(structuredMsg, { enableGrounding: true });
     } catch (err: any) {
-      console.error(`[Periskope Webhook] Gemini failed (${err.message}) — falling back to local Anandita`);
-      rawReply = await callAnandita(phone, structuredMsg);
+      console.error(`[Periskope Webhook] Gemini failed (${err.message}) — falling back to local Anandita + regex classifier`);
+      const fallbackReply = await callAnandita(phone, structuredMsg);
+      const regexResult = regexFallbackClassify(message);
+      geminiOutput = {
+        intent: regexResult.intent,
+        flags: regexResult.flags,
+        project: regexResult.project,
+        docToSend: null,
+        reply: fallbackReply,
+      };
     }
-    const reply = sanitizeReply(rawReply);
+
+    const classification = {
+      intent: geminiOutput.intent,
+      flags: geminiOutput.flags,
+      project: geminiOutput.project,
+      cacheKey: "",
+    };
+    console.log(
+      `[Periskope Webhook] Intent: ${classification.intent} | flags: ${classification.flags.join(",") || "(none)"} | project hint: ${classification.project || "(none)"}`
+    );
+
+    // 7. Override project resolution with Gemini's project hint if it's more specific
+    const projectFromGemini = projectHintToProject(classification.project);
+    if (projectFromGemini && projectFromGemini !== project) {
+      console.log(`[Periskope Webhook] Project override from Gemini: ${project} → ${projectFromGemini}`);
+      project = projectFromGemini;
+    }
+
+    // 8. Map fine-grained intent → Zoho's 6-value picklist (for analytics)
+    const zohoIntent = mapIntentToZoho(classification.intent);
+
+    // 9. Save inbound message with project + (Zoho-mapped) intent tags
+    await saveMessage(phone, "inbound", message, sender, project, zohoIntent);
+
+    const reply = sanitizeReply(geminiOutput.reply);
     console.log(`[Periskope Webhook] Gemini reply (sanitized): ${reply.slice(0, 100)}`);
 
     // 10. Save outbound IMMEDIATELY so a fast follow-up message from the
@@ -592,18 +610,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       console.error(`[Periskope Webhook] Periskope send failed (reply saved to DB but not delivered): ${err.message}`);
     }
 
-    // 12. Auto-deliver document via Periskope when intent is DOCUMENT_REQUEST.
-    //     Pick doc_type by scanning the customer's message for keywords
-    //     (brochure / price sheet / specs / payment / floor plan / etc).
-    //     Falls back to "brochure" if no specific keyword matched.
+    // 12. Auto-deliver document via Periskope when Gemini signals it.
+    //     Gemini's structured output specifies doc_to_send directly;
+    //     we fall back to message-keyword scan if Gemini didn't set it.
     let docSent: { doc_type: string; url: string; source?: string } | null = null;
     const isDocRequest =
       classification.intent === "DOCUMENT_REQUEST" ||
-      zohoIntent === "brochure" ||
-      zohoIntent === "price";
+      geminiOutput.docToSend !== null;
 
     if (project && isDocRequest) {
-      const docTypeFromMsg = customerWordToDocType(message) || "brochure";
+      const docTypeFromMsg =
+        geminiOutput.docToSend || customerWordToDocType(message) || "brochure";
       try {
         const doc = await getDocumentFor(project, docTypeFromMsg);
         if (doc) {

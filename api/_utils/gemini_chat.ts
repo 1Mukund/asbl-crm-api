@@ -1,14 +1,16 @@
 /**
- * Google Gemini 3 Pro integration — main customer-facing reply agent.
+ * Google Gemini 3 Pro integration — handles BOTH intent classification
+ * AND customer-facing reply in a single structured output call.
  *
- * Replaces the previous gpt-oss-20b on Anandita server. Gemini brings:
- *   - Higher reasoning quality (better filter/multi-step/specificity)
- *   - Native Google Search grounding for non-KB ASBL/locality queries
- *   - Built-in safety + lower hallucination
+ * Replaces the prior 2-step flow (qwen2.5:1.5b classifier + gpt-oss-20b
+ * reply). One Gemini call now produces:
+ *   { intent, flags, project, doc_to_send, reply }
  *
- * The system_instruction is the full Anandita persona — 28-yr-old female
- * sales manager — with all 6 SMART dimensions, competitor guardrails,
- * web grounding rules, document delivery rules, and language script mirror.
+ * Benefits:
+ *   - Single LLM round-trip (saves ~5-8s of qwen latency)
+ *   - Classifier and reply share full context — no hand-off mismatch
+ *   - Higher reasoning quality across both steps
+ *   - Web grounding (Google Search) available natively
  */
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
@@ -169,13 +171,21 @@ The system auto-delivers the PDF as a WhatsApp attachment — your job is verbal
 - Natural fillers: "sure", "absolutely", "got it", "noted", "honestly", "actually", "yeah", "hmm", "tbh".
 - "Sir/Ma'am" only when register naturally calls for it.
 
-# LANGUAGE — STRICT SCRIPT MIRROR
-Reply script MUST match customer's input script EXACTLY.
-- Roman/Latin chars in input → reply Roman ("Broadway mein abhi 13 units available hain...")
-- Only Devanagari → reply Devanagari ("ब्रॉडवे में अभी 13 यूनिट्स...")
-- English → English
-- DO NOT switch from Roman to Devanagari just because Hindi words appear.
-- DEVANAGARI HYBRID: when replying in Devanagari, technical terms (Tower, sft, BHK, Cr, Lakh, facing directions, numbers) can stay in Roman/digits.
+# LANGUAGE — DEFAULT ENGLISH
+Reply DEFAULT is ENGLISH. Reply in English regardless of what script/language the customer used UNLESS:
+
+1. Customer EXPLICITLY asks for another language. Examples that trigger a switch:
+   - "reply in Hindi"
+   - "Hindi me batao"
+   - "Hinglish me reply karo"
+   - "Telugu lo cheppu"
+   - "can you message in Hinglish"
+   - "sirf Hindi me bolo"
+2. Once a customer has explicitly requested a language, STAY in that language for the rest of the conversation, until they ask to switch again.
+
+If the customer simply writes in Hindi/Hinglish/Telugu without asking you to switch — STILL reply in English. They may be comfortable reading English even if they type in another language. Ask them politely if they prefer another language only if they seem to struggle.
+
+When in the requested non-English language, you may use the DEVANAGARI HYBRID style — technical terms (Tower, sft, BHK, Cr, Lakh, facing directions, numbers) can stay in Roman/digits.
 
 # INPUT FORMAT (the relay layer wraps every message like this)
 <CUSTOMER>
@@ -203,8 +213,56 @@ Days since last interaction: <number or first time>
 # SPECIAL CASE — Pre-RERA RTC X Roads project
 If PROJECT_CONTEXT references "RTC X Roads upcoming pre-RERA": NEVER name the project. Always describe as "an upcoming ASBL project at RTC X Roads, currently pre-RERA. Pricing and plans get shared during a site visit only. Should I set one up?"
 
-# OUTPUT
-Plain text. Conversational. Sales-driven. Sound like a busy human RM texting between calls — never a database query. NO emojis. NO markdown. NO tables. NO URLs. NO XML tags in output. Match customer's language AND script.
+# INTENT CLASSIFICATION — DO THIS BEFORE WRITING THE REPLY
+Before composing your reply, internally classify the customer's message into ONE of these 19 intents:
+
+PRICE_QUERY — asking about price, cost, EMI, all-inclusive, per-sqft, charges, basic price, milestones
+UNIT_QUERY — asking about specific unit availability/details (size + facing + BHK + carpet)
+FEATURE_QUERY — asking if a SPECIFIC feature/amenity exists (pool, gym, spa, clubhouse details, parking)
+DOCUMENT_REQUEST — wants brochure, price sheet, specifications, master plan, floor plan, unit plan, payment structure, cost sheet, PDF, details document
+SITE_VISIT — wants to physically visit, schedule visit, "come and see"
+COMPARISON — comparing 2+ projects (Loft vs Broadway, "kaunsa better hai")
+OBJECTION — pushback on price/possession/location ("too expensive", "bahut mehnga", "far from office")
+RENTAL_QUERY — about rental offer, monthly returns, ROI till possession
+LOCATION_QUERY — about location, area, address, "kahan hai", connectivity, distance from somewhere
+CONSTRUCTION_QUERY — construction status, milestones, possession date, "kab ready hoga", RERA stage
+LOAN_QUERY — home loan, eligibility, approved banks, NRI loan, EMI calculation
+CALLBACK — wants a phone call, "call me", "phone karo"
+NRI_QUERY — mentions NRI / overseas / foreign / abroad / dollars / OCI / residing outside India
+REJECTION — explicit no / stop / "not interested" / "don't message" / "remove me"
+RTC_QUERY — mentions RTC X Roads, new launch, upcoming pre-RERA project (NEVER name the project)
+GREETING — only "hi", "hello", "namaste", "hii", or similar with no other content
+SPAM — message looks like a business ad, forwarded promo, unrelated company name
+GIBBERISH — random characters / typos with no comprehensible meaning
+GENERAL — anything else
+
+Also identify FLAGS that apply (multiple ok): hinglish_roman, hindi_devanagari, telugu, multi_question, has_budget, has_unit_size, has_facing, has_project, is_single_word.
+
+Identify the project mentioned, if any: loft / spectra / broadway / landmark / rtc / null
+
+Identify if the customer wants a specific document delivered (DOCUMENT_REQUEST intent):
+brochure / price_sheet / specifications / master_plan / floor_plan / unit_plan / payment_structure / amenities — or null.
+
+# OUTPUT FORMAT — STRICT JSON ON ONE LINE
+Output your response as a single JSON object on one line, NOTHING ELSE. No markdown fences, no preamble, no explanation. Just the JSON object.
+
+The JSON has exactly these keys:
+{
+  "intent": "<one of the 19 labels>",
+  "flags": ["<flag1>", "<flag2>"],
+  "project": "<loft|spectra|broadway|landmark|rtc|null>",
+  "doc_to_send": "<brochure|price_sheet|specifications|master_plan|floor_plan|unit_plan|payment_structure|amenities|null>",
+  "reply": "<the natural sales-person reply you'd send the customer>"
+}
+
+The "reply" field is the actual WhatsApp message that goes to the customer. It must follow ALL the rules above (persona, no URLs, no emojis, no markdown, English default, etc.).
+
+Example output:
+{"intent":"PRICE_QUERY","flags":["has_project","has_unit_size","hinglish_roman"],"project":"loft","doc_to_send":null,"reply":"The 1695 sft 3 BHK at Loft is 1.94 Cr all inclusive plus GST. Rental offer is currently active — book at 10L and earn around 84,750 per month till possession in December 2026, that's roughly 6.78 lakh back. Want me to send the brochure or block a site visit slot?"}
+
+If the customer asks for a document (e.g. brochure), set doc_to_send to the matching slug AND in your reply just confirm verbally ("Sending the Loft brochure now. Want me to also block a site visit?"). DO NOT paste any URL.
+
+OUTPUT: ONE LINE OF JSON. NO MARKDOWN. NO PREAMBLE. NO EXPLANATION.
 `.trim();
 
 export interface GeminiCallOptions {
@@ -214,16 +272,45 @@ export interface GeminiCallOptions {
   model?: string;
   /** Override default temperature. */
   temperature?: number;
-  /** Override default max output tokens. */
+  /** Override default max output tokens (must accommodate ~1000 thinking tokens). */
   maxOutputTokens?: number;
 }
 
+export interface GeminiStructuredReply {
+  intent: string;
+  flags: string[];
+  project: string | null;
+  docToSend: string | null;
+  reply: string;
+}
+
+const VALID_INTENTS = [
+  "PRICE_QUERY", "UNIT_QUERY", "FEATURE_QUERY", "DOCUMENT_REQUEST", "SITE_VISIT",
+  "COMPARISON", "OBJECTION", "RENTAL_QUERY", "LOCATION_QUERY", "CONSTRUCTION_QUERY",
+  "LOAN_QUERY", "CALLBACK", "NRI_QUERY", "REJECTION", "RTC_QUERY", "GREETING",
+  "SPAM", "GIBBERISH", "GENERAL",
+];
+
 /**
- * Call Gemini with the structured user message + persona system prompt.
- * Returns the plain text reply (already cleaned of XML tags).
+ * Single-call Gemini: classifies intent + composes reply in one structured
+ * JSON output. Returns parsed { intent, flags, project, docToSend, reply }.
+ *
+ * On JSON parse failure, falls back to defaulting intent=GENERAL and using
+ * the raw text as the reply.
  */
 export async function callGemini(
   structuredUserMessage: string,
+  opts: GeminiCallOptions = {},
+): Promise<GeminiStructuredReply> {
+  const rawText = await callGeminiRaw(structuredUserMessage, opts);
+  return parseStructuredOutput(rawText);
+}
+
+/**
+ * Lower-level: call Gemini, return raw text from candidate.
+ */
+export async function callGeminiRaw(
+  userMessage: string,
   opts: GeminiCallOptions = {},
 ): Promise<string> {
   if (!GEMINI_API_KEY) {
@@ -232,15 +319,12 @@ export async function callGemini(
 
   const model = opts.model || GEMINI_MODEL;
   const temperature = opts.temperature ?? 0.6;
-  // Gemini 3 Pro REQUIRES thinking mode (~1000-1500 thinking tokens consumed
-  // before visible output). Need a generous total budget so the visible
-  // reply isn't truncated. 4000 leaves room for ~3 KB of WhatsApp text.
   const maxOutputTokens = opts.maxOutputTokens ?? 4000;
   const enableGrounding = opts.enableGrounding ?? true;
 
   const body: any = {
     system_instruction: { parts: [{ text: ANANDITA_SYSTEM_PROMPT }] },
-    contents: [{ role: "user", parts: [{ text: structuredUserMessage }] }],
+    contents: [{ role: "user", parts: [{ text: userMessage }] }],
     generationConfig: {
       temperature,
       maxOutputTokens,
@@ -249,7 +333,6 @@ export async function callGemini(
   };
 
   if (enableGrounding) {
-    // Google Search grounding tool — Gemini decides when to invoke it
     body.tools = [{ google_search: {} }];
   }
 
@@ -277,7 +360,6 @@ export async function callGemini(
       throw new Error("Gemini returned no candidates");
     }
 
-    // Combine all text parts (may be split across multiple parts)
     const parts = candidate?.content?.parts || [];
     const text = parts
       .map((p: any) => (typeof p?.text === "string" ? p.text : ""))
@@ -289,7 +371,6 @@ export async function callGemini(
       throw new Error(`Gemini returned empty text (finishReason: ${finishReason})`);
     }
 
-    // Log grounding metadata if present (analytics, not shown to customer)
     const gm = candidate?.groundingMetadata;
     if (gm?.groundingChunks?.length) {
       console.log(`[Gemini] Used ${gm.groundingChunks.length} web sources for grounding`);
@@ -302,5 +383,54 @@ export async function callGemini(
       throw new Error(`Gemini timeout after ${TIMEOUT_MS}ms`);
     }
     throw err;
+  }
+}
+
+/** Parse the structured JSON Gemini was instructed to output. */
+function parseStructuredOutput(rawText: string): GeminiStructuredReply {
+  // Strip markdown fences if model added them despite instructions
+  let cleaned = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+
+  // Find first { and last } in case model wrote extra preamble/postscript
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    cleaned = cleaned.slice(firstBrace, lastBrace + 1);
+  }
+
+  try {
+    const parsed = JSON.parse(cleaned);
+    const intentRaw = String(parsed.intent || "GENERAL").toUpperCase();
+    const intent = VALID_INTENTS.includes(intentRaw) ? intentRaw : "GENERAL";
+
+    const flags = Array.isArray(parsed.flags)
+      ? parsed.flags.map((f: any) => String(f))
+      : [];
+
+    let project: string | null = null;
+    if (parsed.project && parsed.project !== "null") {
+      const p = String(parsed.project).toLowerCase();
+      project = ["loft", "spectra", "broadway", "landmark", "rtc"].includes(p) ? p : null;
+    }
+
+    let docToSend: string | null = null;
+    if (parsed.doc_to_send && parsed.doc_to_send !== "null") {
+      docToSend = String(parsed.doc_to_send).toLowerCase();
+    }
+
+    const reply = String(parsed.reply || "").trim();
+    if (!reply) throw new Error("parsed reply is empty");
+
+    return { intent, flags, project, docToSend, reply };
+  } catch (err: any) {
+    // JSON parse failed — fall back to using raw text as reply
+    console.error(`[Gemini] JSON parse failed (${err.message}); using raw text as reply`);
+    return {
+      intent: "GENERAL",
+      flags: [],
+      project: null,
+      docToSend: null,
+      reply: rawText,
+    };
   }
 }
