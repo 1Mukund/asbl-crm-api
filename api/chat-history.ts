@@ -1,7 +1,8 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { listAllProjectFacts, getProjectFacts, saveProjectFacts, saveProjectKb, KNOWN_PROJECTS } from "./_utils/project_facts";
-import { getAllInventoryRows, refreshInventoryCache, INVENTORY_SHEET_URL, InventoryRow } from "./_utils/inventory_sheet";
+import { getAllInventoryRows, getInventoryForProject, refreshInventoryCache, INVENTORY_SHEET_URL, InventoryRow } from "./_utils/inventory_sheet";
 import { uploadToStorage, extractTextFromPDF, decodeBase64Text, decodeBase64Buffer } from "./_utils/storage_upload";
+import { callGemini } from "./_utils/gemini_chat";
 
 // Bump body-parser limit for base64 PDF uploads (default is 1MB).
 // 50MB binary PDF → ~67MB base64 JSON, so allow 70MB headroom.
@@ -903,6 +904,84 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     } catch (err: any) {
       console.error(`[upload-doc] failed: ${err.message}`);
       return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── Test Gemini directly (no Periskope/Zoho side effects) ─────────────
+  // POST { project, message, customerName?, history? } → returns the same
+  // structured Gemini reply the live bot would produce. Useful for verifying
+  // KB / offer / inventory grounding after upload.
+  if (req.method === "POST" && req.query.action === "test-gemini") {
+    const t0 = Date.now();
+    try {
+      const body = (req.body || {}) as any;
+      const project = String(body.project || "LOFT").toUpperCase();
+      const message = String(body.message || "").trim();
+      const customerName = String(body.customerName || "Test User");
+      const history = String(body.history || "no prior conversation");
+
+      if (!message) return res.status(400).json({ error: "message required" });
+      if (!KNOWN_PROJECTS.includes(project as any)) {
+        return res.status(400).json({ error: `Unknown project: ${project}` });
+      }
+
+      // Build PROJECT_CONTEXT exactly like the webhook does
+      const parts: string[] = [];
+      const facts = await getProjectFacts(project);
+      if ((facts as any)?.kb_text?.trim()) {
+        parts.push("## PROJECT KNOWLEDGE BASE");
+        parts.push((facts as any).kb_text.trim());
+      }
+      if (facts?.facts_text?.trim()) {
+        if (parts.length) parts.push("");
+        parts.push("## OFFER DETAILS (manually curated, authoritative for offers/schemes)");
+        parts.push(facts.facts_text.trim());
+      }
+      try {
+        const inv = await getInventoryForProject(project);
+        if (inv.markdown) {
+          if (parts.length) parts.push("");
+          parts.push("## CURRENT INVENTORY & PRICING (live from sales sheet)");
+          parts.push(inv.markdown);
+        }
+      } catch {}
+      const projectContext = parts.join("\n").trim() || `No KB / inventory available for ${project} yet.`;
+
+      const structuredMessage = [
+        `<CUSTOMER>`,
+        `Name: ${customerName}`,
+        `Phone: 91XXXXXXXX (test)`,
+        `</CUSTOMER>`,
+        ``,
+        `<CURRENT_PROJECT>${project}</CURRENT_PROJECT>`,
+        `<LAST_PROJECT>none</LAST_PROJECT>`,
+        `<DAYS_SINCE_LAST>first time</DAYS_SINCE_LAST>`,
+        ``,
+        `<PROJECT_CONTEXT>`,
+        projectContext,
+        `</PROJECT_CONTEXT>`,
+        ``,
+        `<CONVERSATION_HISTORY>`,
+        history,
+        `</CONVERSATION_HISTORY>`,
+        ``,
+        `<USER_MESSAGE>`,
+        message,
+        `</USER_MESSAGE>`,
+      ].join("\n");
+
+      const reply = await callGemini(structuredMessage, { enableGrounding: false });
+      return res.status(200).json({
+        ok: true,
+        project,
+        message,
+        elapsedMs: Date.now() - t0,
+        contextSize: projectContext.length,
+        gemini: reply,
+      });
+    } catch (err: any) {
+      console.error(`[test-gemini] failed: ${err.message}`);
+      return res.status(500).json({ error: err.message, elapsedMs: Date.now() - t0 });
     }
   }
 
