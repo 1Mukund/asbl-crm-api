@@ -28,12 +28,23 @@ export interface ProjectDoc {
   url: string;
   doc_type: string;
   filename: string | null;
+  size_label?: string | null;
   /** "table" | "kb" — which source resolved this URL (for logs) */
   source?: string;
 }
 
+/** Normalise a size label for fuzzy matching: lowercase, strip non-alphanumeric. */
+function normSize(s: string | null | undefined): string {
+  return (s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
 // ── Look up the matching document — table first, then KB extraction ──────
-export async function getDocumentFor(project: string, intentOrDocType: string): Promise<ProjectDoc | null> {
+// Optional sizeHint helps unit_plan lookups (e.g. "1695 east", "2bhk", "1295").
+export async function getDocumentFor(
+  project: string,
+  intentOrDocType: string,
+  sizeHint?: string | null
+): Promise<ProjectDoc | null> {
   // Accept either a legacy intent ("brochure") or a doc_type slug ("brochure" / "price_sheet" / etc.)
   const docType = LEGACY_INTENT_TO_DOC[intentOrDocType] || intentOrDocType;
   if (!docType) return null;
@@ -44,11 +55,26 @@ export async function getDocumentFor(project: string, intentOrDocType: string): 
       `${SUPABASE_URL}/rest/v1/project_documents` +
         `?project=eq.${project}` +
         `&doc_type=eq.${docType}` +
-        `&order=fetched_at.desc&limit=1&select=url,doc_type,filename`,
+        `&order=fetched_at.desc&limit=20&select=url,doc_type,filename,size_label`,
       { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
     );
-    const rows = await r.json();
-    if (rows?.[0]?.url) {
+    const rows = (await r.json()) as ProjectDoc[];
+
+    if (rows?.length) {
+      // For unit_plan, try to match size_label using sizeHint
+      if (docType === "unit_plan") {
+        const hint = normSize(sizeHint);
+        if (hint) {
+          // Best match: size_label normalised contains the hint, or hint contains it
+          const matched = rows.find((row) => {
+            const lbl = normSize(row.size_label);
+            return lbl && (lbl.includes(hint) || hint.includes(lbl));
+          });
+          if (matched) return { ...matched, source: "table" };
+        }
+        // No hint or no match → fall back to most recently uploaded unit plan
+        return { ...rows[0], source: "table" };
+      }
       return { ...rows[0], source: "table" };
     }
   } catch (err: any) {

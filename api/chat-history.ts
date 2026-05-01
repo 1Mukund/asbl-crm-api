@@ -1,6 +1,13 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { listAllProjectFacts, getProjectFacts, saveProjectFacts, KNOWN_PROJECTS } from "./_utils/project_facts";
 import { getAllInventoryRows, refreshInventoryCache, INVENTORY_SHEET_URL, InventoryRow } from "./_utils/inventory_sheet";
+import { uploadToStorage, extractTextFromPDF, decodeBase64Text, decodeBase64Buffer } from "./_utils/storage_upload";
+
+// Bump body-parser limit for base64 PDF uploads (default is 1MB).
+// 50MB binary PDF → ~67MB base64 JSON, so allow 70MB headroom.
+export const config = {
+  api: { bodyParser: { sizeLimit: "70mb" } },
+};
 
 const LAZYBOT_URL = process.env.LAZYBOT_URL || "https://lazybot-whatsapp-crm.onrender.com";
 const LAZYBOT_API_KEY = process.env.LAZYBOT_API_KEY || "";
@@ -72,7 +79,7 @@ async function renderDashboard(): Promise<string> {
     sb(`whatsapp_messages?created_at=gte.${since24h}&select=phone,direction,message,project,intent,sender,created_at&order=created_at.desc&limit=300`),
     sb(`whatsapp_messages?created_at=gte.${since24h}&direction=eq.inbound&intent=not.is.null&select=intent,project`),
     sb(`cron_log?select=task,ran_at,duration_ms,result,error&order=ran_at.desc&limit=20`),
-    sb(`project_documents?select=project,doc_type,filename,url,fetched_at&order=fetched_at.desc&limit=50`),
+    sb(`project_documents?select=id,project,doc_type,size_label,filename,url,fetched_at&order=fetched_at.desc&limit=200`),
     getAllInventoryRows().catch((err: any) => {
       console.error("[Dashboard] Inventory fetch failed:", err.message);
       return { rows: [], fetchedAt: 0 };
@@ -274,14 +281,90 @@ async function renderDashboard(): Promise<string> {
     })
     .join("");
 
-  // ── Section 5: Project documents ────────────────────────────────────────
-  const docHtml = docRows
-    .map((d: any) => `<tr>
-      <td>${esc(d.project)}</td>
-      <td><span class="badge">${esc(d.doc_type)}</span></td>
-      <td>${esc(d.filename || "—")}</td>
-      <td><a href="${esc(d.url)}" target="_blank" rel="noopener">open</a></td>
-    </tr>`)
+  // ── Section 5: Project Document Library (per-project upload UI) ────────
+  // Group docs by project & doc_type so we can render upload slots / lists.
+  const docsByProj: Record<string, Record<string, any[]>> = {};
+  for (const d of docRows as any[]) {
+    if (!docsByProj[d.project]) docsByProj[d.project] = {};
+    const t = d.doc_type;
+    if (!docsByProj[d.project][t]) docsByProj[d.project][t] = [];
+    docsByProj[d.project][t].push(d);
+  }
+
+  const SINGLE_SLOTS: Array<{ key: string; label: string }> = [
+    { key: "master_plan", label: "Master Plan" },
+    { key: "floor_plan", label: "Floor Plan" },
+    { key: "price_sheet", label: "Price Sheet" },
+    { key: "payment_structure", label: "Payment Structure" },
+    { key: "brochure", label: "Brochure" },
+  ];
+
+  const renderDocSlot = (project: string, docKey: string, label: string) => {
+    const existing = (docsByProj[project]?.[docKey] || []).slice(0, 1)[0];
+    if (existing) {
+      return `<div class="doc-slot filled">
+        <div class="doc-slot-label">${esc(label)} <span class="ok">●</span></div>
+        <div class="doc-slot-file">
+          <a href="${esc(existing.url)}" target="_blank" rel="noopener">${esc(existing.filename || "open")}</a>
+          <form method="POST" action="?action=delete-doc&id=${esc(existing.id)}" style="display:inline" onsubmit="return confirm('Delete ${esc(label)} for ${esc(project)}?')">
+            <button type="submit" class="btn-delete">×</button>
+          </form>
+        </div>
+        <button type="button" class="btn-upload-replace" onclick="pickFile('${esc(project)}', '${esc(docKey)}', null, '${esc(label)}')">Replace</button>
+      </div>`;
+    }
+    return `<div class="doc-slot empty-slot">
+      <div class="doc-slot-label">${esc(label)} <span class="missing">○</span></div>
+      <div class="doc-slot-file"><em>not uploaded</em></div>
+      <button type="button" class="btn-upload" onclick="pickFile('${esc(project)}', '${esc(docKey)}', null, '${esc(label)}')">Upload PDF</button>
+    </div>`;
+  };
+
+  const renderUnitPlans = (project: string) => {
+    const plans = docsByProj[project]?.unit_plan || [];
+    const list = plans.map((p) => `<tr>
+      <td>${esc(p.size_label || "—")}</td>
+      <td><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.filename || "open")}</a></td>
+      <td>
+        <form method="POST" action="?action=delete-doc&id=${esc(p.id)}" style="display:inline" onsubmit="return confirm('Delete unit plan ${esc(p.size_label)} for ${esc(project)}?')">
+          <button type="submit" class="btn-delete">delete</button>
+        </form>
+      </td>
+    </tr>`).join("");
+
+    return `<div class="unit-plans">
+      <div class="doc-slot-label">Unit Plans <span class="${plans.length ? "ok" : "missing"}">${plans.length ? "●" : "○"}</span> <span style="color:#888;font-weight:normal">(${plans.length})</span></div>
+      ${plans.length ? `<table class="unit-table">
+        <tr><th>Size label</th><th>File</th><th></th></tr>
+        ${list}
+      </table>` : `<div class="empty-inline">no unit plans uploaded yet</div>`}
+      <div class="add-unit-row">
+        <input type="text" id="size-${esc(project)}" placeholder="size label e.g. 1695 East" class="size-input" />
+        <button type="button" class="btn-upload" onclick="pickUnitPlan('${esc(project)}')">+ Add unit plan PDF</button>
+      </div>
+    </div>`;
+  };
+
+  const renderProjectKbCard = (project: string) => {
+    const facts = factsByProject.get(project);
+    const hasContent = (facts?.facts_text || "").length > 100;
+    const updated = facts?.updated_at ? timeAgo(facts.updated_at) : "never";
+    const sizeKb = ((facts?.facts_text || "").length / 1024).toFixed(1);
+    return `<div class="kb-row">
+      <span><strong>KB:</strong> ${hasContent ? `<span class="ok">●</span> ${sizeKb} KB · updated ${esc(updated)}` : `<span class="missing">○</span> empty`}</span>
+      <button type="button" class="btn-upload-kb" onclick="pickKb('${esc(project)}')">Upload KB (TXT/PDF)</button>
+    </div>`;
+  };
+
+  const docLibraryHtml = KNOWN_PROJECTS.filter((p) => p !== "LEGACY")
+    .map((p) => `<div class="proj-card">
+      <h3>${esc(p)}</h3>
+      ${renderProjectKbCard(p)}
+      <div class="doc-slots">
+        ${SINGLE_SLOTS.map((s) => renderDocSlot(p, s.key, s.label)).join("")}
+      </div>
+      ${renderUnitPlans(p)}
+    </div>`)
     .join("");
 
   return `<!DOCTYPE html>
@@ -319,6 +402,30 @@ code { background: #f0f0f3; padding: 2px 5px; border-radius: 4px; font-size: 12p
 .proj-text { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11.5px; line-height: 1.45; padding: 14px; background: #fcfcfd; max-height: 480px; overflow: auto; margin: 0; white-space: pre-wrap; word-break: break-word; }
 .proj-help { font-size: 12.5px; color: #555; margin-bottom: 12px; line-height: 1.5; padding: 10px 12px; background: #fafbfc; border-left: 3px solid #007aff; border-radius: 4px; }
 .proj-help code { background: #e5e5ea; padding: 1px 6px; border-radius: 3px; font-size: 11.5px; }
+.doc-library { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; margin-top: 8px; }
+.proj-card { border: 1px solid #e5e5ea; border-radius: 10px; padding: 14px 16px; background: #fcfcfd; }
+.proj-card h3 { margin: 0 0 10px; font-size: 15px; font-weight: 600; color: #1d1d1f; }
+.kb-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; background: white; border: 1px solid #e5e5ea; border-radius: 6px; font-size: 12.5px; margin-bottom: 12px; }
+.doc-slots { display: grid; grid-template-columns: 1fr; gap: 6px; margin-bottom: 12px; }
+.doc-slot { display: grid; grid-template-columns: 130px 1fr auto; align-items: center; gap: 8px; padding: 6px 10px; background: white; border: 1px solid #e5e5ea; border-radius: 6px; font-size: 12px; }
+.doc-slot.empty-slot { background: #fffbf2; border-color: #ffe8b8; }
+.doc-slot-label { font-weight: 500; color: #1d1d1f; }
+.doc-slot-file { color: #444; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.doc-slot-file em { color: #aaa; font-style: normal; }
+.ok { color: #34c759; font-size: 13px; }
+.missing { color: #ffa726; font-size: 13px; }
+.btn-upload, .btn-upload-replace, .btn-upload-kb { background: #007aff; color: white; border: none; padding: 4px 10px; border-radius: 5px; font-size: 11.5px; cursor: pointer; font-weight: 500; }
+.btn-upload-replace { background: #f0f0f3; color: #007aff; }
+.btn-upload:hover, .btn-upload-kb:hover { background: #0066d6; }
+.btn-upload-replace:hover { background: #e5e5ea; }
+.btn-delete { background: transparent; color: #ff3b30; border: none; cursor: pointer; font-size: 14px; padding: 0 4px; line-height: 1; }
+.btn-delete:hover { color: #c00; }
+.unit-plans { background: white; border: 1px solid #e5e5ea; border-radius: 6px; padding: 10px 12px; }
+.unit-table { width: 100%; font-size: 12px; margin: 8px 0; }
+.unit-table th, .unit-table td { padding: 5px 6px; }
+.add-unit-row { display: flex; gap: 8px; margin-top: 8px; }
+.size-input { flex: 1; padding: 5px 9px; border: 1px solid #d1d1d6; border-radius: 5px; font-size: 12px; font-family: inherit; }
+.empty-inline { color: #aaa; font-size: 12px; font-style: italic; padding: 4px 0; }
 </style>
 </head><body>
 <h1>ASBL CRM Dashboard</h1>
@@ -397,14 +504,119 @@ code { background: #f0f0f3; padding: 2px 5px; border-radius: 4px; font-size: 12p
   </div>
 
   <div class="card full">
-    <h2>5. Project Documents (auto-discovered from crawl)</h2>
-    ${docHtml ? `<table>
-      <tr><th>Project</th><th>Type</th><th>Filename</th><th>Link</th></tr>
-      ${docHtml}
-    </table>` : `<div class="empty">No documents found yet. The crawler picks up PDFs on next refresh.</div>`}
+    <h2>5. Project Document Library (KB + PDFs the bot sends on WhatsApp)</h2>
+    <div class="proj-help">
+      <strong>KB</strong> — TXT or PDF. Text is auto-extracted and fed into the bot's Gemini prompt as <code>PROJECT_CONTEXT</code>. Replace anytime; latest upload wins.<br>
+      <strong>Master Plan / Floor Plan / Price Sheet / Payment Structure / Brochure</strong> — single PDF per project. The bot sends this file directly via Periskope when a customer asks (DOCUMENT_REQUEST intent).<br>
+      <strong>Unit Plans</strong> — multiple PDFs, one per inventory size (e.g. <code>1695 East</code>). Bot matches by size label when customer asks for a specific unit's plan.<br>
+      Files go to Supabase Storage bucket <code>project-files</code> (public, 50MB max).
+    </div>
+    <div class="doc-library">
+      ${docLibraryHtml}
+    </div>
   </div>
 
 </div>
+
+<!-- Hidden file inputs reused by the upload buttons -->
+<input type="file" id="hidden-file-input" accept=".pdf,.txt,application/pdf,text/plain" style="display:none" />
+
+<script>
+// ── Upload helpers: read file → base64 → POST JSON ───────────────────────
+const _fileInput = document.getElementById('hidden-file-input');
+let _ctx = null; // { kind: 'kb'|'doc'|'unit', project, docType, sizeLabel, label }
+
+function pickKb(project) {
+  _ctx = { kind: 'kb', project, label: 'KB' };
+  _fileInput.accept = '.pdf,.txt,application/pdf,text/plain';
+  _fileInput.value = '';
+  _fileInput.click();
+}
+
+function pickFile(project, docType, sizeLabel, label) {
+  _ctx = { kind: 'doc', project, docType, sizeLabel, label };
+  _fileInput.accept = '.pdf,application/pdf';
+  _fileInput.value = '';
+  _fileInput.click();
+}
+
+function pickUnitPlan(project) {
+  const sizeInput = document.getElementById('size-' + project);
+  const sizeLabel = (sizeInput?.value || '').trim();
+  if (!sizeLabel) {
+    alert('Enter a size label first (e.g. "1695 East")');
+    sizeInput?.focus();
+    return;
+  }
+  _ctx = { kind: 'unit', project, docType: 'unit_plan', sizeLabel, label: 'Unit Plan ' + sizeLabel };
+  _fileInput.accept = '.pdf,application/pdf';
+  _fileInput.value = '';
+  _fileInput.click();
+}
+
+_fileInput.addEventListener('change', async (e) => {
+  const file = e.target.files?.[0];
+  if (!file || !_ctx) return;
+  const ctx = _ctx;
+  _ctx = null;
+
+  if (file.size > 50 * 1024 * 1024) {
+    alert('File too large (max 50 MB)');
+    return;
+  }
+
+  // Read file as base64 (strip data: prefix)
+  const base64 = await new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => {
+      const s = String(fr.result || '');
+      const idx = s.indexOf(',');
+      resolve(idx >= 0 ? s.slice(idx + 1) : s);
+    };
+    fr.onerror = () => reject(fr.error);
+    fr.readAsDataURL(file);
+  });
+
+  const action = ctx.kind === 'kb' ? 'upload-kb' : 'upload-doc';
+  const payload = {
+    project: ctx.project,
+    filename: file.name,
+    mimetype: file.type || (file.name.toLowerCase().endsWith('.pdf') ? 'application/pdf' : 'text/plain'),
+    base64_content: base64,
+  };
+  if (ctx.kind !== 'kb') {
+    payload.doc_type = ctx.docType;
+    if (ctx.sizeLabel) payload.size_label = ctx.sizeLabel;
+  }
+
+  const btn = document.activeElement;
+  const oldText = btn?.textContent;
+  if (btn && btn.tagName === 'BUTTON') { btn.disabled = true; btn.textContent = 'Uploading…'; }
+
+  try {
+    const r = await fetch('?action=' + action, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await r.json();
+    if (!r.ok || !data.ok) {
+      alert('Upload failed: ' + (data.error || r.status));
+      if (btn && btn.tagName === 'BUTTON') { btn.disabled = false; btn.textContent = oldText; }
+      return;
+    }
+    if (ctx.kind === 'kb') {
+      alert('KB uploaded: ' + data.extractedChars + ' chars extracted for ' + ctx.project);
+    } else {
+      alert(ctx.label + ' uploaded for ' + ctx.project);
+    }
+    location.reload();
+  } catch (err) {
+    alert('Upload error: ' + err.message);
+    if (btn && btn.tagName === 'BUTTON') { btn.disabled = false; btn.textContent = oldText; }
+  }
+});
+</script>
 </body></html>`;
 }
 
@@ -559,6 +771,166 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     res.setHeader("Location", `?view=dashboard`);
     return res.status(303).end();
+  }
+
+  // ─── KB upload (TXT or PDF) — extracts text → project_facts.facts_text ───
+  if (req.method === "POST" && req.query.action === "upload-kb") {
+    try {
+      const body = req.body as any;
+      const project = String(body.project || "").toUpperCase();
+      const filename = String(body.filename || "kb-upload");
+      const mimeType = String(body.mimetype || "application/octet-stream");
+      const base64 = String(body.base64_content || "");
+
+      if (!KNOWN_PROJECTS.includes(project as any)) {
+        return res.status(400).json({ error: `Unknown project: ${project}` });
+      }
+      if (!base64) return res.status(400).json({ error: "base64_content required" });
+
+      // Extract text — TXT directly, PDF via pdf-parse
+      let extractedText = "";
+      if (mimeType === "text/plain" || filename.toLowerCase().endsWith(".txt")) {
+        extractedText = decodeBase64Text(base64);
+      } else if (mimeType === "application/pdf" || filename.toLowerCase().endsWith(".pdf")) {
+        extractedText = await extractTextFromPDF(decodeBase64Buffer(base64));
+        if (!extractedText) {
+          return res.status(400).json({ error: "PDF text extraction returned empty — file may be image-only or corrupt" });
+        }
+      } else {
+        return res.status(400).json({ error: `Unsupported mimetype: ${mimeType}` });
+      }
+
+      // Upload original to storage (for backup / reference)
+      const upload = await uploadToStorage({
+        project,
+        docType: "kb_source",
+        filename,
+        mimeType,
+        base64Content: base64,
+      });
+
+      // Save extracted text + storage URL in project_facts
+      const saveResult = await saveProjectFacts(project, extractedText);
+      if (!saveResult.ok) {
+        return res.status(500).json({ error: `Save failed: ${saveResult.error}` });
+      }
+
+      // Update kb_pdf_url separately (saveProjectFacts doesn't touch it)
+      await fetch(`${SUPABASE_URL}/rest/v1/project_facts?project=eq.${project}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          apikey: SUPABASE_KEY,
+          Authorization: `Bearer ${SUPABASE_KEY}`,
+          Prefer: "return=minimal",
+        },
+        body: JSON.stringify({ kb_pdf_url: upload.publicUrl }),
+      });
+
+      return res.status(200).json({
+        ok: true,
+        project,
+        extractedChars: extractedText.length,
+        publicUrl: upload.publicUrl,
+      });
+    } catch (err: any) {
+      console.error(`[upload-kb] failed: ${err.message}`);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── Doc upload (PDF) — saves to Storage + project_documents row ────────
+  if (req.method === "POST" && req.query.action === "upload-doc") {
+    try {
+      const body = req.body as any;
+      const project = String(body.project || "").toUpperCase();
+      const docType = String(body.doc_type || "").toLowerCase();
+      const sizeLabel = body.size_label ? String(body.size_label) : null;
+      const filename = String(body.filename || "doc.pdf");
+      const mimeType = String(body.mimetype || "application/pdf");
+      const base64 = String(body.base64_content || "");
+
+      const VALID_DOC_TYPES = ["master_plan", "floor_plan", "unit_plan", "price_sheet", "payment_structure", "brochure", "specifications", "amenities"];
+      if (!KNOWN_PROJECTS.includes(project as any)) {
+        return res.status(400).json({ error: `Unknown project: ${project}` });
+      }
+      if (!VALID_DOC_TYPES.includes(docType)) {
+        return res.status(400).json({ error: `Unknown doc_type: ${docType}` });
+      }
+      if (!base64) return res.status(400).json({ error: "base64_content required" });
+
+      // unit_plan REQUIRES size_label
+      if (docType === "unit_plan" && !sizeLabel) {
+        return res.status(400).json({ error: "size_label required for unit_plan (e.g. '1695 East')" });
+      }
+
+      const upload = await uploadToStorage({
+        project,
+        docType,
+        filename,
+        mimeType,
+        base64Content: base64,
+        sizeLabel,
+      });
+
+      // Insert row in project_documents
+      const insertBody: any = {
+        project,
+        doc_type: docType,
+        filename,
+        url: upload.publicUrl,
+      };
+      if (sizeLabel) insertBody.size_label = sizeLabel;
+
+      const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/project_documents`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          apikey: SUPABASE_KEY,
+          Authorization: `Bearer ${SUPABASE_KEY}`,
+          Prefer: "return=representation",
+        },
+        body: JSON.stringify(insertBody),
+      });
+
+      if (!insertRes.ok) {
+        const errText = await insertRes.text();
+        return res.status(500).json({ error: `DB insert failed: ${errText.slice(0, 200)}` });
+      }
+
+      const inserted = await insertRes.json();
+      return res.status(200).json({
+        ok: true,
+        project,
+        docType,
+        sizeLabel,
+        publicUrl: upload.publicUrl,
+        record: inserted,
+      });
+    } catch (err: any) {
+      console.error(`[upload-doc] failed: ${err.message}`);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── Delete a document row by id ────────────────────────────────────────
+  if (req.method === "POST" && req.query.action === "delete-doc") {
+    const id = String(req.query.id || "");
+    if (!id) return res.status(400).json({ error: "id required" });
+    try {
+      await fetch(`${SUPABASE_URL}/rest/v1/project_documents?id=eq.${id}`, {
+        method: "DELETE",
+        headers: {
+          apikey: SUPABASE_KEY,
+          Authorization: `Bearer ${SUPABASE_KEY}`,
+          Prefer: "return=minimal",
+        },
+      });
+      res.setHeader("Location", `?view=dashboard`);
+      return res.status(303).end();
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
   }
 
   if (req.method === "GET") {
