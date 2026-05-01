@@ -319,7 +319,10 @@ export async function callGeminiRaw(
 
   const model = opts.model || GEMINI_MODEL;
   const temperature = opts.temperature ?? 0.6;
-  const maxOutputTokens = opts.maxOutputTokens ?? 4000;
+  // Gemini 3 Pro thinking-mode burns ~1000-1500 tokens before any visible
+  // output; cap too low → JSON gets truncated mid-reply → parser fails.
+  // 6000 leaves ~4500 for actual JSON output, plenty for any reply length.
+  const maxOutputTokens = opts.maxOutputTokens ?? 6000;
   const enableGrounding = opts.enableGrounding ?? true;
 
   const body: any = {
@@ -398,6 +401,7 @@ function parseStructuredOutput(rawText: string): GeminiStructuredReply {
     cleaned = cleaned.slice(firstBrace, lastBrace + 1);
   }
 
+  // ── Attempt 1: full JSON parse ────────────────────────────────────────
   try {
     const parsed = JSON.parse(cleaned);
     const intentRaw = String(parsed.intent || "GENERAL").toUpperCase();
@@ -423,14 +427,52 @@ function parseStructuredOutput(rawText: string): GeminiStructuredReply {
 
     return { intent, flags, project, docToSend, reply };
   } catch (err: any) {
-    // JSON parse failed — fall back to using raw text as reply
-    console.error(`[Gemini] JSON parse failed (${err.message}); using raw text as reply`);
+    console.error(`[Gemini] JSON parse failed (${err.message}); attempting regex extraction`);
+  }
+
+  // ── Attempt 2: regex-extract the "reply" field from malformed/truncated JSON
+  // This handles the case where Gemini's output got cut off mid-string,
+  // produced unescaped quotes, etc. We try the standard form first, then a
+  // looser form that grabs everything up to a terminating "} or " followed by
+  // another known key like "intent".
+  const tryExtract = (re: RegExp): string => {
+    const m = rawText.match(re);
+    if (!m || !m[1]) return "";
+    return m[1]
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "")
+      .replace(/\\t/g, " ")
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, "\\")
+      .trim();
+  };
+
+  const replyText =
+    tryExtract(/"reply"\s*:\s*"((?:\\.|[^"\\])*)"/) ||
+    tryExtract(/"reply"\s*:\s*"([\s\S]*?)"\s*[,}]/) ||
+    tryExtract(/"reply"\s*:\s*"([\s\S]*)$/); // truncated stream
+
+  if (replyText) {
+    const intentMatch = rawText.match(/"intent"\s*:\s*"([^"]+)"/);
+    const intentRaw = (intentMatch?.[1] || "GENERAL").toUpperCase();
+    const intent = VALID_INTENTS.includes(intentRaw) ? intentRaw : "GENERAL";
+    console.log(`[Gemini] Recovered reply via regex (intent=${intent}, ${replyText.length} chars)`);
     return {
-      intent: "GENERAL",
+      intent,
       flags: [],
       project: null,
       docToSend: null,
-      reply: rawText,
+      reply: replyText,
     };
   }
+
+  // ── Final fallback: humanlike deflection (NEVER send raw JSON) ────────
+  console.error(`[Gemini] Total parse failure; sending deflection. Raw start: ${rawText.slice(0, 200)}`);
+  return {
+    intent: "GENERAL",
+    flags: [],
+    project: null,
+    docToSend: null,
+    reply: "Hmm, give me a sec — let me pull that up and revert in just a moment.",
+  };
 }
