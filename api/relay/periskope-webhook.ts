@@ -310,19 +310,28 @@ async function getProjectContextText(project: Project | null): Promise<string> {
 
   const parts: string[] = [];
 
-  // 1. Manual project notes (from dashboard's Edit KB form, if any)
+  // 1. Project KB (auto-extracted from uploaded TXT/PDF via dashboard)
+  //    This is the BIG static knowledge — overview, location, amenities, specs.
   const facts = await getProjectFacts(project);
+  if (facts?.kb_text?.trim()) {
+    parts.push("## PROJECT KNOWLEDGE BASE");
+    parts.push(facts.kb_text.trim());
+  }
+
+  // 2. Curated OFFER details (manually written in dashboard's Edit ✎ form)
+  //    Kept SEPARATE from KB so KB uploads never overwrite offer text.
   if (facts?.facts_text?.trim()) {
-    parts.push("## PROJECT NOTES (manually curated)");
+    if (parts.length) parts.push("");
+    parts.push("## OFFER DETAILS (manually curated, authoritative for offers/schemes)");
     parts.push(facts.facts_text.trim());
   }
 
-  // 2. Live inventory + pricing from the master Google Sheet
+  // 3. Live inventory + pricing from the master Google Sheet
   try {
     const inv = await getInventoryForProject(project);
     if (inv.markdown) {
-      parts.push("");
-      parts.push("## CURRENT INVENTORY & PRICING");
+      if (parts.length) parts.push("");
+      parts.push("## CURRENT INVENTORY & PRICING (live from sales sheet)");
       parts.push(inv.markdown);
     }
   } catch (err: any) {

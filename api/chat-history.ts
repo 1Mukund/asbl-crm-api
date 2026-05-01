@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { listAllProjectFacts, getProjectFacts, saveProjectFacts, KNOWN_PROJECTS } from "./_utils/project_facts";
+import { listAllProjectFacts, getProjectFacts, saveProjectFacts, saveProjectKb, KNOWN_PROJECTS } from "./_utils/project_facts";
 import { getAllInventoryRows, refreshInventoryCache, INVENTORY_SHEET_URL, InventoryRow } from "./_utils/inventory_sheet";
 import { uploadToStorage, extractTextFromPDF, decodeBase64Text, decodeBase64Buffer } from "./_utils/storage_upload";
 
@@ -347,9 +347,12 @@ async function renderDashboard(): Promise<string> {
 
   const renderProjectKbCard = (project: string) => {
     const facts = factsByProject.get(project);
-    const hasContent = (facts?.facts_text || "").length > 100;
-    const updated = facts?.updated_at ? timeAgo(facts.updated_at) : "never";
-    const sizeKb = ((facts?.facts_text || "").length / 1024).toFixed(1);
+    // KB content is stored in kb_text (separate from facts_text which holds offer details)
+    const kbText = (facts as any)?.kb_text || "";
+    const kbUpdated = (facts as any)?.kb_updated_at;
+    const hasContent = kbText.length > 100;
+    const updated = kbUpdated ? timeAgo(kbUpdated) : "never";
+    const sizeKb = (kbText.length / 1024).toFixed(1);
     return `<div class="kb-row">
       <span><strong>KB:</strong> ${hasContent ? `<span class="ok">●</span> ${sizeKb} KB · updated ${esc(updated)}` : `<span class="missing">○</span> empty`}</span>
       <button type="button" class="btn-upload-kb" onclick="pickKb('${esc(project)}')">Upload KB (TXT/PDF)</button>
@@ -436,10 +439,11 @@ code { background: #f0f0f3; padding: 2px 5px; border-radius: 4px; font-size: 12p
   <div class="card full">
     <h2>1. Project Offer Details (per project)</h2>
     <div class="proj-help">
-      Static project KBs are uploaded directly to the <strong>Anandita agent</strong> console.
       This section is only for <strong>offer explanations</strong> — pricing offers, rental schemes,
       pre-EMI offers, limited-time deals — anything the bot should explain when a customer asks
       about offers for a project. Click <strong>edit ✎</strong> to write or update.
+      <br><strong>Note:</strong> Offer text is stored separately from the project KB
+      (Section 5 → KB upload). Uploading a new KB does <em>not</em> overwrite these offer details.
     </div>
     <table>
       <tr><th>Project</th><th>Size</th><th>Lines</th><th>Last updated</th><th>Age</th><th>Status</th><th>Actions</th></tr>
@@ -809,23 +813,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         base64Content: base64,
       });
 
-      // Save extracted text + storage URL in project_facts
-      const saveResult = await saveProjectFacts(project, extractedText);
+      // Save extracted KB text + PDF URL into project_facts.kb_text
+      // (kept SEPARATE from facts_text so curated OFFER details are never overwritten)
+      const saveResult = await saveProjectKb(project, extractedText, upload.publicUrl);
       if (!saveResult.ok) {
         return res.status(500).json({ error: `Save failed: ${saveResult.error}` });
       }
-
-      // Update kb_pdf_url separately (saveProjectFacts doesn't touch it)
-      await fetch(`${SUPABASE_URL}/rest/v1/project_facts?project=eq.${project}`, {
-        method: "PATCH",
-        headers: {
-          "Content-Type": "application/json",
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-          Prefer: "return=minimal",
-        },
-        body: JSON.stringify({ kb_pdf_url: upload.publicUrl }),
-      });
 
       return res.status(200).json({
         ok: true,
