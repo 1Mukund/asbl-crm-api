@@ -1068,6 +1068,87 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── Zoho lead inspector (debug) ────────────────────────────────────────
+  // GET ?action=zoho-lead&id=<lead_id> OR &phone=<+91...>
+  // Returns the raw lead record + recent Notes + recent Calls for diagnosis.
+  // Auth: gated by INHOUSE_POSTHOOK_SECRET (so it isn't open to the world).
+  if (req.method === "GET" && req.query.action === "zoho-lead") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret) {
+      return res.status(503).json({ error: "INHOUSE_POSTHOOK_SECRET not configured (debug gate)" });
+    }
+    if (incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+
+    try {
+      const { getAccessToken, findLeadByPhone } = await import("./_utils/zoho");
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+
+      const fields = "id,First_Name,Last_Name,Mobile,Email,ASBL_Project,Lead_Status,Last_Intent,Call_Status,Call_Duration,Total_Call_Duration_Secs,Last_Inhouse_Call_ID,Last_Arrowhead_Call_ID,Master_Lead_ID,Project_Lead_ID,Created_Time,Modified_Time";
+
+      let lead: any = null;
+      const leadId = req.query.id as string;
+      const phone = req.query.phone as string;
+
+      if (leadId) {
+        const r = await fetch(`${ZOHO_API_BASE}/Leads/${leadId}?fields=${fields}`, {
+          headers: { Authorization: `Zoho-oauthtoken ${token}` },
+        });
+        const j = await r.json() as any;
+        lead = j?.data?.[0] || null;
+      } else if (phone) {
+        const cleaned = phone.replace(/^\+/, "");
+        lead = await findLeadByPhone(cleaned);
+      } else {
+        return res.status(400).json({ error: "id or phone query param required" });
+      }
+
+      if (!lead) {
+        return res.status(404).json({ error: "Lead not found", searched: { id: leadId, phone } });
+      }
+
+      // Fetch latest 5 Notes
+      let notes: any[] = [];
+      try {
+        const nr = await fetch(`${ZOHO_API_BASE}/Leads/${lead.id}/Notes?sort_by=Created_Time&sort_order=desc&per_page=5`, {
+          headers: { Authorization: `Zoho-oauthtoken ${token}` },
+        });
+        const nj = await nr.json() as any;
+        notes = (nj?.data || []).map((n: any) => ({
+          id: n.id,
+          title: n.Note_Title,
+          content: (n.Note_Content || "").slice(0, 500),
+          created_at: n.Created_Time,
+        }));
+      } catch {}
+
+      // Fetch latest 5 Calls (related list)
+      let calls: any[] = [];
+      try {
+        const cr = await fetch(`${ZOHO_API_BASE}/Leads/${lead.id}/Calls?fields=id,Subject,Call_Type,Call_Duration,Call_Start_Time,Call_Status,Description&per_page=5`, {
+          headers: { Authorization: `Zoho-oauthtoken ${token}` },
+        });
+        const cj = await cr.json() as any;
+        calls = (cj?.data || []).map((c: any) => ({
+          id: c.id,
+          subject: c.Subject,
+          type: c.Call_Type,
+          duration: c.Call_Duration,
+          start_time: c.Call_Start_Time,
+          status: c.Call_Status,
+          description: (c.Description || "").slice(0, 300),
+        }));
+      } catch {}
+
+      return res.status(200).json({ lead, notes, calls });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── Meta token health check ────────────────────────────────────────────
   // GET ?action=meta-token-check → introspects META_PAGE_ACCESS_TOKEN via
   // Graph API debug_token + /me, returns expiry, app_id, granted scopes,
