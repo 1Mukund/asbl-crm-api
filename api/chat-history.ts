@@ -1,8 +1,9 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { listAllProjectFacts, getProjectFacts, saveProjectFacts, saveProjectKb, KNOWN_PROJECTS } from "./_utils/project_facts";
 import { getAllInventoryRows, getInventoryForProject, refreshInventoryCache, INVENTORY_SHEET_URL, InventoryRow } from "./_utils/inventory_sheet";
-import { uploadToStorage, extractTextFromPDF, decodeBase64Text, decodeBase64Buffer } from "./_utils/storage_upload";
-import { callGemini } from "./_utils/gemini_chat";
+import { uploadToStorage, extractTextFromPDF, decodeBase64Text, decodeBase64Buffer, createSignedUploadUrl, downloadFromStorage } from "./_utils/storage_upload";
+import { callGemini, ANANDITA_SYSTEM_PROMPT } from "./_utils/gemini_chat";
+import { getBotSetting, setBotSetting } from "./_utils/bot_settings";
 
 // Bump body-parser limit for base64 PDF uploads (default is 1MB).
 // 50MB binary PDF → ~67MB base64 JSON, so allow 70MB headroom.
@@ -16,6 +17,154 @@ const LAZYBOT_SESSION_ID = process.env.LAZYBOT_SESSION_ID || "";
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || "";
+
+// ── Shared modern stylesheet (used by every HTML view) ─────────────────────
+const SHARED_STYLE = `
+<style>
+:root {
+  --bg: #f7f8fa;
+  --surface: #ffffff;
+  --surface-hover: #fafbfc;
+  --surface-muted: #f3f4f6;
+  --border: #e5e7eb;
+  --border-strong: #d1d5db;
+  --text: #111827;
+  --text-soft: #4b5563;
+  --text-muted: #6b7280;
+  --primary: #2563eb;
+  --primary-hover: #1d4ed8;
+  --primary-soft: #dbeafe;
+  --success: #10b981;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-md: 0 4px 12px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04);
+  --radius: 12px;
+  --radius-sm: 8px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+a { color: var(--primary); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code { background: var(--surface-muted); padding: 2px 6px; border-radius: 4px; font-size: 12.5px; font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
+hr { border: 0; border-top: 1px solid var(--border); margin: 24px 0; }
+.topbar {
+  position: sticky; top: 0; z-index: 50;
+  background: rgba(255,255,255,0.85); backdrop-filter: saturate(150%) blur(10px); -webkit-backdrop-filter: saturate(150%) blur(10px);
+  border-bottom: 1px solid var(--border);
+  padding: 14px 28px; display: flex; align-items: center; justify-content: space-between;
+}
+.topbar .brand a { color: var(--text); font-weight: 700; font-size: 15px; letter-spacing: -0.01em; }
+.topbar nav { display: flex; gap: 18px; font-size: 13.5px; }
+.topbar nav a { color: var(--text-soft); }
+.topbar nav a:hover { color: var(--text); text-decoration: none; }
+.topbar .meta { color: var(--text-muted); font-size: 12px; }
+.container { max-width: 1400px; margin: 0 auto; padding: 28px; }
+.page-narrow .container { max-width: 1000px; }
+.page-title { font-size: 24px; font-weight: 700; letter-spacing: -0.015em; margin: 0 0 6px; }
+.page-sub { color: var(--text-soft); font-size: 13.5px; margin: 0 0 24px; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+@media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 22px 24px; box-shadow: var(--shadow-sm); transition: box-shadow .15s;
+}
+.card:hover { box-shadow: var(--shadow-md); }
+.card h2 { font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin: 0 0 16px; }
+.card-help, .proj-help { font-size: 13px; color: var(--text-soft); margin-bottom: 18px; line-height: 1.6; padding: 12px 14px; background: var(--primary-soft); border-radius: var(--radius-sm); }
+.card-help code, .proj-help code { background: rgba(37,99,235,0.12); color: var(--primary-hover); padding: 1px 6px; border-radius: 3px; font-size: 12px; }
+.btn-mini { background: var(--primary); color: #fff; border: none; padding: 5px 12px; border-radius: var(--radius-sm); font-size: 12px; font-weight: 600; cursor: pointer; }
+.btn-mini:hover { background: var(--primary-hover); }
+.full { grid-column: span 2; } @media (max-width: 1100px) { .full { grid-column: span 1; } }
+.empty { color: var(--text-muted); font-style: italic; padding: 16px 0; text-align: center; }
+table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
+th { text-align: left; font-weight: 600; color: var(--text-muted); padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.05em; }
+td { padding: 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+tbody tr:hover td { background: var(--surface-hover); }
+.badge { background: var(--primary-soft); color: var(--primary-hover); padding: 3px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600; }
+.badge-success { background: rgba(16,185,129,0.12); color: #059669; }
+.badge-warn { background: rgba(245,158,11,0.15); color: #b45309; }
+.badge-danger { background: rgba(239,68,68,0.12); color: #b91c1c; }
+.bar { width: 100%; height: 6px; background: var(--surface-muted); border-radius: 999px; overflow: hidden; }
+.bar-fill { height: 100%; background: linear-gradient(90deg, var(--primary), #4f86ff); border-radius: 999px; }
+.dot-ok { color: var(--success); }
+.dot-warn { color: var(--warning); }
+.dot-miss { color: var(--text-muted); }
+
+/* Buttons */
+.btn-primary, .btn-secondary, .btn-danger, button.btn-upload, button.btn-upload-replace, button.btn-upload-kb {
+  font-family: inherit; font-size: 13px; font-weight: 600; border: 1px solid transparent; padding: 8px 16px;
+  border-radius: var(--radius-sm); cursor: pointer; transition: all .12s ease;
+}
+.btn-primary { background: var(--primary); color: #fff; }
+.btn-primary:hover { background: var(--primary-hover); transform: translateY(-1px); box-shadow: var(--shadow-md); }
+.btn-secondary { background: var(--surface); color: var(--text); border-color: var(--border-strong); text-decoration: none; display: inline-block; }
+.btn-secondary:hover { background: var(--surface-hover); }
+.btn-danger { background: rgba(239,68,68,0.1); color: var(--danger); border-color: rgba(239,68,68,0.3); }
+.btn-danger:hover { background: rgba(239,68,68,0.18); }
+
+/* Doc Library cards */
+.doc-library { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 18px; margin-top: 8px; }
+.proj-card { border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; background: linear-gradient(180deg, #fff 0%, #fafbfc 100%); }
+.proj-card h3 { margin: 0 0 14px; font-size: 16px; font-weight: 700; letter-spacing: -0.01em; }
+.kb-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 13px; margin-bottom: 14px; }
+.doc-slots { display: grid; grid-template-columns: 1fr; gap: 8px; margin-bottom: 14px; }
+.doc-slot { display: grid; grid-template-columns: 130px 1fr auto; align-items: center; gap: 10px; padding: 10px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 12.5px; }
+.doc-slot.empty-slot { background: rgba(245,158,11,0.05); border-color: rgba(245,158,11,0.25); }
+.doc-slot-label { font-weight: 600; color: var(--text); }
+.doc-slot-file { color: var(--text-soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: flex; align-items: center; gap: 6px; }
+.doc-slot-file em { color: var(--text-muted); font-style: normal; }
+.ok { color: var(--success); font-size: 14px; }
+.missing { color: var(--warning); font-size: 14px; }
+.btn-upload, .btn-upload-kb { background: var(--primary); color: #fff; padding: 6px 12px; font-size: 12px; }
+.btn-upload:hover, .btn-upload-kb:hover { background: var(--primary-hover); }
+.btn-upload-replace { background: var(--surface-muted); color: var(--primary); padding: 6px 12px; font-size: 12px; border: 1px solid var(--border); }
+.btn-upload-replace:hover { background: var(--border); }
+.btn-delete { background: transparent; color: var(--danger); border: none; cursor: pointer; font-size: 16px; padding: 0 6px; line-height: 1; font-weight: 700; }
+.btn-delete:hover { color: #b91c1c; }
+.unit-plans { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; }
+.unit-table { width: 100%; font-size: 12.5px; margin: 10px 0; }
+.unit-table th, .unit-table td { padding: 6px 8px; }
+.add-unit-row { display: flex; gap: 8px; margin-top: 10px; }
+.size-input { flex: 1; padding: 7px 11px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); font-size: 12.5px; font-family: inherit; background: var(--surface); }
+.size-input:focus { outline: 0; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37,99,235,0.15); }
+.empty-inline { color: var(--text-muted); font-size: 12.5px; font-style: italic; padding: 4px 0; }
+
+/* Project facts (offer details viewer) */
+.proj-content { border: 1px solid var(--border); border-radius: var(--radius-sm); margin: 10px 0; padding: 0; background: var(--surface); }
+.proj-content summary { cursor: pointer; padding: 13px 16px; font-size: 13.5px; user-select: none; }
+.proj-content summary:hover { background: var(--surface-hover); }
+.proj-content[open] summary { border-bottom: 1px solid var(--border); background: var(--surface-hover); }
+.proj-text { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 12px; line-height: 1.55; padding: 16px; background: #fcfcfd; max-height: 480px; overflow: auto; margin: 0; white-space: pre-wrap; word-break: break-word; }
+
+/* Edit form views */
+.field-label { display: block; font-weight: 600; margin: 14px 0 8px; font-size: 13px; color: var(--text); }
+textarea {
+  width: 100%; min-height: 540px; font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 12.5px; line-height: 1.55;
+  padding: 14px 16px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); resize: vertical;
+  background: var(--surface); color: var(--text);
+}
+textarea:focus { outline: 0; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37,99,235,0.15); }
+.prompt-textarea { min-height: 720px; }
+.actions { margin-top: 18px; display: flex; gap: 12px; align-items: center; }
+.flash { padding: 12px 16px; border-radius: var(--radius-sm); margin-bottom: 18px; font-size: 13.5px; font-weight: 500; }
+.flash-success { background: rgba(16,185,129,0.1); color: #047857; border: 1px solid rgba(16,185,129,0.25); }
+.flash-error { background: rgba(239,68,68,0.08); color: #b91c1c; border: 1px solid rgba(239,68,68,0.25); }
+
+/* Misc */
+.muted { color: var(--text-muted); font-size: 12px; }
+.text-mono { font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
+</style>
+`;
 
 // ── Helper: Supabase REST GET ────────────────────────────────────────────────
 async function sb(path: string): Promise<any> {
@@ -376,66 +525,23 @@ async function renderDashboard(): Promise<string> {
 <meta charset="utf-8">
 <meta http-equiv="refresh" content="30">
 <title>ASBL CRM Dashboard</title>
-<style>
-* { box-sizing: border-box; }
-body { font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f7; color: #1d1d1f; margin: 0; padding: 24px; }
-h1 { font-size: 22px; margin: 0 0 4px; font-weight: 600; }
-.sub { color: #666; font-size: 13px; margin-bottom: 24px; }
-.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-@media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
-.card { background: white; border-radius: 12px; padding: 18px 20px; border: 1px solid #e5e5ea; }
-.card h2 { font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: #666; margin: 0 0 12px; }
-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th { text-align: left; font-weight: 500; color: #666; padding: 6px 8px; border-bottom: 1px solid #e5e5ea; }
-td { padding: 8px; border-bottom: 1px solid #f0f0f3; vertical-align: top; }
-tr:hover td { background: #fafbfc; }
-code { background: #f0f0f3; padding: 2px 5px; border-radius: 4px; font-size: 12px; }
-.badge { background: #007aff14; color: #007aff; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 500; }
-.bar { width: 100%; height: 8px; background: #f0f0f3; border-radius: 4px; overflow: hidden; }
-.bar-fill { height: 100%; background: #007aff; }
-.full { grid-column: span 2; }
-@media (max-width: 1100px) { .full { grid-column: span 1; } }
-.empty { color: #888; font-style: italic; padding: 12px 0; }
-.proj-content { border: 1px solid #e5e5ea; border-radius: 8px; margin: 8px 0; padding: 0; }
-.proj-content summary { cursor: pointer; padding: 12px 14px; font-size: 13px; user-select: none; }
-.proj-content summary:hover { background: #fafbfc; }
-.proj-content[open] summary { border-bottom: 1px solid #e5e5ea; background: #fafbfc; }
-.proj-stats { padding: 10px 14px; background: #f9fafb; font-size: 12px; color: #444; border-bottom: 1px solid #e5e5ea; }
-.proj-stats a { color: #007aff; text-decoration: none; }
-.proj-stats a:hover { text-decoration: underline; }
-.proj-text { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11.5px; line-height: 1.45; padding: 14px; background: #fcfcfd; max-height: 480px; overflow: auto; margin: 0; white-space: pre-wrap; word-break: break-word; }
-.proj-help { font-size: 12.5px; color: #555; margin-bottom: 12px; line-height: 1.5; padding: 10px 12px; background: #fafbfc; border-left: 3px solid #007aff; border-radius: 4px; }
-.proj-help code { background: #e5e5ea; padding: 1px 6px; border-radius: 3px; font-size: 11.5px; }
-.doc-library { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; margin-top: 8px; }
-.proj-card { border: 1px solid #e5e5ea; border-radius: 10px; padding: 14px 16px; background: #fcfcfd; }
-.proj-card h3 { margin: 0 0 10px; font-size: 15px; font-weight: 600; color: #1d1d1f; }
-.kb-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; background: white; border: 1px solid #e5e5ea; border-radius: 6px; font-size: 12.5px; margin-bottom: 12px; }
-.doc-slots { display: grid; grid-template-columns: 1fr; gap: 6px; margin-bottom: 12px; }
-.doc-slot { display: grid; grid-template-columns: 130px 1fr auto; align-items: center; gap: 8px; padding: 6px 10px; background: white; border: 1px solid #e5e5ea; border-radius: 6px; font-size: 12px; }
-.doc-slot.empty-slot { background: #fffbf2; border-color: #ffe8b8; }
-.doc-slot-label { font-weight: 500; color: #1d1d1f; }
-.doc-slot-file { color: #444; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.doc-slot-file em { color: #aaa; font-style: normal; }
-.ok { color: #34c759; font-size: 13px; }
-.missing { color: #ffa726; font-size: 13px; }
-.btn-upload, .btn-upload-replace, .btn-upload-kb { background: #007aff; color: white; border: none; padding: 4px 10px; border-radius: 5px; font-size: 11.5px; cursor: pointer; font-weight: 500; }
-.btn-upload-replace { background: #f0f0f3; color: #007aff; }
-.btn-upload:hover, .btn-upload-kb:hover { background: #0066d6; }
-.btn-upload-replace:hover { background: #e5e5ea; }
-.btn-delete { background: transparent; color: #ff3b30; border: none; cursor: pointer; font-size: 14px; padding: 0 4px; line-height: 1; }
-.btn-delete:hover { color: #c00; }
-.unit-plans { background: white; border: 1px solid #e5e5ea; border-radius: 6px; padding: 10px 12px; }
-.unit-table { width: 100%; font-size: 12px; margin: 8px 0; }
-.unit-table th, .unit-table td { padding: 5px 6px; }
-.add-unit-row { display: flex; gap: 8px; margin-top: 8px; }
-.size-input { flex: 1; padding: 5px 9px; border: 1px solid #d1d1d6; border-radius: 5px; font-size: 12px; font-family: inherit; }
-.empty-inline { color: #aaa; font-size: 12px; font-style: italic; padding: 4px 0; }
-</style>
+<link rel="preconnect" href="https://rsms.me/">
+<link rel="stylesheet" href="https://rsms.me/inter/inter.css">
+${SHARED_STYLE}
 </head><body>
-<h1>ASBL CRM Dashboard</h1>
-<div class="sub">Last refresh: ${new Date().toLocaleString("en-IN")} · Auto-refresh every 30s</div>
+<header class="topbar">
+  <div class="brand"><a href="?view=dashboard">ASBL CRM</a></div>
+  <nav>
+    <a href="?view=dashboard">Dashboard</a>
+    <a href="?view=edit-prompt">Bot Prompt</a>
+  </nav>
+  <div class="meta">Last refresh: ${new Date().toLocaleString("en-IN")} · auto-refresh 30s</div>
+</header>
+<main class="container">
+  <h1 class="page-title">Operations Dashboard</h1>
+  <p class="page-sub">Live view of project KB, offers, inventory, document library, conversations and bot configuration.</p>
 
-<div class="grid">
+  <div class="grid">
 
   <div class="card full">
     <h2>1. Project Offer Details (per project)</h2>
@@ -465,7 +571,7 @@ code { background: #f0f0f3; padding: 2px 5px; border-radius: 4px; font-size: 12p
       The bot uses this as the source of truth for unit availability, per-sft rates, all-inclusive prices,
       and active offers.
       <form method="POST" action="?action=refresh-inventory" style="display:inline-block;margin-left:12px">
-        <button type="submit" style="background:#007aff;color:white;border:none;padding:4px 12px;border-radius:6px;font-size:12px;cursor:pointer">↻ Refresh now</button>
+        <button type="submit" class="btn-mini">↻ Refresh now</button>
       </form>
       Last fetched: <strong>${esc(invFetchedAt)}</strong> (${esc(invFetchedAgo)}) · ${inventory.rows.length} units in sheet.
     </div>
@@ -510,26 +616,35 @@ code { background: #f0f0f3; padding: 2px 5px; border-radius: 4px; font-size: 12p
 
   <div class="card full">
     <h2>5. Project Document Library (KB + PDFs the bot sends on WhatsApp)</h2>
-    <div class="proj-help">
+    <div class="card-help">
       <strong>KB</strong> — TXT or PDF. Text is auto-extracted and fed into the bot's Gemini prompt as <code>PROJECT_CONTEXT</code>. Replace anytime; latest upload wins.<br>
-      <strong>Master Plan / Floor Plan / Price Sheet / Payment Structure / Brochure</strong> — single PDF per project. The bot sends this file directly via Periskope when a customer asks (DOCUMENT_REQUEST intent).<br>
-      <strong>Unit Plans</strong> — multiple PDFs, one per inventory size (e.g. <code>1695 East</code>). Bot matches by size label when customer asks for a specific unit's plan.<br>
-      Files go to Supabase Storage bucket <code>project-files</code> (public, 50MB max).
+      <strong>Master Plan / Floor Plan / Price Sheet / Payment Structure / Brochure</strong> — single PDF per project. The bot sends this file directly via Periskope when a customer asks.<br>
+      <strong>Unit Plans</strong> — multiple PDFs, one per inventory size (e.g. <code>1695 East</code>). Bot matches by size label.<br>
+      Files upload <strong>directly to Supabase Storage</strong> via signed URL — large PDFs (up to 50 MB) work without hitting Vercel's 4.5 MB request limit.
     </div>
     <div class="doc-library">
       ${docLibraryHtml}
     </div>
   </div>
 
-</div>
+  <div class="card full">
+    <h2>6. Bot System Prompt</h2>
+    <div class="card-help">
+      The Gemini system prompt defines the bot's persona, banned phrases, intent labels and JSON output format. Edit it on the dedicated page — saves are <strong>live</strong> (the bot picks up the new prompt on the next message; no redeploy needed).
+    </div>
+    <a href="?view=edit-prompt" class="btn-primary" style="display:inline-block;text-decoration:none">Open prompt editor →</a>
+  </div>
 
-<!-- Hidden file inputs reused by the upload buttons -->
+  </div>
+</main>
+
+<!-- Hidden file input reused by all upload buttons -->
 <input type="file" id="hidden-file-input" accept=".pdf,.txt,application/pdf,text/plain" style="display:none" />
 
 <script>
-// ── Upload helpers: read file → base64 → POST JSON ───────────────────────
+// ── Upload flow: signed-URL direct to Supabase, then finalize metadata ──
 const _fileInput = document.getElementById('hidden-file-input');
-let _ctx = null; // { kind: 'kb'|'doc'|'unit', project, docType, sizeLabel, label }
+let _ctx = null;
 
 function pickKb(project) {
   _ctx = { kind: 'kb', project, label: 'KB' };
@@ -537,89 +652,90 @@ function pickKb(project) {
   _fileInput.value = '';
   _fileInput.click();
 }
-
 function pickFile(project, docType, sizeLabel, label) {
   _ctx = { kind: 'doc', project, docType, sizeLabel, label };
   _fileInput.accept = '.pdf,application/pdf';
   _fileInput.value = '';
   _fileInput.click();
 }
-
 function pickUnitPlan(project) {
   const sizeInput = document.getElementById('size-' + project);
   const sizeLabel = (sizeInput?.value || '').trim();
-  if (!sizeLabel) {
-    alert('Enter a size label first (e.g. "1695 East")');
-    sizeInput?.focus();
-    return;
-  }
+  if (!sizeLabel) { alert('Enter a size label first (e.g. "1695 East")'); sizeInput?.focus(); return; }
   _ctx = { kind: 'unit', project, docType: 'unit_plan', sizeLabel, label: 'Unit Plan ' + sizeLabel };
   _fileInput.accept = '.pdf,application/pdf';
   _fileInput.value = '';
   _fileInput.click();
 }
 
-_fileInput.addEventListener('change', async (e) => {
-  const file = e.target.files?.[0];
-  if (!file || !_ctx) return;
-  const ctx = _ctx;
-  _ctx = null;
-
-  if (file.size > 50 * 1024 * 1024) {
-    alert('File too large (max 50 MB)');
-    return;
-  }
-
-  // Read file as base64 (strip data: prefix)
-  const base64 = await new Promise((resolve, reject) => {
-    const fr = new FileReader();
-    fr.onload = () => {
-      const s = String(fr.result || '');
-      const idx = s.indexOf(',');
-      resolve(idx >= 0 ? s.slice(idx + 1) : s);
-    };
-    fr.onerror = () => reject(fr.error);
-    fr.readAsDataURL(file);
-  });
-
-  const action = ctx.kind === 'kb' ? 'upload-kb' : 'upload-doc';
-  const payload = {
-    project: ctx.project,
-    filename: file.name,
-    mimetype: file.type || (file.name.toLowerCase().endsWith('.pdf') ? 'application/pdf' : 'text/plain'),
-    base64_content: base64,
-  };
-  if (ctx.kind !== 'kb') {
-    payload.doc_type = ctx.docType;
-    if (ctx.sizeLabel) payload.size_label = ctx.sizeLabel;
-  }
-
-  const btn = document.activeElement;
+async function uploadFile(ctx, file, btn) {
+  if (file.size > 50 * 1024 * 1024) { alert('File too large (max 50 MB)'); return; }
   const oldText = btn?.textContent;
-  if (btn && btn.tagName === 'BUTTON') { btn.disabled = true; btn.textContent = 'Uploading…'; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Signing…'; }
+
+  const isKb = ctx.kind === 'kb';
+  const mimetype = file.type || (file.name.toLowerCase().endsWith('.pdf') ? 'application/pdf' : 'text/plain');
 
   try {
-    const r = await fetch('?action=' + action, {
+    // 1. Get signed upload URL from our backend
+    const signReq = { project: ctx.project, filename: file.name, is_kb: isKb };
+    if (!isKb) {
+      signReq.doc_type = ctx.docType;
+      if (ctx.sizeLabel) signReq.size_label = ctx.sizeLabel;
+    }
+    const signRes = await fetch('?action=upload-sign', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(signReq),
     });
-    const data = await r.json();
-    if (!r.ok || !data.ok) {
-      alert('Upload failed: ' + (data.error || r.status));
-      if (btn && btn.tagName === 'BUTTON') { btn.disabled = false; btn.textContent = oldText; }
-      return;
+    const sign = await signRes.json();
+    if (!signRes.ok || !sign.ok) throw new Error(sign.error || 'sign failed');
+
+    // 2. PUT file directly to Supabase storage (bypasses Vercel body limit)
+    if (btn) btn.textContent = 'Uploading…';
+    const putRes = await fetch(sign.uploadPath, {
+      method: 'PUT',
+      headers: { 'Content-Type': mimetype, 'x-upsert': 'true' },
+      body: file,
+    });
+    if (!putRes.ok) {
+      const errText = await putRes.text().catch(() => '');
+      throw new Error('Storage upload ' + putRes.status + ': ' + errText.slice(0, 200));
     }
-    if (ctx.kind === 'kb') {
-      alert('KB uploaded: ' + data.extractedChars + ' chars extracted for ' + ctx.project);
-    } else {
-      alert(ctx.label + ' uploaded for ' + ctx.project);
+
+    // 3. Finalize — record metadata + (for KB) extract text
+    if (btn) btn.textContent = isKb ? 'Extracting…' : 'Saving…';
+    const finReq = {
+      project: ctx.project, filename: file.name, mimetype,
+      storage_path: sign.storagePath, public_url: sign.publicUrl, is_kb: isKb,
+    };
+    if (!isKb) {
+      finReq.doc_type = ctx.docType;
+      if (ctx.sizeLabel) finReq.size_label = ctx.sizeLabel;
     }
+    const finRes = await fetch('?action=upload-finalize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(finReq),
+    });
+    const fin = await finRes.json();
+    if (!finRes.ok || !fin.ok) throw new Error(fin.error || 'finalize failed');
+
+    if (isKb) alert('KB uploaded: ' + fin.extractedChars + ' chars extracted for ' + ctx.project);
+    else alert(ctx.label + ' uploaded for ' + ctx.project);
     location.reload();
   } catch (err) {
     alert('Upload error: ' + err.message);
-    if (btn && btn.tagName === 'BUTTON') { btn.disabled = false; btn.textContent = oldText; }
+    if (btn) { btn.disabled = false; btn.textContent = oldText; }
   }
+}
+
+_fileInput.addEventListener('change', async (e) => {
+  const file = e.target.files?.[0];
+  if (!file || !_ctx) return;
+  const ctx = _ctx; _ctx = null;
+  const btn = document.activeElement?.tagName === 'BUTTON' ? document.activeElement : null;
+  await uploadFile(ctx, file, btn);
 });
 </script>
 </body></html>`;
@@ -635,54 +751,35 @@ async function renderEditForm(project: string, message: string = ""): Promise<st
 <html><head>
 <meta charset="utf-8">
 <title>Edit ${esc(project)} Offer Details — ASBL CRM</title>
-<style>
-* { box-sizing: border-box; }
-body { font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f7; color: #1d1d1f; margin: 0; padding: 24px; max-width: 1100px; margin: 0 auto; }
-h1 { font-size: 22px; margin: 0 0 4px; font-weight: 600; }
-.sub { color: #666; font-size: 13px; margin-bottom: 20px; }
-.card { background: white; border-radius: 12px; padding: 24px; border: 1px solid #e5e5ea; }
-.help { font-size: 12.5px; color: #555; margin-bottom: 16px; line-height: 1.5; padding: 12px 14px; background: #fafbfc; border-left: 3px solid #007aff; border-radius: 4px; }
-label { display: block; font-weight: 600; margin: 12px 0 6px; font-size: 13px; }
-textarea { width: 100%; min-height: 600px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px; line-height: 1.5; padding: 14px; border: 1px solid #d1d1d6; border-radius: 8px; resize: vertical; }
-.actions { margin-top: 16px; display: flex; gap: 12px; align-items: center; }
-button { background: #007aff; color: white; border: none; padding: 10px 22px; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; }
-button:hover { background: #0066d6; }
-.btn-secondary { background: white; color: #1d1d1f; border: 1px solid #d1d1d6; }
-.btn-secondary:hover { background: #f5f5f7; }
-.flash { padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 13px; }
-.flash-success { background: #34c75914; color: #1f6f3a; border: 1px solid #34c75940; }
-.flash-error { background: #ff3b3014; color: #b71c1c; border: 1px solid #ff3b3040; }
-a { color: #007aff; text-decoration: none; }
-a:hover { text-decoration: underline; }
-.meta { font-size: 12px; color: #888; margin-top: 8px; }
-code { background: #f0f0f3; padding: 2px 5px; border-radius: 4px; font-size: 12px; }
-</style>
-</head><body>
-<h1>Edit Offer Details — ${esc(project)}</h1>
-<div class="sub">
-  <a href="?view=dashboard">← back to dashboard</a> · last updated: ${esc(updated)}
-</div>
+<link rel="preconnect" href="https://rsms.me/">
+<link rel="stylesheet" href="https://rsms.me/inter/inter.css">
+${SHARED_STYLE}
+</head><body class="page-narrow">
+<header class="topbar">
+  <div class="brand"><a href="?view=dashboard">ASBL CRM</a></div>
+  <nav><a href="?view=dashboard">← Dashboard</a></nav>
+</header>
+<main class="container">
+  <h1 class="page-title">Edit Offer Details — ${esc(project)}</h1>
+  <p class="page-sub">Last updated: ${esc(updated)}</p>
 
-${message ? `<div class="flash ${message.startsWith("Saved") ? "flash-success" : "flash-error"}">${esc(message)}</div>` : ""}
+  ${message ? `<div class="flash ${message.startsWith("Saved") ? "flash-success" : "flash-error"}">${esc(message)}</div>` : ""}
 
-<div class="card">
-  <div class="help">
-    Write the <strong>offer explanation</strong> for ${esc(project)} below — pricing offers, rental schemes,
-    pre-EMI offers, limited-time deals, etc. The bot will use this when a customer asks about offers for this
-    project. Static project KBs (overview, location, master plan) are uploaded separately to the Anandita
-    agent — this is only for offer details.
-  </div>
-  <form method="POST" action="?action=save-facts">
-    <input type="hidden" name="project" value="${esc(project)}" />
-    <label for="facts_text">Offer details (size: ${(text.length / 1024).toFixed(1)} KB)</label>
-    <textarea id="facts_text" name="facts_text" placeholder="# ${esc(project)} — OFFERS
+  <div class="card">
+    <div class="card-help">
+      Write the <strong>offer explanation</strong> for ${esc(project)} below — rental schemes, pre-EMI offers, limited-time deals. Stored in <code>project_facts.facts_text</code>, separate from the KB upload (Section 5). Uploading a new KB will <em>not</em> overwrite this.
+    </div>
+    <form method="POST" action="?action=save-facts">
+      <input type="hidden" name="project" value="${esc(project)}" />
+      <label class="field-label">Offer details (current size: ${(text.length / 1024).toFixed(1)} KB)</label>
+      <textarea name="facts_text" placeholder="# ${esc(project)} — OFFERS
 
 ## Active Offer
 - Name: <e.g. Rental Offer>
 - What it is: <plain-language explainer the bot can read out>
 - Eligibility: <who qualifies>
-- Booking amount: <e.g. ₹10L>
-- Returns / discount: <e.g. ₹50/sqft/month till Dec 2026>
+- Booking amount: <e.g. Rs. 10L>
+- Returns / discount: <e.g. Rs. 50/sqft/month till Dec 2026>
 - Validity: <until when>
 - Key terms: <any caveats>
 
@@ -694,13 +791,55 @@ ${message ? `<div class="flash ${message.startsWith("Saved") ? "flash-success" :
 - If asked about the rental offer, explain in 2-3 lines and offer to share the calculation for their unit size.
 - Always confirm exact terms over a call with the executive.
 ">${esc(text)}</textarea>
-    <div class="actions">
-      <button type="submit">Save offer details</button>
-      <a href="?view=dashboard" class="btn-secondary" style="text-decoration:none;padding:10px 22px;border-radius:8px;border:1px solid #d1d1d6;color:#1d1d1f;background:white">Cancel</a>
-      <span class="meta">Saving will overwrite the current offer details for this project.</span>
+      <div class="actions">
+        <button type="submit" class="btn-primary">Save offer details</button>
+        <a href="?view=dashboard" class="btn-secondary">Cancel</a>
+        <span class="muted" style="margin-left:auto">Saving overwrites the current offer text for this project.</span>
+      </div>
+    </form>
+  </div>
+</main>
+</body></html>`;
+}
+
+// ── Render edit-bot-prompt page ────────────────────────────────────────────
+async function renderEditPrompt(message: string = ""): Promise<string> {
+  const row = await getBotSetting("system_prompt");
+  const isOverride = !!(row?.value && row.value.trim().length > 200);
+  const text = isOverride ? row!.value : ANANDITA_SYSTEM_PROMPT;
+  const updated = row?.updated_at ? new Date(row.updated_at).toLocaleString("en-IN") : "—";
+
+  return `<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>Edit Bot Prompt — ASBL CRM</title>
+${SHARED_STYLE}
+</head><body class="page-narrow">
+<header class="topbar">
+  <div class="brand"><a href="?view=dashboard">ASBL CRM</a></div>
+  <nav><a href="?view=dashboard">← Dashboard</a></nav>
+</header>
+<main class="container">
+  <h1 class="page-title">Bot System Prompt</h1>
+  <p class="page-sub">This is the live Gemini 3 Pro instruction set. Saving here updates the bot <strong>instantly</strong> — no redeploy. Active source: <strong>${isOverride ? "DB override" : "hardcoded default"}</strong>${isOverride ? ` · last edited ${esc(updated)}` : ""}.</p>
+
+  ${message ? `<div class="flash ${message.startsWith("Saved") ? "flash-success" : "flash-error"}">${esc(message)}</div>` : ""}
+
+  <div class="card">
+    <div class="card-help">
+      <strong>What goes here:</strong> Persona, banned phrases, intent labels, JSON output format. The relay layer wraps every customer message with <code>&lt;CUSTOMER&gt;</code>, <code>&lt;PROJECT_CONTEXT&gt;</code>, <code>&lt;CONVERSATION_HISTORY&gt;</code>, <code>&lt;USER_MESSAGE&gt;</code> blocks before sending to the bot. The bot must output strict JSON: <code>{"intent","flags","project","doc_to_send","reply"}</code>.
     </div>
-  </form>
-</div>
+    <form method="POST" action="?action=save-prompt">
+      <label class="field-label">System prompt (current size: ${(text.length / 1024).toFixed(1)} KB)</label>
+      <textarea name="prompt" class="prompt-textarea" spellcheck="false">${esc(text)}</textarea>
+      <div class="actions">
+        <button type="submit" class="btn-primary">Save prompt</button>
+        <a href="?view=dashboard" class="btn-secondary">Cancel</a>
+        ${isOverride ? `<form method="POST" action="?action=reset-prompt" style="display:inline;margin-left:auto" onsubmit="return confirm('Discard your override and revert to the hardcoded default?')"><button type="submit" class="btn-danger">Reset to default</button></form>` : ""}
+      </div>
+    </form>
+  </div>
+</main>
 </body></html>`;
 }
 
@@ -737,6 +876,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     } catch (err: any) {
       return res.status(500).send(`<pre>Dashboard error: ${err.message}</pre>`);
     }
+  }
+
+  // Edit bot prompt view
+  if (req.method === "GET" && req.query.view === "edit-prompt") {
+    const flash = (req.query.msg as string) || "";
+    const html = await renderEditPrompt(flash);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).send(html);
   }
 
   // Edit KB form (HTML)
@@ -1043,6 +1191,138 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       console.error(`[test-gemini] failed: ${err.message}`);
       return res.status(500).json({ error: err.message, elapsedMs: Date.now() - t0 });
     }
+  }
+
+  // ─── Step 1 of the large-file upload flow: get a signed upload URL ──────
+  // POST { project, doc_type, filename, size_label?, is_kb? }
+  //   → { uploadPath, token, storagePath, publicUrl }
+  // The browser then PUTs the file directly to `uploadPath`, bypassing
+  // Vercel's 4.5 MB request body limit. After upload, browser calls
+  // ?action=upload-finalize with the storagePath to record the metadata.
+  if (req.method === "POST" && req.query.action === "upload-sign") {
+    try {
+      const body = req.body as any;
+      const project = String(body.project || "").toUpperCase();
+      const isKb = !!body.is_kb;
+      const docType = isKb ? "kb_source" : String(body.doc_type || "").toLowerCase();
+      const filename = String(body.filename || "upload");
+      const sizeLabel = body.size_label ? String(body.size_label) : null;
+
+      if (!KNOWN_PROJECTS.includes(project as any)) {
+        return res.status(400).json({ error: `Unknown project: ${project}` });
+      }
+      if (!isKb) {
+        const VALID = ["master_plan", "floor_plan", "unit_plan", "price_sheet", "payment_structure", "brochure", "specifications", "amenities"];
+        if (!VALID.includes(docType)) return res.status(400).json({ error: `Unknown doc_type: ${docType}` });
+        if (docType === "unit_plan" && !sizeLabel) {
+          return res.status(400).json({ error: "size_label required for unit_plan" });
+        }
+      }
+
+      const signed = await createSignedUploadUrl({ project, docType, filename, sizeLabel });
+      return res.status(200).json({ ok: true, ...signed });
+    } catch (err: any) {
+      console.error(`[upload-sign] failed: ${err.message}`);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── Step 2: finalize the upload (after browser has PUT the file) ───────
+  // POST { project, filename, mimetype, storage_path, public_url, is_kb,
+  //        doc_type?, size_label? }
+  // For KB uploads: downloads the file from Supabase, extracts text,
+  // saves to project_facts.kb_text. For docs: just inserts a project_documents row.
+  if (req.method === "POST" && req.query.action === "upload-finalize") {
+    try {
+      const body = req.body as any;
+      const project = String(body.project || "").toUpperCase();
+      const filename = String(body.filename || "");
+      const mimeType = String(body.mimetype || "application/octet-stream");
+      const storagePath = String(body.storage_path || "");
+      const publicUrl = String(body.public_url || "");
+      const isKb = !!body.is_kb;
+
+      if (!KNOWN_PROJECTS.includes(project as any)) {
+        return res.status(400).json({ error: `Unknown project: ${project}` });
+      }
+      if (!storagePath) return res.status(400).json({ error: "storage_path required" });
+
+      if (isKb) {
+        // Download + extract text
+        const buf = await downloadFromStorage(storagePath);
+        let extractedText = "";
+        if (mimeType === "text/plain" || filename.toLowerCase().endsWith(".txt")) {
+          extractedText = buf.toString("utf-8");
+        } else if (mimeType === "application/pdf" || filename.toLowerCase().endsWith(".pdf")) {
+          extractedText = await extractTextFromPDF(buf);
+          if (!extractedText) {
+            return res.status(400).json({ error: "PDF text extraction returned empty (image-only PDF?)" });
+          }
+        } else {
+          return res.status(400).json({ error: `Unsupported mimetype: ${mimeType}` });
+        }
+        const saveRes = await saveProjectKb(project, extractedText, publicUrl);
+        if (!saveRes.ok) return res.status(500).json({ error: `Save failed: ${saveRes.error}` });
+        return res.status(200).json({ ok: true, project, extractedChars: extractedText.length, publicUrl });
+      }
+
+      // Document upload: just insert the row
+      const docType = String(body.doc_type || "").toLowerCase();
+      const sizeLabel = body.size_label ? String(body.size_label) : null;
+      const VALID = ["master_plan", "floor_plan", "unit_plan", "price_sheet", "payment_structure", "brochure", "specifications", "amenities"];
+      if (!VALID.includes(docType)) return res.status(400).json({ error: `Unknown doc_type: ${docType}` });
+
+      const insertBody: any = { project, doc_type: docType, filename, url: publicUrl };
+      if (sizeLabel) insertBody.size_label = sizeLabel;
+
+      const insRes = await fetch(`${SUPABASE_URL}/rest/v1/project_documents`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          apikey: SUPABASE_KEY,
+          Authorization: `Bearer ${SUPABASE_KEY}`,
+          Prefer: "return=representation",
+        },
+        body: JSON.stringify(insertBody),
+      });
+      if (!insRes.ok) {
+        return res.status(500).json({ error: `DB insert failed: ${(await insRes.text()).slice(0, 200)}` });
+      }
+      return res.status(200).json({ ok: true, project, docType, sizeLabel, publicUrl, record: await insRes.json() });
+    } catch (err: any) {
+      console.error(`[upload-finalize] failed: ${err.message}`);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── Save the bot's Gemini system prompt (live — no redeploy needed) ────
+  if (req.method === "POST" && req.query.action === "save-prompt") {
+    const body = parseFormBody(req.body);
+    const prompt = String(body.prompt || "");
+    if (prompt.trim().length < 200) {
+      return res.status(400).send("Prompt is too short (must be > 200 chars).");
+    }
+    const result = await setBotSetting("system_prompt", prompt);
+    if (!result.ok) {
+      res.setHeader("Location", `?view=edit-prompt&msg=${encodeURIComponent("Save failed: " + result.error)}`);
+    } else {
+      res.setHeader("Location", `?view=edit-prompt&msg=${encodeURIComponent("Saved (" + (prompt.length / 1024).toFixed(1) + " KB). The bot will use this prompt on the next message.")}`);
+    }
+    return res.status(303).end();
+  }
+
+  // ─── Reset prompt to hardcoded default (deletes DB override) ────────────
+  if (req.method === "POST" && req.query.action === "reset-prompt") {
+    try {
+      await fetch(`${SUPABASE_URL}/rest/v1/bot_settings?key=eq.system_prompt`, {
+        method: "DELETE",
+        headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, Prefer: "return=minimal" },
+      });
+      res.setHeader("Location", `?view=edit-prompt&msg=${encodeURIComponent("Reset to hardcoded default.")}`);
+    } catch (err: any) {
+      res.setHeader("Location", `?view=edit-prompt&msg=${encodeURIComponent("Reset failed: " + err.message)}`);
+    }
+    return res.status(303).end();
   }
 
   // ─── Delete a document row by id ────────────────────────────────────────

@@ -91,3 +91,63 @@ export function decodeBase64Text(base64: string): string {
 export function decodeBase64Buffer(base64: string): Buffer {
   return Buffer.from(base64, "base64");
 }
+
+/**
+ * Create a Supabase Storage signed-upload URL so the browser can PUT
+ * a large file DIRECTLY to Supabase (bypassing Vercel's 4.5 MB body cap).
+ * Returns the path under Supabase Storage's REST API.
+ */
+export async function createSignedUploadUrl(opts: {
+  project: string;
+  docType: string;
+  filename: string;
+  sizeLabel?: string | null;
+}): Promise<{ uploadPath: string; token: string; storagePath: string; publicUrl: string }> {
+  const projectSlug = opts.project.toLowerCase();
+  const docTypeSlug = opts.docType.toLowerCase();
+  const safe = (s: string) => s.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const ts = Date.now();
+
+  const pathParts = [projectSlug, docTypeSlug];
+  if (opts.sizeLabel) pathParts.push(safe(opts.sizeLabel));
+  pathParts.push(`${ts}-${safe(opts.filename)}`);
+  const storagePath = pathParts.join("/");
+
+  // Supabase Storage signed-upload-URL endpoint
+  const r = await fetch(
+    `${SUPABASE_URL}/storage/v1/object/upload/sign/${BUCKET}/${storagePath}`,
+    {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({}),
+    }
+  );
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`signed-url ${r.status}: ${t.slice(0, 200)}`);
+  }
+  const data = await r.json();
+  // data.url is like "/object/upload/sign/<bucket>/<path>?token=..."
+  const uploadPath = `${SUPABASE_URL}/storage/v1${data.url}`;
+  const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${storagePath}`;
+  return { uploadPath, token: data.token, storagePath, publicUrl };
+}
+
+/** Download a previously-uploaded object from Supabase Storage as a Buffer. */
+export async function downloadFromStorage(storagePath: string): Promise<Buffer> {
+  const r = await fetch(
+    `${SUPABASE_URL}/storage/v1/object/${BUCKET}/${storagePath}`,
+    {
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
+    }
+  );
+  if (!r.ok) {
+    throw new Error(`storage download ${r.status}: ${await r.text()}`);
+  }
+  const ab = await r.arrayBuffer();
+  return Buffer.from(ab);
+}

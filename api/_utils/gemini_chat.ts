@@ -13,8 +13,26 @@
  *   - Web grounding (Google Search) available natively
  */
 
+import { getBotSetting } from "./bot_settings";
+
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3-pro-preview";
+
+/**
+ * Resolve the active system prompt — DB override (bot_settings.system_prompt)
+ * if present, else fall through to ANANDITA_SYSTEM_PROMPT below.
+ * Failure (DB unreachable) falls back to the hardcoded default — bot keeps
+ * working even if Supabase blips.
+ */
+async function resolveSystemPrompt(): Promise<string> {
+  try {
+    const row = await getBotSetting("system_prompt");
+    if (row?.value && row.value.trim().length > 200) {
+      return row.value;
+    }
+  } catch {}
+  return ANANDITA_SYSTEM_PROMPT;
+}
 
 const GEMINI_URL = (model: string) =>
   `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
@@ -325,8 +343,9 @@ export async function callGeminiRaw(
   const maxOutputTokens = opts.maxOutputTokens ?? 6000;
   const enableGrounding = opts.enableGrounding ?? true;
 
+  const systemPrompt = await resolveSystemPrompt();
   const body: any = {
-    system_instruction: { parts: [{ text: ANANDITA_SYSTEM_PROMPT }] },
+    system_instruction: { parts: [{ text: systemPrompt }] },
     contents: [{ role: "user", parts: [{ text: userMessage }] }],
     generationConfig: {
       temperature,
