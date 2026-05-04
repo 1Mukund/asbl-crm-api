@@ -94,21 +94,41 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     const body = (req.body || {}) as any;
     const event = String(body.event || "").toLowerCase();
-    console.log(`[InHouse Posthook] Event=${event} payload-keys=${Object.keys(body).join(",")}`);
+    // Tag every log line in this request with the call_sid so log
+    // interleaving (multiple webhooks in flight) is unambiguous.
+    const tag = body.call_sid || body.call_id || "no-id";
+    console.log(`[InHouse Posthook ${tag}] Event=${event} payload-keys=${Object.keys(body).join(",")}`);
 
     // ── Lenient field extraction (covers both call_completed and posthook_received) ──
     const callId: string =
       body.call_sid || body.call_id || body.external_schedule_id || "";
     const phoneRaw: string =
       body.phone_number || body.phone || body.to || "";
-    const durationSecs: number = Number(
+
+    // Duration: prefer explicit fields, else compute from started_at/ended_at.
+    // The voice-bot's call_completed payload has timestamps but no
+    // duration_seconds field, so this fallback is normal-path, not an edge case.
+    let durationSecs: number = Number(
       body.duration_seconds ?? body.call_duration_secs ?? body.duration ?? 0
     );
+    if (!durationSecs && body.started_at && body.ended_at) {
+      const ms = new Date(body.ended_at).getTime() - new Date(body.started_at).getTime();
+      if (Number.isFinite(ms) && ms > 0) durationSecs = Math.round(ms / 1000);
+    }
+
     const summary: string = body.summary || "";
     const fullText: string = body.full_text || formatTranscript(body.transcript || body.transcription);
     const recordingUrl: string =
       body.recording_url || body.recording_link || "";
-    const rawSlug: string = body.zoho_status || body.call_result_slug || body.status || "";
+
+    // Status sources: voice-bot uses `call_outcome`; legacy Arrowhead used
+    // `call_result_slug`; internal posthook format uses `zoho_status`.
+    const rawSlug: string =
+      body.zoho_status ||
+      body.call_outcome ||
+      body.call_result_slug ||
+      body.status ||
+      "";
 
     if (!callId && !phoneRaw) {
       return res.status(400).json({ error: "Missing call_sid / phone_number" });
@@ -183,7 +203,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     );
 
     console.log(
-      `[InHouse Posthook] Lead ${lead.id} updated → ${callStatus} | duration=${durationSecs}s | call_id=${callId}`
+      `[InHouse Posthook ${callId || "no-id"}] Lead ${lead.id} updated → ${callStatus} | duration=${durationSecs}s | rawSlug=${rawSlug || "(none)"}`
     );
 
     return res.status(200).json({
