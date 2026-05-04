@@ -907,6 +907,66 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── Meta token health check ────────────────────────────────────────────
+  // GET ?action=meta-token-check → introspects META_PAGE_ACCESS_TOKEN via
+  // Graph API debug_token + /me, returns expiry, app_id, granted scopes,
+  // and a clear OK / EXPIRED / INVALID verdict.
+  if (req.method === "GET" && req.query.action === "meta-token-check") {
+    const token = process.env.META_PAGE_ACCESS_TOKEN || "";
+    if (!token || token === "REPLACE_WITH_YOUR_PAGE_ACCESS_TOKEN") {
+      return res.status(500).json({ verdict: "MISSING", error: "META_PAGE_ACCESS_TOKEN not set in Vercel env" });
+    }
+    try {
+      // 1. /me — fastest token-validity probe
+      const meRes = await fetch(`https://graph.facebook.com/v19.0/me?access_token=${encodeURIComponent(token)}`);
+      const meBody = await meRes.json();
+      if (!meRes.ok || meBody.error) {
+        const errCode = meBody?.error?.code;
+        const errSub = meBody?.error?.error_subcode;
+        const errMsg = meBody?.error?.message || "unknown";
+        const verdict = errCode === 190 ? "EXPIRED_OR_INVALID" : "ERROR";
+        return res.status(200).json({
+          verdict,
+          httpStatus: meRes.status,
+          error: { code: errCode, subcode: errSub, message: errMsg },
+          hint: errCode === 190
+            ? "Meta token expired or revoked. Generate a new long-lived Page Access Token (System User recommended for permanence)."
+            : null,
+        });
+      }
+      // 2. debug_token — shows expiry, type, scopes
+      let debug: any = null;
+      try {
+        const dRes = await fetch(`https://graph.facebook.com/v19.0/debug_token?input_token=${encodeURIComponent(token)}&access_token=${encodeURIComponent(token)}`);
+        const dBody = await dRes.json();
+        if (dBody?.data) {
+          const d = dBody.data;
+          const expiresAt = d.expires_at ? new Date(d.expires_at * 1000).toISOString() : null;
+          const dataAccessExpiresAt = d.data_access_expires_at ? new Date(d.data_access_expires_at * 1000).toISOString() : null;
+          const isExpired = d.expires_at && d.expires_at * 1000 < Date.now();
+          debug = {
+            isValid: !!d.is_valid,
+            type: d.type,
+            appId: d.app_id,
+            userId: d.user_id,
+            scopes: d.scopes,
+            expiresAt,
+            dataAccessExpiresAt,
+            isExpired,
+            issuedAt: d.issued_at ? new Date(d.issued_at * 1000).toISOString() : null,
+          };
+        }
+      } catch {}
+      return res.status(200).json({
+        verdict: "OK",
+        page: { id: meBody.id, name: meBody.name },
+        debug,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ verdict: "FETCH_ERROR", error: err.message });
+    }
+  }
+
   // ─── Test Gemini directly (no Periskope/Zoho side effects) ─────────────
   // POST { project, message, customerName?, history? } → returns the same
   // structured Gemini reply the live bot would produce. Useful for verifying
