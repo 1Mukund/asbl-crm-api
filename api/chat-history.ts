@@ -1110,40 +1110,86 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return res.status(404).json({ error: "Lead not found", searched: { id: leadId, phone } });
       }
 
-      // Fetch latest 5 Notes
+      // ── Fetch Notes — try related-list first, then Notes/search fallback ──
       let notes: any[] = [];
+      const notesDebug: any = {};
       try {
-        const nr = await fetch(`${ZOHO_API_BASE}/Leads/${lead.id}/Notes?sort_by=Created_Time&sort_order=desc&per_page=5`, {
-          headers: { Authorization: `Zoho-oauthtoken ${token}` },
-        });
-        const nj = await nr.json() as any;
-        notes = (nj?.data || []).map((n: any) => ({
-          id: n.id,
-          title: n.Note_Title,
-          content: (n.Note_Content || "").slice(0, 500),
-          created_at: n.Created_Time,
-        }));
-      } catch {}
+        const nr = await fetch(
+          `${ZOHO_API_BASE}/Leads/${lead.id}/Notes?sort_by=Created_Time&sort_order=desc&per_page=10`,
+          { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
+        );
+        notesDebug.related_list_status = nr.status;
+        if (nr.ok) {
+          const nj = await nr.json() as any;
+          notes = (nj?.data || []).map((n: any) => ({
+            id: n.id,
+            title: n.Note_Title,
+            content: (n.Note_Content || "").slice(0, 500),
+            created_at: n.Created_Time,
+          }));
+        } else if (nr.status !== 204) {
+          notesDebug.related_list_error = (await nr.text()).slice(0, 200);
+        }
+      } catch (e: any) { notesDebug.related_list_exception = e.message; }
 
-      // Fetch latest 5 Calls (related list)
+      // Fallback: Notes/search by Parent_Id
+      if (!notes.length) {
+        try {
+          const sr = await fetch(
+            `${ZOHO_API_BASE}/Notes/search?criteria=(Parent_Id:equals:${lead.id})&sort_by=Created_Time&sort_order=desc&per_page=10`,
+            { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
+          );
+          notesDebug.search_status = sr.status;
+          if (sr.ok) {
+            const sj = await sr.json() as any;
+            notes = (sj?.data || []).map((n: any) => ({
+              id: n.id,
+              title: n.Note_Title,
+              content: (n.Note_Content || "").slice(0, 500),
+              created_at: n.Created_Time,
+            }));
+          } else if (sr.status !== 204) {
+            notesDebug.search_error = (await sr.text()).slice(0, 200);
+          }
+        } catch (e: any) { notesDebug.search_exception = e.message; }
+      }
+
+      // ── Fetch recent Calls — Calls aren't lead-linked here, search by recency ──
       let calls: any[] = [];
+      const callsDebug: any = {};
       try {
-        const cr = await fetch(`${ZOHO_API_BASE}/Leads/${lead.id}/Calls?fields=id,Subject,Call_Type,Call_Duration,Call_Start_Time,Call_Status,Description&per_page=5`, {
-          headers: { Authorization: `Zoho-oauthtoken ${token}` },
-        });
-        const cj = await cr.json() as any;
-        calls = (cj?.data || []).map((c: any) => ({
-          id: c.id,
-          subject: c.Subject,
-          type: c.Call_Type,
-          duration: c.Call_Duration,
-          start_time: c.Call_Start_Time,
-          status: c.Call_Status,
-          description: (c.Description || "").slice(0, 300),
-        }));
-      } catch {}
+        const cr = await fetch(
+          `${ZOHO_API_BASE}/Calls?fields=id,Subject,Call_Type,Call_Duration,Call_Start_Time,Call_Status,Call_Result,Description&sort_by=Created_Time&sort_order=desc&per_page=20`,
+          { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
+        );
+        callsDebug.list_status = cr.status;
+        if (cr.ok) {
+          const cj = await cr.json() as any;
+          // Filter to calls referencing this lead in description (note: Zoho org doesn't support Who_Id for leads)
+          const leadPhone = String(lead.Mobile || "").replace(/^\+/, "");
+          calls = (cj?.data || [])
+            .filter((c: any) => {
+              const desc = String(c.Description || "");
+              const sub = String(c.Subject || "");
+              return desc.includes(leadPhone) || sub.includes(lead.Project_Lead_ID || "") || sub.includes(lead.Master_Lead_ID || "");
+            })
+            .slice(0, 5)
+            .map((c: any) => ({
+              id: c.id,
+              subject: c.Subject,
+              type: c.Call_Type,
+              duration: c.Call_Duration,
+              start_time: c.Call_Start_Time,
+              status: c.Call_Status,
+              call_result: c.Call_Result,
+              description: (c.Description || "").slice(0, 300),
+            }));
+        } else if (cr.status !== 204) {
+          callsDebug.list_error = (await cr.text()).slice(0, 200);
+        }
+      } catch (e: any) { callsDebug.list_exception = e.message; }
 
-      return res.status(200).json({ lead, notes, calls });
+      return res.status(200).json({ lead, notes, calls, _debug: { notes: notesDebug, calls: callsDebug } });
     } catch (err: any) {
       return res.status(500).json({ error: err.message });
     }
