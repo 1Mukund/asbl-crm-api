@@ -60,6 +60,28 @@ export async function findLeadByArrowheadCallId(callId: string): Promise<any | n
   }
 }
 
+/** Look up a lead by Last_Inhouse_Call_ID — precise correlation for the
+ *  in-house voice bot's posthook (call_sid from voice-bot trigger response). */
+export async function findLeadByInhouseCallId(callId: string): Promise<any | null> {
+  const token = await getAccessToken();
+  try {
+    const res = await axios.get(`${ZOHO_API_BASE}/Leads/search`, {
+      headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      params: {
+        criteria: `(Last_Inhouse_Call_ID:equals:${callId})`,
+        fields: "id,First_Name,Last_Name,Mobile,Master_Lead_ID,Project_Lead_ID,ASBL_Project,Total_Call_Duration_Secs",
+      },
+    });
+    return res.data?.data?.[0] ?? null;
+  } catch (err: any) {
+    if (err.response?.status === 204) return null;
+    // If the custom field doesn't exist yet, Zoho throws — fall back gracefully
+    const detail = err.response?.data ?? err.message;
+    console.warn(`[findLeadByInhouseCallId] non-fatal: ${JSON.stringify(detail).slice(0, 200)}`);
+    return null;
+  }
+}
+
 export async function findLeadByPhone(phone: string): Promise<any | null> {
   const token = await getAccessToken();
   try {
