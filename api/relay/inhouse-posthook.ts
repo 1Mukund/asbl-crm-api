@@ -174,33 +174,39 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       );
     }
 
-    // ── 4. Call log + Note (fire-and-forget so webhook returns fast) ─────
+    // ── 4. Call log + Note ────────────────────────────────────────────────
+    // IMPORTANT: must AWAIT in Vercel serverless — fire-and-forget kills the
+    // outbound HTTP requests when the handler returns. (Earlier version had
+    // these as .catch() promises which silently lost half the writes.)
     const transcriptText = summary
       ? `${summary}\n\n--- Transcript ---\n${fullText}`
       : fullText;
 
-    createCallLog({
-      leadId: lead.id,
-      leadName,
-      externalId: callId,
-      callStatus,
-      durationSecs,
-      transcription: transcriptText || undefined,
-      recordingUrl: recordingUrl || undefined,
-    }).catch((err) =>
-      console.error(`[InHouse Posthook] createCallLog failed: ${err.message}`)
-    );
-
-    createCallNote({
-      leadId: lead.id,
-      externalId: callId,
-      callStatus,
-      durationSecs,
-      transcription: transcriptText || undefined,
-      recordingUrl: recordingUrl || undefined,
-    }).catch((err) =>
-      console.error(`[InHouse Posthook] createCallNote failed: ${err.message}`)
-    );
+    const [logRes, noteRes] = await Promise.allSettled([
+      createCallLog({
+        leadId: lead.id,
+        leadName,
+        externalId: callId,
+        callStatus,
+        durationSecs,
+        transcription: transcriptText || undefined,
+        recordingUrl: recordingUrl || undefined,
+      }),
+      createCallNote({
+        leadId: lead.id,
+        externalId: callId,
+        callStatus,
+        durationSecs,
+        transcription: transcriptText || undefined,
+        recordingUrl: recordingUrl || undefined,
+      }),
+    ]);
+    if (logRes.status === "rejected") {
+      console.error(`[InHouse Posthook ${callId}] createCallLog failed: ${logRes.reason?.message}`);
+    }
+    if (noteRes.status === "rejected") {
+      console.error(`[InHouse Posthook ${callId}] createCallNote failed: ${noteRes.reason?.message}`);
+    }
 
     console.log(
       `[InHouse Posthook ${callId || "no-id"}] Lead ${lead.id} updated → ${callStatus} | duration=${durationSecs}s | rawSlug=${rawSlug || "(none)"}`
