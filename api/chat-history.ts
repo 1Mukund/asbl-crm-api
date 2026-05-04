@@ -443,12 +443,18 @@ async function renderDashboard(): Promise<string> {
 
   const SINGLE_SLOTS: Array<{ key: string; label: string }> = [
     { key: "master_plan", label: "Master Plan" },
-    { key: "floor_plan", label: "Floor Plan" },
     { key: "price_sheet", label: "Price Sheet" },
     { key: "payment_structure", label: "Payment Structure" },
     { key: "brochure", label: "Brochure" },
     { key: "specifications", label: "Specifications" },
     { key: "amenities", label: "Amenities" },
+  ];
+
+  // Multi-PDF slots — one row per label (e.g. tower / unit size).
+  // The bot fuzzy-matches by label when a customer asks for a specific one.
+  const MULTI_SLOTS: Array<{ key: string; title: string; placeholder: string }> = [
+    { key: "floor_plan", title: "Floor Plans", placeholder: "tower label e.g. Tower A" },
+    { key: "unit_plan", title: "Unit Plans", placeholder: "size label e.g. 1695 East" },
   ];
 
   const renderDocSlot = (project: string, docKey: string, label: string) => {
@@ -472,27 +478,28 @@ async function renderDashboard(): Promise<string> {
     </div>`;
   };
 
-  const renderUnitPlans = (project: string) => {
-    const plans = docsByProj[project]?.unit_plan || [];
-    const list = plans.map((p) => `<tr>
+  const renderMultiSlot = (project: string, docType: string, title: string, placeholder: string) => {
+    const items = docsByProj[project]?.[docType] || [];
+    const labelHeader = docType === "floor_plan" ? "Tower" : "Size";
+    const list = items.map((p) => `<tr>
       <td>${esc(p.size_label || "—")}</td>
       <td><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.filename || "open")}</a></td>
       <td>
-        <form method="POST" action="?action=delete-doc&id=${esc(p.id)}" style="display:inline" onsubmit="return confirm('Delete unit plan ${esc(p.size_label)} for ${esc(project)}?')">
+        <form method="POST" action="?action=delete-doc&id=${esc(p.id)}" style="display:inline" onsubmit="return confirm('Delete ${esc(title)} ${esc(p.size_label || '')} for ${esc(project)}?')">
           <button type="submit" class="btn-delete">delete</button>
         </form>
       </td>
     </tr>`).join("");
 
     return `<div class="unit-plans">
-      <div class="doc-slot-label">Unit Plans <span class="${plans.length ? "ok" : "missing"}">${plans.length ? "●" : "○"}</span> <span style="color:#888;font-weight:normal">(${plans.length})</span></div>
-      ${plans.length ? `<table class="unit-table">
-        <tr><th>Size label</th><th>File</th><th></th></tr>
+      <div class="doc-slot-label">${esc(title)} <span class="${items.length ? "ok" : "missing"}">${items.length ? "●" : "○"}</span> <span style="color:#888;font-weight:normal">(${items.length})</span></div>
+      ${items.length ? `<table class="unit-table">
+        <tr><th>${esc(labelHeader)} label</th><th>File</th><th></th></tr>
         ${list}
-      </table>` : `<div class="empty-inline">no unit plans uploaded yet</div>`}
+      </table>` : `<div class="empty-inline">no ${esc(title.toLowerCase())} uploaded yet</div>`}
       <div class="add-unit-row">
-        <input type="text" id="size-${esc(project)}" placeholder="size label e.g. 1695 East" class="size-input" />
-        <button type="button" class="btn-upload" onclick="pickUnitPlan('${esc(project)}')">+ Add unit plan PDF</button>
+        <input type="text" id="multi-${esc(project)}-${esc(docType)}" placeholder="${esc(placeholder)}" class="size-input" />
+        <button type="button" class="btn-upload" onclick="pickMulti('${esc(project)}', '${esc(docType)}', '${esc(title)}')">+ Add ${esc(title.toLowerCase().slice(0, -1))} PDF</button>
       </div>
     </div>`;
   };
@@ -518,7 +525,7 @@ async function renderDashboard(): Promise<string> {
       <div class="doc-slots">
         ${SINGLE_SLOTS.map((s) => renderDocSlot(p, s.key, s.label)).join("")}
       </div>
-      ${renderUnitPlans(p)}
+      ${MULTI_SLOTS.map((m) => renderMultiSlot(p, m.key, m.title, m.placeholder)).join("")}
     </div>`)
     .join("");
 
@@ -660,11 +667,15 @@ function pickFile(project, docType, sizeLabel, label) {
   _fileInput.value = '';
   _fileInput.click();
 }
-function pickUnitPlan(project) {
-  const sizeInput = document.getElementById('size-' + project);
-  const sizeLabel = (sizeInput?.value || '').trim();
-  if (!sizeLabel) { alert('Enter a size label first (e.g. "1695 East")'); sizeInput?.focus(); return; }
-  _ctx = { kind: 'unit', project, docType: 'unit_plan', sizeLabel, label: 'Unit Plan ' + sizeLabel };
+function pickMulti(project, docType, title) {
+  const input = document.getElementById('multi-' + project + '-' + docType);
+  const sizeLabel = (input?.value || '').trim();
+  if (!sizeLabel) {
+    alert('Enter a label first (e.g. "Tower A" for floor plans, "1695 East" for unit plans)');
+    input?.focus();
+    return;
+  }
+  _ctx = { kind: 'multi', project, docType, sizeLabel, label: title + ' ' + sizeLabel };
   _fileInput.accept = '.pdf,application/pdf';
   _fileInput.value = '';
   _fileInput.click();
@@ -1004,8 +1015,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (!base64) return res.status(400).json({ error: "base64_content required" });
 
       // unit_plan REQUIRES size_label
-      if (docType === "unit_plan" && !sizeLabel) {
-        return res.status(400).json({ error: "size_label required for unit_plan (e.g. '1695 East')" });
+      if ((docType === "unit_plan" || docType === "floor_plan") && !sizeLabel) {
+        return res.status(400).json({ error: `size_label required for ${docType} (e.g. "Tower A" / "1695 East")` });
       }
 
       const upload = await uploadToStorage({
@@ -1216,8 +1227,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (!isKb) {
         const VALID = ["master_plan", "floor_plan", "unit_plan", "price_sheet", "payment_structure", "brochure", "specifications", "amenities"];
         if (!VALID.includes(docType)) return res.status(400).json({ error: `Unknown doc_type: ${docType}` });
-        if (docType === "unit_plan" && !sizeLabel) {
-          return res.status(400).json({ error: "size_label required for unit_plan" });
+        // Multi-slot doc types need a label so the bot can pick the right one
+        if ((docType === "unit_plan" || docType === "floor_plan") && !sizeLabel) {
+          return res.status(400).json({ error: `size_label required for ${docType} (e.g. "Tower A" / "1695 East")` });
         }
       }
 

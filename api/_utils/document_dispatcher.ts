@@ -61,18 +61,19 @@ export async function getDocumentFor(
     const rows = (await r.json()) as ProjectDoc[];
 
     if (rows?.length) {
-      // For unit_plan, try to match size_label using sizeHint
-      if (docType === "unit_plan") {
+      // For multi-slot doc types (unit_plan / floor_plan), try to match
+      // size_label fuzzily using the customer's message as a hint.
+      const isMulti = docType === "unit_plan" || docType === "floor_plan";
+      if (isMulti) {
         const hint = normSize(sizeHint);
         if (hint) {
-          // Best match: size_label normalised contains the hint, or hint contains it
           const matched = rows.find((row) => {
             const lbl = normSize(row.size_label);
             return lbl && (lbl.includes(hint) || hint.includes(lbl));
           });
           if (matched) return { ...matched, source: "table" };
         }
-        // No hint or no match → fall back to most recently uploaded unit plan
+        // No hint or no match → fall back to the most recently uploaded one
         return { ...rows[0], source: "table" };
       }
       return { ...rows[0], source: "table" };

@@ -631,9 +631,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const docTypeFromMsg =
         geminiOutput.docToSend || customerWordToDocType(message) || "brochure";
       try {
-        // For unit_plan, pass the raw message as a size hint so the dispatcher
-        // can match the right size (e.g. "1695 east floor plan" → 1695-East unit_plan)
-        const sizeHint = docTypeFromMsg === "unit_plan" ? message : null;
+        // For multi-slot doc types (unit_plan / floor_plan), pass the raw
+        // customer message as a hint so the dispatcher fuzzy-matches the right
+        // tower / unit-size variant (e.g. "Tower A floor plan" → Tower-A row).
+        const sizeHint =
+          (docTypeFromMsg === "unit_plan" || docTypeFromMsg === "floor_plan")
+            ? message
+            : null;
         const doc = await getDocumentFor(project, docTypeFromMsg, sizeHint);
         if (doc) {
           const captionMap: Record<string, string> = {
