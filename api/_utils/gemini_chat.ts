@@ -337,10 +337,10 @@ export async function callGeminiRaw(
 
   const model = opts.model || GEMINI_MODEL;
   const temperature = opts.temperature ?? 0.6;
-  // Gemini 3 Pro thinking-mode burns ~1000-1500 tokens before any visible
-  // output; cap too low → JSON gets truncated mid-reply → parser fails.
-  // 6000 leaves ~4500 for actual JSON output, plenty for any reply length.
-  const maxOutputTokens = opts.maxOutputTokens ?? 6000;
+  // Gemini 3 Pro thinking-mode burns ~1500-3000 tokens before any visible
+  // output (more for complex/grounding queries); cap too low → JSON gets
+  // truncated mid-reply → parser fails. 8000 keeps generous headroom.
+  const maxOutputTokens = opts.maxOutputTokens ?? 8000;
   const enableGrounding = opts.enableGrounding ?? true;
 
   const systemPrompt = await resolveSystemPrompt();
@@ -358,7 +358,7 @@ export async function callGeminiRaw(
     body.tools = [{ google_search: {} }];
   }
 
-  const TIMEOUT_MS = 25000;
+  const TIMEOUT_MS = 35000;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
 
@@ -388,8 +388,13 @@ export async function callGeminiRaw(
       .join("")
       .trim();
 
+    const finishReason = candidate?.finishReason || "unknown";
+    // Surface finishReason so MAX_TOKENS truncations are obvious in logs
+    if (finishReason && finishReason !== "STOP") {
+      console.warn(`[Gemini] finishReason=${finishReason} (text length=${text.length})`);
+    }
+
     if (!text) {
-      const finishReason = candidate?.finishReason || "unknown";
       throw new Error(`Gemini returned empty text (finishReason: ${finishReason})`);
     }
 

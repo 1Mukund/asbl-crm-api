@@ -201,14 +201,53 @@ function projectHintToProject(hint: string | null): Project | null {
   return null;
 }
 
-// ── Zoho: Get access token ────────────────────────────────────────────────────
+// ── Zoho: Get access token (with two-tier cache) ─────────────────────────────
+// Tier 1: module-level (warm Vercel invocations)
+// Tier 2: Supabase bot_settings (cold-start cross-invocation)
+// Without this, every webhook hit Zoho's OAuth /token endpoint fresh →
+// rate-limit errors ("too many requests continuously") under burst load.
+import { getBotSetting, setBotSetting } from "../_utils/bot_settings";
+
+let _zohoTokenCache: string | null = null;
+let _zohoTokenExpiry = 0;
+const ZOHO_TOKEN_KEY = "zoho_access_token_v1";
+
 async function getZohoToken(): Promise<string> {
+  const now = Date.now();
+
+  // 1. Module-level cache (warm)
+  if (_zohoTokenCache && now < _zohoTokenExpiry) return _zohoTokenCache;
+
+  // 2. Supabase-backed cache (across cold starts)
+  try {
+    const row = await getBotSetting(ZOHO_TOKEN_KEY);
+    if (row?.value) {
+      const parsed = JSON.parse(row.value);
+      if (parsed?.token && parsed?.expiry && now < parsed.expiry - 60_000) {
+        _zohoTokenCache = parsed.token;
+        _zohoTokenExpiry = parsed.expiry;
+        return parsed.token;
+      }
+    }
+  } catch {}
+
+  // 3. Refresh from Zoho
   const r = await fetch(
     `https://accounts.zoho.in/oauth/v2/token?grant_type=refresh_token&client_id=${ZOHO_CLIENT_ID}&client_secret=${ZOHO_CLIENT_SECRET}&refresh_token=${ZOHO_REFRESH_TOKEN}`,
     { method: "POST" }
   );
   const data = await r.json() as any;
   if (!data.access_token) throw new Error("Zoho token error: " + JSON.stringify(data));
+
+  const expiresInSec = Number(data.expires_in) || 3600;
+  // Pad by 2 min so we don't serve a token about to die
+  const expiry = now + (expiresInSec - 120) * 1000;
+  _zohoTokenCache = data.access_token;
+  _zohoTokenExpiry = expiry;
+
+  // Persist for cold-start invocations
+  setBotSetting(ZOHO_TOKEN_KEY, JSON.stringify({ token: data.access_token, expiry })).catch(() => {});
+
   return data.access_token;
 }
 
