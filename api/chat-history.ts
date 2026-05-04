@@ -447,6 +447,8 @@ async function renderDashboard(): Promise<string> {
     { key: "price_sheet", label: "Price Sheet" },
     { key: "payment_structure", label: "Payment Structure" },
     { key: "brochure", label: "Brochure" },
+    { key: "specifications", label: "Specifications" },
+    { key: "amenities", label: "Amenities" },
   ];
 
   const renderDocSlot = (project: string, docKey: string, label: string) => {
@@ -618,7 +620,7 @@ ${SHARED_STYLE}
     <h2>5. Project Document Library (KB + PDFs the bot sends on WhatsApp)</h2>
     <div class="card-help">
       <strong>KB</strong> — TXT or PDF. Text is auto-extracted and fed into the bot's Gemini prompt as <code>PROJECT_CONTEXT</code>. Replace anytime; latest upload wins.<br>
-      <strong>Master Plan / Floor Plan / Price Sheet / Payment Structure / Brochure</strong> — single PDF per project. The bot sends this file directly via Periskope when a customer asks.<br>
+      <strong>Master Plan / Floor Plan / Price Sheet / Payment Structure / Brochure / Specifications / Amenities</strong> — single PDF per project. The bot sends this file directly via Periskope when a customer asks.<br>
       <strong>Unit Plans</strong> — multiple PDFs, one per inventory size (e.g. <code>1695 East</code>). Bot matches by size label.<br>
       Files upload <strong>directly to Supabase Storage</strong> via signed URL — large PDFs (up to 50 MB) work without hitting Vercel's 4.5 MB request limit.
     </div>
