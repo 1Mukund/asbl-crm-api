@@ -606,19 +606,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // 1+2. Run Zoho lookup AND conversation history fetch in parallel —
     //      they're independent and account for ~1.5-2s sequentially.
-    let leadDetails: LeadDetails | null = null;
-    let zohoToken = "";
-    const zohoTask = (async () => {
+    const zohoTask: Promise<{ token: string; lead: LeadDetails | null }> = (async () => {
       try {
-        zohoToken = await getZohoToken();
-        leadDetails = await findLeadDetailsByPhone(phone, zohoToken);
+        const token = await getZohoToken();
+        const lead = await findLeadDetailsByPhone(phone, token);
+        return { token, lead };
       } catch (err: any) {
         console.error(`[Periskope Webhook] Zoho lookup failed: ${err.message}`);
+        return { token: "", lead: null };
       }
     })();
 
     const historyTask = getConversationContext(phone);
-    const [, conversation] = await Promise.all([zohoTask, historyTask]);
+    const [zohoResult, conversation] = await Promise.all([zohoTask, historyTask]);
+    const zohoToken = zohoResult.token;
+    const leadDetails: LeadDetails | null = zohoResult.lead;
 
     // 3. Resolve project (regex on message > Zoho field > last asked).
     //    Gemini may also identify the project itself from its output;
