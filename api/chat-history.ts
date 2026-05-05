@@ -532,7 +532,6 @@ async function renderDashboard(): Promise<string> {
   return `<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="30">
 <title>ASBL CRM Dashboard</title>
 <link rel="preconnect" href="https://rsms.me/">
 <link rel="stylesheet" href="https://rsms.me/inter/inter.css">
@@ -544,7 +543,7 @@ ${SHARED_STYLE}
     <a href="?view=dashboard">Dashboard</a>
     <a href="?view=edit-prompt">Bot Prompt</a>
   </nav>
-  <div class="meta">Last refresh: ${new Date().toLocaleString("en-IN")} · auto-refresh 30s</div>
+  <div class="meta">Loaded: ${new Date().toLocaleString("en-IN")} · <a href="javascript:location.reload()" style="color:var(--primary)">↻ refresh</a></div>
 </header>
 <main class="container">
   <h1 class="page-title">Operations Dashboard</h1>
