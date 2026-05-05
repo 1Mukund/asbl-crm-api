@@ -1251,14 +1251,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         });
       }
 
-      // Attempt creation
+      // Attempt creation — Zoho's tooltip.name only accepts "Static Text" or
+      // "Info Icon" (with that exact casing). Skipping tooltip for simplicity.
       const createBody = {
         fields: [
           {
             field_label: "Last Inhouse Call ID",
             data_type: "text",
             length: 100,
-            tooltip: { name: "info_icon", value: "Voice-bot UUID for the most recent call (correlated by /api/relay/inhouse-posthook)" },
           },
         ],
       };
