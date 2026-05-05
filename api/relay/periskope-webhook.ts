@@ -347,11 +347,21 @@ async function getProjectContextText(project: Project | null): Promise<string> {
   if (!project) return "no specific project resolved";
   if (project === "LEGACY") return LEGACY_TEASER;
 
+  // KB + offer (one row read) and live inventory fetch in parallel —
+  // both can take 200-500ms independently. Saves ~400ms in cold/cache-miss path.
+  const [factsRes, invRes] = await Promise.allSettled([
+    getProjectFacts(project),
+    getInventoryForProject(project),
+  ]);
+  const facts = factsRes.status === "fulfilled" ? factsRes.value : null;
+  const inv = invRes.status === "fulfilled" ? invRes.value : null;
+  if (invRes.status === "rejected") {
+    console.error(`[Webhook] Inventory fetch failed: ${invRes.reason?.message}`);
+  }
+
   const parts: string[] = [];
 
   // 1. Project KB (auto-extracted from uploaded TXT/PDF via dashboard)
-  //    This is the BIG static knowledge — overview, location, amenities, specs.
-  const facts = await getProjectFacts(project);
   if (facts?.kb_text?.trim()) {
     parts.push("## PROJECT KNOWLEDGE BASE");
     parts.push(facts.kb_text.trim());
@@ -366,15 +376,10 @@ async function getProjectContextText(project: Project | null): Promise<string> {
   }
 
   // 3. Live inventory + pricing from the master Google Sheet
-  try {
-    const inv = await getInventoryForProject(project);
-    if (inv.markdown) {
-      if (parts.length) parts.push("");
-      parts.push("## CURRENT INVENTORY & PRICING (live from sales sheet)");
-      parts.push(inv.markdown);
-    }
-  } catch (err: any) {
-    console.error(`[Webhook] Inventory fetch failed: ${err.message}`);
+  if (inv?.markdown) {
+    if (parts.length) parts.push("");
+    parts.push("## CURRENT INVENTORY & PRICING (live from sales sheet)");
+    parts.push(inv.markdown);
   }
 
   if (parts.length === 0) {
@@ -527,9 +532,9 @@ async function sendReply(phone: string, sender: string, message: string): Promis
     });
   } catch { /* not critical */ }
 
-  // 2. Short human-like pause (1.5s — keeps it natural while shrinking the
-  //    fast-follow-up race window)
-  await new Promise(resolve => setTimeout(resolve, 1500));
+  // 2. Brief human-like pause — kept short so total reply latency stays
+  //    under ~10s end-to-end. Periskope shows a typing indicator anyway.
+  await new Promise(resolve => setTimeout(resolve, 500));
 
   // 3. Send actual message — with 1 retry on 5xx / network failure
   const sendOnce = async () => {
@@ -599,18 +604,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     console.log(`[Periskope Webhook] Inbound from ${phone} | msg: ${message.slice(0, 80)}`);
 
-    // 1. Zoho lookup (name + ASBL_Project) — best-effort, parallel with rest
+    // 1+2. Run Zoho lookup AND conversation history fetch in parallel —
+    //      they're independent and account for ~1.5-2s sequentially.
     let leadDetails: LeadDetails | null = null;
     let zohoToken = "";
-    try {
-      zohoToken = await getZohoToken();
-      leadDetails = await findLeadDetailsByPhone(phone, zohoToken);
-    } catch (err: any) {
-      console.error(`[Periskope Webhook] Zoho lookup failed: ${err.message}`);
-    }
+    const zohoTask = (async () => {
+      try {
+        zohoToken = await getZohoToken();
+        leadDetails = await findLeadDetailsByPhone(phone, zohoToken);
+      } catch (err: any) {
+        console.error(`[Periskope Webhook] Zoho lookup failed: ${err.message}`);
+      }
+    })();
 
-    // 2. Fetch conversation history (needed as context for Gemini)
-    const conversation = await getConversationContext(phone);
+    const historyTask = getConversationContext(phone);
+    const [, conversation] = await Promise.all([zohoTask, historyTask]);
 
     // 3. Resolve project (regex on message > Zoho field > last asked).
     //    Gemini may also identify the project itself from its output;
@@ -655,10 +663,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
 
     // 6. Single Gemini call: classifies + composes reply (structured JSON output).
-    //    On failure, fall back to local Anandita reply + regex-based classifier.
+    //    Grounding (Google Search) adds 5-15s overhead PER call — disabled by
+    //    default since 95% of queries are answered from PROJECT_CONTEXT alone.
+    //    callGemini still auto-retries on truncation; with grounding off, both
+    //    attempts are fast. On total failure, falls back to local Anandita.
     let geminiOutput: Awaited<ReturnType<typeof callGemini>>;
     try {
-      geminiOutput = await callGemini(structuredMsg, { enableGrounding: true });
+      geminiOutput = await callGemini(structuredMsg, { enableGrounding: false });
     } catch (err: any) {
       console.error(`[Periskope Webhook] Gemini failed (${err.message}) — falling back to local Anandita + regex classifier`);
       const fallbackReply = await callAnandita(phone, structuredMsg);
