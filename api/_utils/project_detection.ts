@@ -44,14 +44,18 @@ export function detectFromMessage(message: string): Project | null {
 }
 
 // ── Get last asked project for phone from Supabase ───────────────────────────
+// Looks at last 5 turns from EITHER direction (so a project the bot just
+// answered about counts even if the customer's follow-up doesn't repeat the name).
 export async function getLastAskedProject(phone: string): Promise<Project | null> {
   try {
     const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/whatsapp_messages?phone=eq.${phone}&project=not.is.null&direction=eq.inbound&order=created_at.desc&limit=1&select=project`,
+      `${SUPABASE_URL}/rest/v1/whatsapp_messages?phone=eq.${phone}&project=not.is.null&order=created_at.desc&limit=5&select=project,direction,created_at`,
       { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
     );
     const rows = await r.json();
-    const proj = rows?.[0]?.project;
+    if (!Array.isArray(rows) || !rows.length) return null;
+    // Take the very latest project tag — project context locks to it
+    const proj = rows[0]?.project;
     if (proj && [...KNOWN_PROJECTS, "LEGACY"].includes(proj)) return proj as Project;
     return null;
   } catch (err: any) {
@@ -60,27 +64,54 @@ export async function getLastAskedProject(phone: string): Promise<Project | null
   }
 }
 
+// ── Detect "all projects" / multi-project intent ─────────────────────────────
+// Returns true when the customer is asking about everything (price across all,
+// compare, list of projects, etc.) — caller should inject ALL projects'
+// PROJECT_CONTEXT instead of just one.
+export function detectMultiProjectIntent(message: string): boolean {
+  const m = message.toLowerCase();
+  const triggers = [
+    "all your projects", "all projects", "all the projects",
+    "across all", "across project", "every project", "in all",
+    "all units", "all sizes", "all options",
+    "compare", "comparison", "vs ", " versus",
+    "list of projects", "tell me about your projects", "what all projects",
+    "kaunsa", "kaun sa", "konsa", "kon sa", // hindi: which one
+    "all offers", "all schemes",
+  ];
+  return triggers.some((t) => m.includes(t));
+}
+
 // ── Resolve final project ─────────────────────────────────────────────────────
+// Priority chain (highest first):
+//   1. Explicit project keyword in current message — always honor.
+//   2. Most recent project tagged on this phone (either direction) in DB.
+//      This ensures context follows the BOT's last reply, not just the
+//      customer's last keyword. Fixes "Spectra was discussed → customer asks
+//      generic question → bot reverts to Loft" regression.
+//   3. Zoho lead's ASBL_Project field — only used as a tiebreaker when
+//      conversation history is empty.
+//   4. null (Gemini will ask which project, or use multi-project context).
 export async function resolveProject(opts: {
   message: string;
-  zohoProject?: string | null; // value of ASBL_Project from Zoho lead
+  zohoProject?: string | null;
   phone: string;
 }): Promise<Project | null> {
-  // Priority 1: explicit mention in message
+  // 1. Explicit mention always wins
   const fromMsg = detectFromMessage(opts.message);
   if (fromMsg) return fromMsg;
 
-  // Priority 2: Zoho lead's ASBL_Project field
+  // 2. Most recent project from conversation history
+  const lastAsked = await getLastAskedProject(opts.phone);
+  if (lastAsked) return lastAsked;
+
+  // 3. Zoho field as tiebreaker when no conversation history
   if (opts.zohoProject) {
     const upper = opts.zohoProject.trim().toUpperCase();
     if ([...KNOWN_PROJECTS, "LEGACY"].includes(upper as any)) {
       return upper as Project;
     }
   }
-
-  // Priority 3: last-asked project for this phone
-  const lastAsked = await getLastAskedProject(opts.phone);
-  if (lastAsked) return lastAsked;
 
   return null;
 }

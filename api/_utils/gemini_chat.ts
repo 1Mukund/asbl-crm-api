@@ -320,8 +320,57 @@ export async function callGemini(
   structuredUserMessage: string,
   opts: GeminiCallOptions = {},
 ): Promise<GeminiStructuredReply> {
-  const rawText = await callGeminiRaw(structuredUserMessage, opts);
-  return parseStructuredOutput(rawText);
+  // Attempt 1: with caller's options (grounding usually on)
+  let rawText = "";
+  try {
+    rawText = await callGeminiRaw(structuredUserMessage, opts);
+  } catch (err: any) {
+    console.warn(`[Gemini] First call failed (${err.message}); retrying without grounding`);
+    rawText = "";
+  }
+
+  // If output is empty / parses to the deflection fallback (Tier-3 in the
+  // parser), retry once WITHOUT grounding. Grounding occasionally returns
+  // empty/malformed JSON when Google Search times out mid-thinking.
+  const wasEmpty = !rawText || rawText.trim().length < 10;
+  if (wasEmpty && opts.enableGrounding !== false) {
+    try {
+      console.warn("[Gemini] First attempt empty; retrying with grounding disabled");
+      rawText = await callGeminiRaw(structuredUserMessage, { ...opts, enableGrounding: false });
+    } catch (err: any) {
+      console.error(`[Gemini] Retry without grounding also failed: ${err.message}`);
+    }
+  }
+
+  if (!rawText || rawText.trim().length < 5) {
+    return {
+      intent: "GENERAL",
+      flags: [],
+      project: null,
+      docToSend: null,
+      reply: "Hmm, give me a sec — let me pull that up and revert in just a moment.",
+    };
+  }
+
+  const parsed = parseStructuredOutput(rawText);
+
+  // If parser landed on the friendly deflection AND grounding was on, retry
+  // ONCE without grounding (often resolves Google Search-induced truncation).
+  const isDeflection = parsed.reply.startsWith("Hmm, give me a sec");
+  if (isDeflection && opts.enableGrounding !== false) {
+    try {
+      console.warn("[Gemini] Parser hit Tier-3 deflection; retrying without grounding");
+      const retryRaw = await callGeminiRaw(structuredUserMessage, { ...opts, enableGrounding: false });
+      const retryParsed = parseStructuredOutput(retryRaw);
+      if (!retryParsed.reply.startsWith("Hmm, give me a sec")) {
+        return retryParsed;
+      }
+    } catch (err: any) {
+      console.error(`[Gemini] Tier-3 retry failed: ${err.message}`);
+    }
+  }
+
+  return parsed;
 }
 
 /**
@@ -339,8 +388,9 @@ export async function callGeminiRaw(
   const temperature = opts.temperature ?? 0.6;
   // Gemini 3 Pro thinking-mode burns ~1500-3000 tokens before any visible
   // output (more for complex/grounding queries); cap too low → JSON gets
-  // truncated mid-reply → parser fails. 8000 keeps generous headroom.
-  const maxOutputTokens = opts.maxOutputTokens ?? 8000;
+  // truncated mid-reply → parser fails. 10000 keeps generous headroom for
+  // multi-project comparison answers + grounded queries.
+  const maxOutputTokens = opts.maxOutputTokens ?? 10000;
   const enableGrounding = opts.enableGrounding ?? true;
 
   const systemPrompt = await resolveSystemPrompt();

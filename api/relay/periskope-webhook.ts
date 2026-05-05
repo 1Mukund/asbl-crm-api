@@ -19,7 +19,7 @@
  * Webhook URL: https://asbl-crm-api.vercel.app/api/relay/periskope-webhook
  */
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { resolveProject, Project } from "../_utils/project_detection";
+import { resolveProject, detectMultiProjectIntent, Project } from "../_utils/project_detection";
 import { getProjectFacts } from "../_utils/project_facts";
 import { getInventoryForProject } from "../_utils/inventory_sheet";
 import { getConversationContext } from "../_utils/conversation_context";
@@ -386,6 +386,49 @@ async function getProjectContextText(project: Project | null): Promise<string> {
   return combined.length > 18000 ? combined.slice(0, 18000) + "\n... (truncated)" : combined;
 }
 
+// ── Build a compact multi-project context (used for "all projects" / compare) ─
+// Each project's KB+offer is heavily summarised so all 4 fit comfortably in
+// Gemini's input. Inventory is also condensed to per-project headlines.
+async function getMultiProjectContextText(): Promise<string> {
+  const projects: Project[] = ["LOFT", "SPECTRA", "BROADWAY", "LANDMARK"];
+  const parts: string[] = [];
+
+  for (const p of projects) {
+    const block: string[] = [`### PROJECT: ${p}`];
+    try {
+      const facts = await getProjectFacts(p);
+      const kbText = (facts as any)?.kb_text?.trim() || "";
+      const offerText = facts?.facts_text?.trim() || "";
+
+      if (kbText) {
+        // Cap each project's KB to ~3 KB so 4 projects fit in budget
+        block.push("KB:");
+        block.push(kbText.length > 3000 ? kbText.slice(0, 3000) + "..." : kbText);
+      }
+      if (offerText) {
+        block.push("OFFER:");
+        block.push(offerText);
+      }
+      try {
+        const inv = await getInventoryForProject(p);
+        if (inv.markdown) {
+          // Take only the first 1.5KB of inventory per project
+          block.push("INVENTORY:");
+          block.push(inv.markdown.length > 1500 ? inv.markdown.slice(0, 1500) + "..." : inv.markdown);
+        }
+      } catch {}
+    } catch {}
+    if (block.length > 1) parts.push(block.join("\n"));
+  }
+
+  if (!parts.length) return "No project data loaded.";
+
+  const combined =
+    "## MULTI_PROJECT_CONTEXT — use this when the customer asks about all/any projects, compares, or doesn't name one\n\n" +
+    parts.join("\n\n");
+  return combined.length > 22000 ? combined.slice(0, 22000) + "\n... (truncated)" : combined;
+}
+
 // ── Build structured message for the LLM ─────────────────────────────────────
 // Gemini decides intent/flags itself in its structured output, so we no longer
 // pass <INTENT>/<FLAGS> blocks. The signature still accepts them for the
@@ -579,8 +622,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
     console.log(`[Periskope Webhook] Initial project resolution: ${project || "(none)"}`);
 
-    // 4. Fetch project context (KB + live inventory)
-    const projectContext = await getProjectContextText(project);
+    // 4. Detect "all projects / compare" intent — switch to multi-project context
+    //    so Gemini can answer about every project, not just the resolved one.
+    const isMultiProject = detectMultiProjectIntent(message);
+
+    // 5. Build PROJECT_CONTEXT — single project's KB+offer+inventory normally,
+    //    or all 4 projects condensed when multi-project intent fires.
+    let projectContext: string;
+    if (isMultiProject) {
+      console.log(`[Periskope Webhook] Multi-project intent detected — sending all projects' context`);
+      projectContext = await getMultiProjectContextText();
+    } else {
+      projectContext = await getProjectContextText(project);
+    }
 
     // 5. Build structured message — Gemini will classify + reply in one call.
     //    No <INTENT>/<FLAGS> blocks because Gemini decides those itself.
@@ -694,7 +748,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           docSent = { doc_type: doc.doc_type, url: doc.url, source: doc.source };
           console.log(`[Periskope Webhook] Doc sent (source=${doc.source}): ${doc.doc_type} → ${doc.url}`);
         } else {
-          console.log(`[Periskope Webhook] No ${docTypeFromMsg} doc found for ${project} (table or KB)`);
+          // ATOMIC DELIVERY — Gemini promised the doc but it's not uploaded yet.
+          // Send an honest follow-up so customer doesn't wait for a PDF that
+          // never arrives (fixes MD-3 broken-promise issue from the test sheet).
+          console.log(`[Periskope Webhook] No ${docTypeFromMsg} doc found for ${project} — sending honest follow-up`);
+          const followUp = `Actually one sec — that one's not on my phone right now. Let me get it from the project team and send it across shortly.`;
+          await saveMessage(phone, "outbound", followUp, sender, project);
+          try {
+            await sendReply(phone, sender, followUp);
+          } catch (err: any) {
+            console.error(`[Periskope Webhook] doc-missing follow-up failed: ${err.message}`);
+          }
         }
       } catch (err: any) {
         console.error(`[Periskope Webhook] Doc send failed: ${err.message}`);

@@ -38,6 +38,37 @@ function normSize(s: string | null | undefined): string {
   return (s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
+/** List the available size_labels for a multi-slot doc type (for asking
+ *  the customer "which tower / which size?" when the request is ambiguous). */
+export async function listAvailableLabels(
+  project: string,
+  docType: string,
+): Promise<string[]> {
+  if (docType !== "unit_plan" && docType !== "floor_plan") return [];
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/project_documents` +
+        `?project=eq.${project}` +
+        `&doc_type=eq.${docType}` +
+        `&select=size_label&size_label=not.is.null&order=size_label.asc`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    const rows = (await r.json()) as Array<{ size_label: string | null }>;
+    if (!Array.isArray(rows)) return [];
+    const seen = new Set<string>();
+    const labels: string[] = [];
+    for (const row of rows) {
+      if (row?.size_label && !seen.has(row.size_label)) {
+        seen.add(row.size_label);
+        labels.push(row.size_label);
+      }
+    }
+    return labels;
+  } catch {
+    return [];
+  }
+}
+
 // ── Look up the matching document — table first, then KB extraction ──────
 // Optional sizeHint helps unit_plan lookups (e.g. "1695 east", "2bhk", "1295").
 export async function getDocumentFor(
