@@ -1123,7 +1123,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           notes = (nj?.data || []).map((n: any) => ({
             id: n.id,
             title: n.Note_Title,
-            content: (n.Note_Content || "").slice(0, 500),
+            content: n.Note_Content || "",
             created_at: n.Created_Time,
           }));
         } else if (nr.status !== 204) {
@@ -1144,7 +1144,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             notes = (sj?.data || []).map((n: any) => ({
               id: n.id,
               title: n.Note_Title,
-              content: (n.Note_Content || "").slice(0, 500),
+              content: n.Note_Content || "",
               created_at: n.Created_Time,
             }));
           } else if (sr.status !== 204) {
