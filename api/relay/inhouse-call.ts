@@ -1,14 +1,18 @@
 /**
- * Triggers an outbound call via the in-house ASBL Voice Bot (Anandita).
- * Replaces the prior Arrowhead relay.
+ * Outbound call trigger — country-routes the lead:
+ *
+ *   +91 (India) → in-house ASBL Voice Bot (Anandita) at
+ *                 https://asbl-voice-bot.onrender.com/api/trigger-call
+ *   +1  (US)    → Arrowhead campaign (legacy, still in use for US leads)
  *
  * Contract (kept compatible with existing Zoho Deluge):
  *   POST /api/relay/inhouse-call
  *   Body: { _zoho_lead_id, phone_number | mobile_number, ...extras }
  *
- * Internally posts to https://asbl-voice-bot.onrender.com/api/trigger-call
- * with { to: "+91…" }, then writes the returned call_id back to Zoho as
- * Last_Inhouse_Call_ID so the posthook can correlate later.
+ * For the in-house path we stamp the returned call_id onto Zoho as
+ * Last_Inhouse_Call_ID so /api/relay/inhouse-posthook can correlate.
+ * For the Arrowhead path we keep the original Last_Arrowhead_Call_ID
+ * scheme via the Deluge-side payload + /api/relay/arrowhead-posthook.
  */
 import { VercelRequest, VercelResponse } from "@vercel/node";
 import { triggerBlueprintTransition, updateLead } from "../_utils/zoho";
@@ -16,6 +20,11 @@ import { triggerBlueprintTransition, updateLead } from "../_utils/zoho";
 const VOICEBOT_URL =
   process.env.ASBL_VOICEBOT_URL || "https://asbl-voice-bot.onrender.com";
 const VOICEBOT_API_KEY = process.env.ASBL_VOICEBOT_API_KEY || "";
+
+const ARROWHEAD_BEARER_TOKEN = process.env.ARROWHEAD_BEARER_TOKEN || "";
+const ARROWHEAD_CAMPAIGN_URL_US =
+  process.env.ARROWHEAD_CAMPAIGN_URL_US ||
+  "https://api.agent.arrowhead.team/api/v2/public/domain/932f86fc-ed03-42d5-a127-7dfc63216a8a/campaign/adcc6884-03d1-4bfa-8b2f-ce4da5ddc527/schedule";
 
 /** Normalise phone input → E.164 with leading "+". */
 function toE164(raw: string): string {
@@ -29,14 +38,55 @@ function toE164(raw: string): string {
   return `+${digits}`;
 }
 
+/** Detect country region from E.164 number. India = "IN", US = "US". */
+function detectRegion(e164: string): "IN" | "US" | "OTHER" {
+  const digits = e164.replace(/^\+/, "");
+  if (digits.startsWith("91")) return "IN";
+  if (digits.startsWith("1")) return "US";
+  return "OTHER";
+}
+
+/** Trigger the in-house ASBL voice bot (India calls). */
+async function triggerInHouseBot(
+  phone: string,
+): Promise<{ ok: boolean; status: number; data: any }> {
+  const r = await fetch(`${VOICEBOT_URL}/api/trigger-call`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${VOICEBOT_API_KEY}`,
+    },
+    body: JSON.stringify({ to: phone }),
+  });
+  const data = await r.json().catch(() => ({}));
+  return { ok: r.ok && (data as any)?.success === true, status: r.status, data };
+}
+
+/** Trigger Arrowhead campaign (US calls — legacy, still active). */
+async function triggerArrowheadUs(
+  phone: string,
+  rawBody: any,
+): Promise<{ ok: boolean; status: number; data: any }> {
+  // Strip our internal _zoho_lead_id before forwarding — Arrowhead doesn't need it
+  const { _zoho_lead_id, ...arrowheadPayload } = rawBody;
+  // Make sure Arrowhead sees the phone in its expected field
+  if (!arrowheadPayload.phone_number && !arrowheadPayload.mobile_number) {
+    arrowheadPayload.phone_number = phone;
+  }
+  const r = await fetch(ARROWHEAD_CAMPAIGN_URL_US, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${ARROWHEAD_BEARER_TOKEN}`,
+    },
+    body: JSON.stringify(arrowheadPayload),
+  });
+  const data = await r.json().catch(() => ({}));
+  return { ok: r.ok, status: r.status, data };
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
-
-  if (!VOICEBOT_API_KEY) {
-    return res
-      .status(500)
-      .json({ error: "ASBL_VOICEBOT_API_KEY env var not configured" });
-  }
 
   try {
     const body = (req.body || {}) as any;
@@ -45,57 +95,88 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (!phone || phone.length < 11) {
       return res.status(400).json({
-        error: "phone_number required (E.164 format, e.g. +919876543210)",
+        error: "phone_number required (E.164 format, e.g. +919876543210 or +14155551234)",
       });
     }
 
-    console.log(`[InHouse Call] Trigger request: lead=${zohoLeadId || "(none)"} phone=${phone}`);
+    const region = detectRegion(phone);
+    console.log(`[InHouse Call] Region=${region} phone=${phone} lead=${zohoLeadId || "(none)"}`);
 
-    // ── 1. Hit voice-bot trigger-call ────────────────────────────────────
-    const r = await fetch(`${VOICEBOT_URL}/api/trigger-call`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${VOICEBOT_API_KEY}`,
-      },
-      body: JSON.stringify({ to: phone }),
-    });
-    const data = (await r.json().catch(() => ({}))) as any;
+    // ── A. India (+91) → in-house ASBL Voice Bot (Anandita) ────────────
+    if (region === "IN") {
+      if (!VOICEBOT_API_KEY) {
+        return res.status(500).json({ error: "ASBL_VOICEBOT_API_KEY env var not configured" });
+      }
 
-    if (!r.ok || !data?.success) {
-      console.error(`[InHouse Call] Voice-bot trigger failed (${r.status}):`, data);
-      return res
-        .status(r.status || 500)
-        .json({ error: data?.error || `voice-bot ${r.status}`, voicebot_response: data });
-    }
+      const result = await triggerInHouseBot(phone);
+      if (!result.ok) {
+        console.error(`[InHouse Call] Voice-bot trigger failed (${result.status}):`, result.data);
+        return res.status(result.status || 500).json({
+          error: result.data?.error || `voice-bot ${result.status}`,
+          voicebot_response: result.data,
+        });
+      }
 
-    const callId: string = data.call_id;
-    const provider: string = data.provider || "unknown";
-    console.log(`[InHouse Call] Triggered → call_id=${callId} provider=${provider}`);
+      const callId: string = result.data.call_id;
+      const provider: string = result.data.provider || "unknown";
+      console.log(`[InHouse Call IN] Triggered → call_id=${callId} provider=${provider}`);
 
-    // ── 2. Update Zoho lead in parallel (best-effort, non-blocking) ──────
-    if (zohoLeadId) {
-      // a) Stamp Last_Inhouse_Call_ID for posthook correlation + flip Lead_Status
-      updateLead(zohoLeadId, {
-        Lead_Status: "Lead Initiated",
-        Last_Inhouse_Call_ID: callId,
-      }).catch((err) =>
-        console.error(`[InHouse Call] updateLead failed: ${err.message}`)
-      );
+      // Best-effort Zoho stamping (won't block the response)
+      if (zohoLeadId) {
+        updateLead(zohoLeadId, {
+          Lead_Status: "Lead Initiated",
+          Last_Inhouse_Call_ID: callId,
+        }).catch((err) =>
+          console.error(`[InHouse Call IN] updateLead failed: ${err.message}`)
+        );
+        triggerBlueprintTransition(zohoLeadId, "Lead Initiated").catch(() => {});
+      }
 
-      // b) Best-effort blueprint transition (silently no-op if not configured)
-      triggerBlueprintTransition(zohoLeadId, "Lead Initiated").catch(() => {
-        /* ignore — transition may not exist */
+      return res.status(200).json({
+        success: true,
+        region: "IN",
+        provider,
+        call_id: callId,
+        to: phone,
       });
-    } else {
-      console.warn("[InHouse Call] _zoho_lead_id missing — skipping Zoho update");
     }
 
-    return res.status(200).json({
-      success: true,
-      call_id: callId,
-      provider,
-      to: phone,
+    // ── B. US (+1) → Arrowhead campaign ────────────────────────────────
+    if (region === "US") {
+      if (!ARROWHEAD_BEARER_TOKEN) {
+        return res.status(500).json({ error: "ARROWHEAD_BEARER_TOKEN env var not configured" });
+      }
+
+      const result = await triggerArrowheadUs(phone, body);
+      if (!result.ok) {
+        console.error(`[InHouse Call US] Arrowhead trigger failed (${result.status}):`, result.data);
+        return res.status(result.status || 500).json({
+          error: result.data?.error || result.data || `arrowhead ${result.status}`,
+        });
+      }
+
+      console.log(`[InHouse Call US] Arrowhead campaign triggered for ${phone}`);
+
+      // Move Zoho lead to "Lead Initiated" — same pattern as the legacy relay
+      if (zohoLeadId) {
+        updateLead(zohoLeadId, { Lead_Status: "Lead Initiated" }).catch((err) =>
+          console.error(`[InHouse Call US] updateLead failed: ${err.message}`)
+        );
+        triggerBlueprintTransition(zohoLeadId, "Lead Initiated").catch(() => {});
+      }
+
+      return res.status(200).json({
+        success: true,
+        region: "US",
+        provider: "arrowhead",
+        to: phone,
+        arrowhead_response: result.data,
+      });
+    }
+
+    // ── C. Unsupported country — refuse rather than guess ──────────────
+    return res.status(400).json({
+      error: `Unsupported country code for ${phone}. Only +91 (India, in-house bot) and +1 (US, Arrowhead) are routed.`,
     });
   } catch (err: any) {
     console.error("[InHouse Call] Unexpected error:", err.message);
