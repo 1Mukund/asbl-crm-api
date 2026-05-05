@@ -1194,6 +1194,96 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── Zoho field metadata + auto-create Last_Inhouse_Call_ID ────────────
+  // GET ?action=zoho-fields&secret=<INHOUSE_POSTHOOK_SECRET>
+  //   Lists ALL custom fields on the Leads module + checks for the call-id
+  //   ones used by our posthook flows (Last_Arrowhead_Call_ID, Last_Inhouse_Call_ID).
+  // GET ?action=zoho-create-inhouse-field&secret=<...>
+  //   Attempts to CREATE Last_Inhouse_Call_ID via Zoho Metadata API.
+  //   Requires the refresh token to have ZohoCRM.settings.fields.CREATE scope.
+  if (req.method === "GET" && (req.query.action === "zoho-fields" || req.query.action === "zoho-create-inhouse-field")) {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+
+      // Always list fields first
+      const fr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+        headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      });
+      if (!fr.ok) {
+        return res.status(fr.status).json({ error: "field-list failed", body: (await fr.text()).slice(0, 500) });
+      }
+      const fj = await fr.json() as any;
+      const allFields = (fj?.fields || []) as any[];
+      const callRelated = allFields
+        .filter((f) => /call|inhouse|arrowhead|recording|transcript/i.test(f.api_name || ""))
+        .map((f) => ({
+          api_name: f.api_name,
+          field_label: f.field_label,
+          data_type: f.data_type,
+          custom_field: f.custom_field,
+          length: f.length,
+        }));
+
+      const hasInhouse = callRelated.some((f) => f.api_name === "Last_Inhouse_Call_ID");
+
+      if (req.query.action === "zoho-fields") {
+        return res.status(200).json({
+          total_fields: allFields.length,
+          call_related_fields: callRelated,
+          Last_Inhouse_Call_ID_exists: hasInhouse,
+        });
+      }
+
+      // zoho-create-inhouse-field path
+      if (hasInhouse) {
+        return res.status(200).json({
+          status: "already_exists",
+          message: "Last_Inhouse_Call_ID is already a field on the Leads module",
+          existing: callRelated.find((f) => f.api_name === "Last_Inhouse_Call_ID"),
+        });
+      }
+
+      // Attempt creation
+      const createBody = {
+        fields: [
+          {
+            field_label: "Last Inhouse Call ID",
+            data_type: "text",
+            length: 100,
+            tooltip: { name: "info_icon", value: "Voice-bot UUID for the most recent call (correlated by /api/relay/inhouse-posthook)" },
+          },
+        ],
+      };
+      const cr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+        method: "POST",
+        headers: {
+          Authorization: `Zoho-oauthtoken ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(createBody),
+      });
+      const createResp = await cr.json().catch(() => ({}));
+      return res.status(cr.status).json({
+        attempted: true,
+        http_status: cr.status,
+        response: createResp,
+        hint: cr.status === 401 || cr.status === 403
+          ? "Your Zoho refresh token likely doesn't have ZohoCRM.settings.fields.CREATE scope. Add the field manually: Setup → Customization → Modules → Leads → Fields → + New Field → Single Line → name 'Last Inhouse Call ID'."
+          : undefined,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── Meta token health check ────────────────────────────────────────────
   // GET ?action=meta-token-check → introspects META_PAGE_ACCESS_TOKEN via
   // Graph API debug_token + /me, returns expiry, app_id, granted scopes,
