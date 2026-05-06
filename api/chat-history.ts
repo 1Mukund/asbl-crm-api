@@ -518,6 +518,13 @@ async function renderDashboard(): Promise<string> {
     </div>`;
   };
 
+  // PDF-extracts fallback toggle (default ON if no setting present)
+  let pdfExtractsToggleEnabled = true;
+  try {
+    const row = await getBotSetting("use_pdf_extracts");
+    if (row?.value === "false") pdfExtractsToggleEnabled = false;
+  } catch {}
+
   const docLibraryHtml = KNOWN_PROJECTS.filter((p) => p !== "LEGACY")
     .map((p) => `<div class="proj-card">
       <h3>${esc(p)}</h3>
@@ -641,6 +648,22 @@ ${SHARED_STYLE}
       The Gemini system prompt defines the bot's persona, banned phrases, intent labels and JSON output format. Edit it on the dedicated page — saves are <strong>live</strong> (the bot picks up the new prompt on the next message; no redeploy needed).
     </div>
     <a href="?view=edit-prompt" class="btn-primary" style="display:inline-block;text-decoration:none">Open prompt editor →</a>
+  </div>
+
+  <div class="card full">
+    <h2>7. PDF Extracts as Fallback KB</h2>
+    <div class="card-help">
+      When ON, every uploaded PDF (brochure, specs, master plan, etc.) gets text-extracted on upload and added to the bot's context as a fallback source. If a customer asks something the curated KB doesn't cover, the bot scans the PDFs for an answer before deferring. Cap: 3.5 KB per PDF in context.
+      <br><br>
+      ${pdfExtractsToggleEnabled ? `Status: <strong style="color:var(--success)">ON</strong>` : `Status: <strong style="color:var(--text-muted)">OFF</strong>`} ·
+      <form method="POST" action="?action=set-pdf-extracts&value=${pdfExtractsToggleEnabled ? "off" : "on"}" style="display:inline">
+        <button type="submit" class="btn-mini">Turn ${pdfExtractsToggleEnabled ? "OFF" : "ON"}</button>
+      </form>
+    </div>
+    <div style="font-size:13px;color:var(--text-soft);line-height:1.5">
+      <strong>Backfill existing PDFs</strong> — if you uploaded PDFs before this feature existed, they don't have text extracts yet. Run the backfill once to extract all of them:
+      <pre style="background:var(--surface-muted);padding:10px;border-radius:6px;font-size:12px;overflow:auto;margin-top:8px">curl -X POST "https://asbl-crm-api.vercel.app/api/chat-history?action=backfill-pdf-extracts&secret=&lt;INHOUSE_POSTHOOK_SECRET&gt;"</pre>
+    </div>
   </div>
 
   </div>
@@ -1502,8 +1525,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const VALID = ["master_plan", "floor_plan", "unit_plan", "price_sheet", "payment_structure", "brochure", "specifications", "amenities"];
       if (!VALID.includes(docType)) return res.status(400).json({ error: `Unknown doc_type: ${docType}` });
 
+      // Extract text from the just-uploaded PDF so the bot can use it as
+      // a fallback KB source when project_facts.kb_text doesn't have an
+      // answer. Best-effort — if extraction fails we still record the row.
+      let textExtract = "";
+      try {
+        if (mimeType === "application/pdf" || filename.toLowerCase().endsWith(".pdf")) {
+          const buf = await downloadFromStorage(storagePath);
+          textExtract = await extractTextFromPDF(buf);
+        }
+      } catch (err: any) {
+        console.warn(`[upload-finalize] PDF text extract failed: ${err.message}`);
+      }
+
       const insertBody: any = { project, doc_type: docType, filename, url: publicUrl };
       if (sizeLabel) insertBody.size_label = sizeLabel;
+      if (textExtract) {
+        // Cap each PDF's extract at 8000 chars so even 8 doc types per project
+        // stay under Gemini's effective input budget when bundled into context.
+        insertBody.text_extract = textExtract.slice(0, 8000);
+        insertBody.text_extract_chars = textExtract.length;
+        insertBody.text_extracted_at = new Date().toISOString();
+      }
 
       const insRes = await fetch(`${SUPABASE_URL}/rest/v1/project_documents`, {
         method: "POST",
@@ -1518,7 +1561,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (!insRes.ok) {
         return res.status(500).json({ error: `DB insert failed: ${(await insRes.text()).slice(0, 200)}` });
       }
-      return res.status(200).json({ ok: true, project, docType, sizeLabel, publicUrl, record: await insRes.json() });
+      return res.status(200).json({
+        ok: true,
+        project, docType, sizeLabel, publicUrl,
+        text_extracted: !!textExtract,
+        text_extract_chars: textExtract.length,
+        record: await insRes.json(),
+      });
     } catch (err: any) {
       console.error(`[upload-finalize] failed: ${err.message}`);
       return res.status(500).json({ error: err.message });
@@ -1539,6 +1588,79 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       res.setHeader("Location", `?view=edit-prompt&msg=${encodeURIComponent("Saved (" + (prompt.length / 1024).toFixed(1) + " KB). The bot will use this prompt on the next message.")}`);
     }
     return res.status(303).end();
+  }
+
+  // ─── Toggle PDF extracts as fallback KB source ─────────────────────────
+  // POST ?action=set-pdf-extracts&value=on|off
+  // Stored in bot_settings.use_pdf_extracts ("true" / "false"). Default = true.
+  if (req.method === "POST" && req.query.action === "set-pdf-extracts") {
+    const value = String(req.query.value || "").toLowerCase() === "off" ? "false" : "true";
+    await setBotSetting("use_pdf_extracts", value);
+    res.setHeader("Location", `?view=dashboard`);
+    return res.status(303).end();
+  }
+
+  // ─── Backfill text_extract for already-uploaded PDFs ────────────────────
+  // POST ?action=backfill-pdf-extracts&secret=<INHOUSE_POSTHOOK_SECRET>
+  // Iterates project_documents rows missing text_extract, downloads the file
+  // from Supabase Storage, runs PDF text extraction, updates the row.
+  if (req.method === "POST" && req.query.action === "backfill-pdf-extracts") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    try {
+      // Find all PDF rows missing text_extract
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/project_documents?text_extract=is.null&select=id,project,doc_type,filename,url&limit=200`,
+        { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+      );
+      const rows = (await r.json()) as Array<any>;
+      const results: any[] = [];
+      for (const row of rows) {
+        const filename = String(row.filename || "");
+        if (!filename.toLowerCase().endsWith(".pdf")) {
+          results.push({ id: row.id, skipped: "not a pdf" });
+          continue;
+        }
+        try {
+          // Reconstruct storage path from public URL — pattern is /object/public/<bucket>/<path>
+          const storagePathMatch = String(row.url || "").match(/\/object\/public\/[^/]+\/(.+)$/);
+          if (!storagePathMatch) {
+            results.push({ id: row.id, error: "couldn't parse storage path from URL" });
+            continue;
+          }
+          const storagePath = decodeURIComponent(storagePathMatch[1]);
+          const buf = await downloadFromStorage(storagePath);
+          const text = await extractTextFromPDF(buf);
+          if (!text) {
+            results.push({ id: row.id, error: "empty text" });
+            continue;
+          }
+          await fetch(`${SUPABASE_URL}/rest/v1/project_documents?id=eq.${row.id}`, {
+            method: "PATCH",
+            headers: {
+              apikey: SUPABASE_KEY,
+              Authorization: `Bearer ${SUPABASE_KEY}`,
+              "Content-Type": "application/json",
+              Prefer: "return=minimal",
+            },
+            body: JSON.stringify({
+              text_extract: text.slice(0, 8000),
+              text_extract_chars: text.length,
+              text_extracted_at: new Date().toISOString(),
+            }),
+          });
+          results.push({ id: row.id, project: row.project, doc_type: row.doc_type, chars: text.length, ok: true });
+        } catch (err: any) {
+          results.push({ id: row.id, error: err.message });
+        }
+      }
+      return res.status(200).json({ processed: results.length, results });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
   }
 
   // ─── Reset prompt to hardcoded default (deletes DB override) ────────────

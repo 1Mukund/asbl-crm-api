@@ -386,9 +386,66 @@ async function getProjectContextText(project: Project | null): Promise<string> {
     return `No knowledge base or inventory available for ${project} yet. Tell the customer you'll have a sales executive revert with details.`;
   }
 
+  // 4. PDF document extracts — fallback KB when curated text doesn't have it.
+  //    Toggleable via bot_settings.use_pdf_extracts (default = on).
+  try {
+    const setting = await getBotSetting("use_pdf_extracts");
+    const enabled = !setting || setting.value !== "false"; // default ON
+    if (enabled) {
+      const pdfBlock = await fetchPdfExtractsForProject(project);
+      if (pdfBlock) {
+        if (parts.length) parts.push("");
+        parts.push(pdfBlock);
+      }
+    }
+  } catch (err: any) {
+    console.error(`[Webhook] PDF extracts fetch failed: ${err.message}`);
+  }
+
   const combined = parts.join("\n").trim();
-  // Trim to ~18 KB to keep prompt size reasonable
-  return combined.length > 18000 ? combined.slice(0, 18000) + "\n... (truncated)" : combined;
+  // Trim to ~24 KB to keep prompt size reasonable (PDFs added headroom)
+  return combined.length > 24000 ? combined.slice(0, 24000) + "\n... (truncated)" : combined;
+}
+
+// ── Fetch + format PDF extracts for a single project ─────────────────────
+async function fetchPdfExtractsForProject(project: Project): Promise<string> {
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/project_documents` +
+        `?project=eq.${project}` +
+        `&text_extract=not.is.null` +
+        `&select=doc_type,size_label,text_extract,filename` +
+        `&order=fetched_at.desc&limit=20`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    const rows = (await r.json()) as Array<any>;
+    if (!Array.isArray(rows) || !rows.length) return "";
+
+    // Group by doc_type — only keep latest extract per type (latest already first via order)
+    const seen = new Set<string>();
+    const blocks: string[] = [];
+    for (const row of rows) {
+      const key = row.doc_type + (row.size_label ? `:${row.size_label}` : "");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const label = row.size_label ? `${row.doc_type} (${row.size_label})` : row.doc_type;
+      const text = (row.text_extract || "").trim();
+      if (!text) continue;
+      // Cap each PDF's contribution at 3500 chars in the assembled context
+      const snippet = text.length > 3500 ? text.slice(0, 3500) + "\n[...truncated]" : text;
+      blocks.push(`### ${label.toUpperCase()}\n${snippet}`);
+    }
+    if (!blocks.length) return "";
+    return [
+      "## PDF DOCUMENT EXTRACTS (fallback when KB / inventory don't have an answer)",
+      "When the customer asks something specific you can't find above, scan these for the answer before deferring.",
+      "",
+      ...blocks,
+    ].join("\n");
+  } catch (err: any) {
+    console.error(`[Webhook] fetchPdfExtractsForProject failed: ${err.message}`);
+    return "";
+  }
 }
 
 // ── Build a compact multi-project context (used for "all projects" / compare) ─
