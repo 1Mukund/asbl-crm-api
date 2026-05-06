@@ -1090,6 +1090,91 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── Zoho daily leads report (since YYYY-MM-DD) ───────────────────────
+  // GET ?action=zoho-leads-report&since=YYYY-MM-DD&secret=<INHOUSE_POSTHOOK_SECRET>
+  // Pages through all Zoho Leads created on/after `since`, returns per-day
+  // aggregates: total, by_status, with site-visit indicators.
+  if (req.method === "GET" && req.query.action === "zoho-leads-report") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=" });
+    }
+    const since = String(req.query.since || "2026-04-01");
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+
+      const fields = "id,Created_Time,Lead_Status,Call_Status,ASBL_Project,Lead_Source,First_Name,Last_Name,Mobile";
+      const allLeads: any[] = [];
+      let page = 1;
+      const maxPages = 30; // 30 × 200 = 6000 leads safety cap
+      while (page <= maxPages) {
+        const r = await fetch(
+          `${ZOHO_API_BASE}/Leads/search?criteria=(Created_Time:greater_equal:${since}T00:00:00%2B05:30)&fields=${fields}&page=${page}&per_page=200`,
+          { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
+        );
+        if (r.status === 204) break;
+        if (!r.ok) {
+          const t = await r.text();
+          return res.status(500).json({ error: `Zoho ${r.status}: ${t.slice(0, 300)}` });
+        }
+        const data = (await r.json()) as any;
+        const rows = data?.data || [];
+        allLeads.push(...rows);
+        if (rows.length < 200 || data?.info?.more_records === false) break;
+        page++;
+      }
+
+      // Aggregate per day
+      const byDate: Record<string, any> = {};
+      for (const lead of allLeads) {
+        const created = String(lead.Created_Time || "");
+        const day = created.slice(0, 10); // YYYY-MM-DD
+        if (!day) continue;
+        if (!byDate[day]) {
+          byDate[day] = {
+            date: day,
+            total: 0,
+            site_visit_booked: 0,   // Lead_Status: "Pre Site" / "Site Visit Booked"
+            site_visit_done: 0,     // Lead_Status: "Site Visit Done" / "Site Visited"
+            statuses: {} as Record<string, number>,
+          };
+        }
+        byDate[day].total++;
+        const ls = String(lead.Lead_Status || "");
+        byDate[day].statuses[ls] = (byDate[day].statuses[ls] || 0) + 1;
+        const lsLower = ls.toLowerCase();
+        if (
+          lsLower.includes("pre site") ||
+          lsLower.includes("site visit booked") ||
+          lsLower === "site visit"
+        ) byDate[day].site_visit_booked++;
+        if (
+          lsLower.includes("site visit done") ||
+          lsLower === "site visited" ||
+          lsLower.includes("visited")
+        ) byDate[day].site_visit_done++;
+      }
+      const dates = Object.keys(byDate).sort();
+      const report = dates.map((d) => byDate[d]);
+      // Also collect all unique statuses for inspection
+      const allStatuses = new Set<string>();
+      for (const r of report) Object.keys(r.statuses).forEach((s) => allStatuses.add(s));
+
+      return res.status(200).json({
+        since,
+        total_leads: allLeads.length,
+        pages_fetched: page,
+        all_statuses_seen: Array.from(allStatuses).sort(),
+        report,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── Zoho lead inspector (debug) ────────────────────────────────────────
   // GET ?action=zoho-lead&id=<lead_id> OR &phone=<+91...>
   // Returns the raw lead record + recent Notes + recent Calls for diagnosis.
