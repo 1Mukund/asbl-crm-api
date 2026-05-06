@@ -1646,9 +1646,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           }
           const ab = await fetchRes.arrayBuffer();
           const buf = Buffer.from(ab);
-          const text = await extractTextFromPDF(buf);
+          let text = "";
+          let extractErr = "";
+          try {
+            text = await extractTextFromPDF(buf);
+          } catch (e: any) {
+            extractErr = e?.message || String(e);
+          }
           if (!text) {
-            results.push({ id: row.id, error: "empty text (image-only PDF or parse fail)" });
+            results.push({
+              id: row.id,
+              error: `extract returned empty (${extractErr || "no exception thrown"}) for ${url.slice(0, 100)}`,
+            });
             continue;
           }
           await fetch(`${SUPABASE_URL}/rest/v1/project_documents?id=eq.${row.id}`, {

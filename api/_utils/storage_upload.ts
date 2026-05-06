@@ -93,12 +93,9 @@ export async function extractTextFromPDF(pdfBuffer: Buffer): Promise<string> {
   }
 
   // ── Tier 2 — Gemini vision OCR (image-only PDFs) ─────────────────────
-  try {
-    return await extractWithGeminiVision(pdfBuffer);
-  } catch (err: any) {
-    console.error(`[storage_upload] Vision OCR failed: ${err.message}`);
-    return "";
-  }
+  // Throw the underlying error so the backfill caller can surface it
+  // instead of swallowing into an empty string.
+  return await extractWithGeminiVision(pdfBuffer);
 }
 
 /** Extract text from a PDF using Gemini 2.0 Flash vision.
