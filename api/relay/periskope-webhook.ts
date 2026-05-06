@@ -23,7 +23,7 @@ import { resolveProject, detectMultiProjectIntent, Project } from "../_utils/pro
 import { getProjectFacts } from "../_utils/project_facts";
 import { getInventoryForProject } from "../_utils/inventory_sheet";
 import { getConversationContext } from "../_utils/conversation_context";
-import { sanitizeReply } from "../_utils/sanitizer";
+import { sanitizeReply, stripReintroduction } from "../_utils/sanitizer";
 import { getDocumentFor, sendDocViaPeriskope } from "../_utils/document_dispatcher";
 import { callGemini } from "../_utils/gemini_chat";
 import { customerWordToDocType } from "../_utils/kb_doc_extractor";
@@ -765,8 +765,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // 9. Save inbound message with project + (Zoho-mapped) intent tags
     await saveMessage(phone, "inbound", message, sender, project, zohoIntent);
 
-    const reply = sanitizeReply(geminiOutput.reply);
-    console.log(`[Periskope Webhook] Gemini reply (sanitized): ${reply.slice(0, 100)}`);
+    // Strip mid-conversation re-introduction prefixes ("Hi Shivank, picking
+    // up on Loft —") that Gemini emits despite the prompt forbidding them.
+    // hasHistory is true when there's at least one prior Anandita reply in
+    // CONVERSATION_HISTORY — formatted by conversation_context.ts as "you: ..."
+    const hasHistory =
+      conversation.totalMessages > 0 &&
+      /\byou:\s/.test(conversation.formatted || "");
+    const reply = stripReintroduction(sanitizeReply(geminiOutput.reply), hasHistory);
+    console.log(`[Periskope Webhook] Gemini reply (sanitized, history=${hasHistory}): ${reply.slice(0, 120)}`);
 
     // 10. Save outbound IMMEDIATELY so a fast follow-up message from the
     //     customer sees the bot's reply in CONVERSATION_HISTORY, even if

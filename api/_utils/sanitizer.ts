@@ -22,6 +22,51 @@ const BANNED_PATTERNS: Array<RegExp> = [
   /\bit\s+(would|will)\s+be\s+my\s+pleasure\s+to\s+[^.!?\n]*[.!?\n]/gi,
 ];
 
+/**
+ * Strip mid-conversation re-introduction prefixes. Gemini consistently
+ * starts replies with "Hi <name>, picking up on <project> —" even when
+ * the prompt forbids it. This post-processor removes that pattern so the
+ * customer never sees the bot-y greeting on the 2nd, 3rd, Nth message.
+ *
+ * Pass `hasHistory = true` only when CONVERSATION_HISTORY had a prior
+ * Anandita reply. On the very first turn the greeting stays.
+ */
+export function stripReintroduction(text: string, hasHistory: boolean): string {
+  if (!text || !hasHistory) return text;
+  let out = text.trimStart();
+
+  // Patterns Gemini emits — order matters (longest first to catch combos)
+  const REINTRO_PATTERNS: RegExp[] = [
+    // "Hi <Name>, Anandita here from ASBL. Picking up on <Project> — "
+    /^Hi\s+\w+,?\s*Anandita\s+here(?:\s+from\s+ASBL)?[\.,]?\s*(?:Just\s+)?[Pp]icking\s+up\s+(?:on|from)\s+[^.,—\-]+[.,]?\s*[—\-]?\s*/i,
+    // "Hi <Name>, picking up on <Project> — "
+    /^Hi\s+\w+,?\s*(?:Just\s+)?[Pp]icking\s+up\s+(?:on|from)\s+(?:our\s+last\s+chat|[^.,—\-]+)[.,]?\s*[—\-]?\s*/i,
+    // "Hi <Name>, Anandita here from ASBL. "
+    /^Hi\s+\w+,?\s*Anandita\s+here(?:\s+from\s+ASBL)?[\.,]?\s*/i,
+    // "Hi <Name>. Anandita here. " variants
+    /^Hi\s+\w+[.,]?\s*Anandita(?:\s+here)?[.,]?\s*/i,
+    // Bare "Hi <Name>, " or "Hi <Name>. "
+    /^Hi\s+\w+\s*[.,]?\s*[—\-]?\s*/i,
+    // "Picking up on <project> — " without greeting
+    /^(?:Just\s+)?[Pp]icking\s+up\s+(?:on|from)\s+(?:our\s+last\s+chat|[^.,—\-]+)[.,]?\s*[—\-]?\s*/i,
+    // "Hey <Name>, Anandita again. "
+    /^Hey\s+\w+,?\s*Anandita\s+again[.,]?\s*/i,
+  ];
+
+  for (const re of REINTRO_PATTERNS) {
+    const next = out.replace(re, "");
+    if (next !== out) {
+      out = next.trimStart();
+      // Capitalize the new first letter so the message reads cleanly
+      if (out.length && /[a-z]/.test(out[0])) {
+        out = out[0].toUpperCase() + out.slice(1);
+      }
+      break;
+    }
+  }
+  return out;
+}
+
 export function sanitizeReply(text: string): string {
   if (!text) return text;
   let out = text;
