@@ -72,12 +72,17 @@ export function detectMultiProjectIntent(message: string): boolean {
   const m = message.toLowerCase();
   const triggers = [
     "all your projects", "all projects", "all the projects",
-    "across all", "across project", "every project", "in all",
-    "all units", "all sizes", "all options",
+    "across all", "across project", "across projects", "every project", "in all",
+    "all units", "all sizes", "all options", "all unit plans", "all floor plans",
     "compare", "comparison", "vs ", " versus",
     "list of projects", "tell me about your projects", "what all projects",
     "kaunsa", "kaun sa", "konsa", "kon sa", // hindi: which one
     "all offers", "all schemes",
+    // RERA / approval queries across projects
+    "all rera", "rera of all", "rera for all", "rera numbers", "every rera",
+    // generic "all" across categories often used in our domain
+    "for all projects", "of all projects", "from all projects",
+    "all the projects", "all 4 projects", "all four projects",
   ];
   return triggers.some((t) => m.includes(t));
 }

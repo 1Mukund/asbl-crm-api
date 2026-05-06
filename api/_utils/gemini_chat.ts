@@ -348,7 +348,7 @@ export async function callGemini(
       flags: [],
       project: null,
       docToSend: null,
-      reply: "Hmm, give me a sec — let me pull that up and revert in just a moment.",
+      reply: "Let me confirm that with the project team and revert in a bit.",
     };
   }
 
@@ -356,13 +356,13 @@ export async function callGemini(
 
   // If parser landed on the friendly deflection AND grounding was on, retry
   // ONCE without grounding (often resolves Google Search-induced truncation).
-  const isDeflection = parsed.reply.startsWith("Hmm, give me a sec");
+  const isDeflection = parsed.reply.startsWith("Let me confirm that with the project team");
   if (isDeflection && opts.enableGrounding !== false) {
     try {
       console.warn("[Gemini] Parser hit Tier-3 deflection; retrying without grounding");
       const retryRaw = await callGeminiRaw(structuredUserMessage, { ...opts, enableGrounding: false });
       const retryParsed = parseStructuredOutput(retryRaw);
-      if (!retryParsed.reply.startsWith("Hmm, give me a sec")) {
+      if (!retryParsed.reply.startsWith("Let me confirm that with the project team")) {
         return retryParsed;
       }
     } catch (err: any) {
@@ -547,6 +547,6 @@ function parseStructuredOutput(rawText: string): GeminiStructuredReply {
     flags: [],
     project: null,
     docToSend: null,
-    reply: "Hmm, give me a sec — let me pull that up and revert in just a moment.",
+    reply: "Let me confirm that with the project team and revert in a bit.",
   };
 }

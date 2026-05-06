@@ -726,16 +726,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // 12. Auto-deliver document via Periskope when Gemini signals it.
-    //     Gemini's structured output specifies doc_to_send directly;
-    //     we fall back to message-keyword scan if Gemini didn't set it.
+    //     STRICT GATING — only fire doc lookup when Gemini EXPLICITLY set
+    //     doc_to_send to a non-null slug. Earlier we also fired on
+    //     intent === DOCUMENT_REQUEST with doc_to_send=null, which caused
+    //     the "Sure, which tower? — Actually one sec, not on my phone"
+    //     double-message bug when Gemini purposely asked a clarifying
+    //     question instead of sending a doc. Now Gemini is the single
+    //     source of truth for whether a doc should be delivered.
     let docSent: { doc_type: string; url: string; source?: string } | null = null;
-    const isDocRequest =
-      classification.intent === "DOCUMENT_REQUEST" ||
-      geminiOutput.docToSend !== null;
+    const isDocRequest = geminiOutput.docToSend !== null;
 
     if (project && isDocRequest) {
-      const docTypeFromMsg =
-        geminiOutput.docToSend || customerWordToDocType(message) || "brochure";
+      const docTypeFromMsg = geminiOutput.docToSend!;
       try {
         // For multi-slot doc types (unit_plan / floor_plan), pass the raw
         // customer message as a hint so the dispatcher fuzzy-matches the right
