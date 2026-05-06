@@ -1619,32 +1619,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const rows = (await r.json()) as Array<any>;
       const results: any[] = [];
       for (const row of rows) {
+        const url = String(row.url || "");
         const filename = String(row.filename || "");
-        if (!filename.toLowerCase().endsWith(".pdf")) {
+        const isPdf = filename.toLowerCase().endsWith(".pdf") || url.toLowerCase().includes(".pdf");
+        if (!isPdf) {
           results.push({ id: row.id, skipped: "not a pdf" });
           continue;
         }
         try {
-          // Reconstruct storage path from public URL — patterns we've seen:
-          //   .../storage/v1/object/public/<bucket>/<path>
-          //   .../storage/v1/object/<bucket>/<path>           (sometimes seen)
-          //   .../storage/v1/object/sign/<bucket>/<path>?...  (signed URL)
-          const url = String(row.url || "");
-          let storagePath = "";
-          const m =
-            url.match(/\/storage\/v1\/object\/public\/[^/]+\/(.+?)(?:\?.*)?$/) ||
-            url.match(/\/storage\/v1\/object\/sign\/[^/]+\/(.+?)(?:\?.*)?$/) ||
-            url.match(/\/storage\/v1\/object\/[^/]+\/(.+?)(?:\?.*)?$/);
-          if (m) {
-            storagePath = decodeURIComponent(m[1]);
-          } else {
-            results.push({ id: row.id, error: `couldn't parse storage path from URL: ${url.slice(0, 120)}` });
+          // Generic public-URL fetch — works for Supabase Storage AND legacy
+          // AWS S3 (leads-test-public.s3.ap-south-1.amazonaws.com) URLs
+          // that were registered before signed-upload flow existed.
+          const fetchRes = await fetch(url);
+          if (!fetchRes.ok) {
+            results.push({ id: row.id, error: `fetch ${fetchRes.status} for ${url.slice(0, 80)}` });
             continue;
           }
-          const buf = await downloadFromStorage(storagePath);
+          const ab = await fetchRes.arrayBuffer();
+          const buf = Buffer.from(ab);
           const text = await extractTextFromPDF(buf);
           if (!text) {
-            results.push({ id: row.id, error: "empty text" });
+            results.push({ id: row.id, error: "empty text (image-only PDF or parse fail)" });
             continue;
           }
           await fetch(`${SUPABASE_URL}/rest/v1/project_documents?id=eq.${row.id}`, {
