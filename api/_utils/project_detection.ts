@@ -80,6 +80,10 @@ export function detectMultiProjectIntent(message: string): boolean {
     "all offers", "all schemes",
     // RERA / approval queries across projects
     "all rera", "rera of all", "rera for all", "rera numbers", "every rera",
+    "rera of each", "rera for each", "rera number for each",
+    // "of each" / "for each" / "each project" patterns (covers RERA, possession,
+    // price, location, etc. when asked across projects)
+    "of each project", "for each project", "each project", "in each project",
     // generic "all" across categories often used in our domain
     "for all projects", "of all projects", "from all projects",
     "all the projects", "all 4 projects", "all four projects",
