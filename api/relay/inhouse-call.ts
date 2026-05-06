@@ -46,18 +46,58 @@ function detectRegion(e164: string): "IN" | "US" | "OTHER" {
   return "OTHER";
 }
 
-/** Trigger the in-house ASBL voice bot (India calls). */
+/** Trigger the in-house ASBL voice bot (India calls).
+ *
+ *  Uses /api/schedule-call (richer than /api/trigger-call) so we can pass:
+ *    - customer_name → bot greets by name instead of "Hello sir"
+ *    - external_schedule_id → posthook correlates without our extra field
+ *    - external_customer_id → MLID for cross-call identity
+ *    - metadata → project / plid / mlid / size_pref / budget that the bot's
+ *      LLM session can use as conversation context
+ *
+ *  Falls back to /api/trigger-call automatically on 404 (in case schedule-call
+ *  was unavailable on the bot's deployment).
+ */
 async function triggerInHouseBot(
   phone: string,
+  ctx: {
+    customer_name?: string;
+    external_schedule_id?: string;
+    external_customer_id?: string;
+    metadata?: Record<string, any>;
+  },
 ): Promise<{ ok: boolean; status: number; data: any }> {
-  const r = await fetch(`${VOICEBOT_URL}/api/trigger-call`, {
+  const schedulePayload: any = { to: phone };
+  if (ctx.customer_name)        schedulePayload.customer_name = ctx.customer_name;
+  if (ctx.external_schedule_id) schedulePayload.external_schedule_id = ctx.external_schedule_id;
+  if (ctx.external_customer_id) schedulePayload.external_customer_id = ctx.external_customer_id;
+  if (ctx.metadata && Object.keys(ctx.metadata).length) {
+    schedulePayload.metadata = ctx.metadata;
+  }
+
+  // Try /api/schedule-call first (richer)
+  let r = await fetch(`${VOICEBOT_URL}/api/schedule-call`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${VOICEBOT_API_KEY}`,
     },
-    body: JSON.stringify({ to: phone }),
+    body: JSON.stringify(schedulePayload),
   });
+
+  // Fallback to /api/trigger-call if schedule-call isn't deployed
+  if (r.status === 404) {
+    console.warn("[InHouse Call IN] /api/schedule-call returned 404 — falling back to /api/trigger-call");
+    r = await fetch(`${VOICEBOT_URL}/api/trigger-call`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${VOICEBOT_API_KEY}`,
+      },
+      body: JSON.stringify({ to: phone }),
+    });
+  }
+
   const data = await r.json().catch(() => ({}));
   return { ok: r.ok && (data as any)?.success === true, status: r.status, data };
 }
@@ -108,18 +148,56 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return res.status(500).json({ error: "ASBL_VOICEBOT_API_KEY env var not configured" });
       }
 
-      const result = await triggerInHouseBot(phone);
+      // Extract context that Zoho Deluge already supplies on every trigger.
+      // This is what enables Anandita to greet by name + speak about the
+      // right project (was missing earlier — bot knew nothing about the lead).
+      const customerName: string =
+        body.customer_full_name ||
+        body.customer_name ||
+        (body.retell_llm_dynamic_variables?.customer_name) ||
+        "";
+      const externalScheduleId: string = body.external_schedule_id || "";
+      const externalCustomerId: string =
+        body.external_customer_id ||
+        body.retell_llm_dynamic_variables?.mlid ||
+        "";
+
+      // Pass everything Deluge gave us (project, mlid, plid, etc.) as
+      // metadata so the voice-bot's LLM session has full context.
+      const dynVars = body.retell_llm_dynamic_variables || {};
+      const metadata: Record<string, any> = {
+        project: dynVars.project_name || body.project || "",
+        plid: dynVars.plid || "",
+        mlid: dynVars.mlid || "",
+        customer_phone: dynVars.customer_phone || phone,
+        customer_name: customerName,
+      };
+      // Strip empty values so we don't ship noise
+      for (const k of Object.keys(metadata)) {
+        if (!metadata[k]) delete metadata[k];
+      }
+
+      const result = await triggerInHouseBot(phone, {
+        customer_name: customerName || undefined,
+        external_schedule_id: externalScheduleId || undefined,
+        external_customer_id: externalCustomerId || undefined,
+        metadata: Object.keys(metadata).length ? metadata : undefined,
+      });
       if (!result.ok) {
-        console.error(`[InHouse Call] Voice-bot trigger failed (${result.status}):`, result.data);
+        console.error(`[InHouse Call IN] Voice-bot trigger failed (${result.status}):`, result.data);
         return res.status(result.status || 500).json({
           error: result.data?.error || `voice-bot ${result.status}`,
           voicebot_response: result.data,
         });
       }
 
-      const callId: string = result.data.call_id;
-      const provider: string = result.data.provider || "unknown";
-      console.log(`[InHouse Call IN] Triggered → call_id=${callId} provider=${provider}`);
+      const callId: string = result.data.call_id || result.data.external_schedule_id || "";
+      const provider: string = result.data.provider || "voice-bot";
+      console.log(
+        `[InHouse Call IN] Triggered → call_id=${callId} provider=${provider} ` +
+        `customer=${customerName || "(unknown)"} project=${metadata.project || "(none)"} ` +
+        `external_schedule_id=${externalScheduleId || "(none)"}`,
+      );
 
       // Best-effort Zoho stamping (won't block the response)
       if (zohoLeadId) {
@@ -137,6 +215,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         region: "IN",
         provider,
         call_id: callId,
+        external_schedule_id: externalScheduleId,
+        customer_name: customerName,
         to: phone,
       });
     }
