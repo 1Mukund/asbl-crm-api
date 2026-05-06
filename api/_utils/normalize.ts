@@ -45,12 +45,21 @@ export function isIndianNumber(phone: string | null): boolean {
   return !!phone && phone.startsWith("91") && phone.length === 12;
 }
 
+/**
+ * Split a free-form name into first + last for Zoho Lead creation.
+ *
+ * Zoho's Leads module requires Last_Name to be non-empty. When the lead
+ * source only provides a single name token (Meta forms, website forms with
+ * one "name" field), we use "." as a placeholder — same convention as the
+ * FIM ingester. NEVER duplicate the first name as last name (which caused
+ * "Sanjay Sanjay" repetition in the lead detail / display name).
+ */
 export function parseName(fullName: string | null | undefined): { first_name: string; last_name: string } {
   if (!fullName?.trim()) return { first_name: "", last_name: "" };
   const parts = fullName.trim().split(/\s+/);
   return {
     first_name: parts[0],
-    last_name: parts.length > 1 ? parts.slice(1).join(" ") : parts[0],
+    last_name: parts.length > 1 ? parts.slice(1).join(" ") : ".",
   };
 }
 
