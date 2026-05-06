@@ -1431,13 +1431,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       ].join("\n");
 
       const reply = await callGemini(structuredMessage, { enableGrounding: false });
+
+      // Apply the same post-processing the production webhook does so this
+      // endpoint reflects what the customer would actually see.
+      const { sanitizeReply, stripReintroduction } = await import("./_utils/sanitizer");
+      const hasHistoryFlag =
+        history !== "no prior conversation" && /\byou:\s/.test(history);
+      const sanitized = stripReintroduction(sanitizeReply(reply.reply), hasHistoryFlag);
+
       return res.status(200).json({
         ok: true,
         project,
         message,
         elapsedMs: Date.now() - t0,
         contextSize: projectContext.length,
-        gemini: reply,
+        hasHistory: hasHistoryFlag,
+        gemini: { ...reply, reply_raw: reply.reply, reply: sanitized },
       });
     } catch (err: any) {
       console.error(`[test-gemini] failed: ${err.message}`);
