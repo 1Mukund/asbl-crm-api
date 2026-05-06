@@ -1357,10 +1357,45 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           };
         }
       } catch {}
+      // 3. Page subscribed_apps — verifies Meta still has us subscribed for
+      //    the leadgen field on this page. If we're NOT in this list, leads
+      //    will stop coming even though the token is valid.
+      let subscribedApps: any = null;
+      try {
+        const sRes = await fetch(
+          `https://graph.facebook.com/v19.0/${meBody.id}/subscribed_apps?access_token=${encodeURIComponent(token)}`
+        );
+        const sBody = await sRes.json();
+        if (sBody?.data) {
+          subscribedApps = sBody.data.map((app: any) => ({
+            id: app.id,
+            name: app.name,
+            link: app.link,
+            subscribed_fields: app.subscribed_fields || [],
+            has_leadgen: (app.subscribed_fields || []).includes("leadgen"),
+          }));
+        } else if (sBody?.error) {
+          subscribedApps = { error: sBody.error };
+        }
+      } catch (e: any) {
+        subscribedApps = { error: e.message };
+      }
+
+      // 4. Form-allowlist info — if env var is set, show how many forms
+      //    pass through and whether incoming forms might be silently dropped.
+      const allowlistRaw = process.env.META_FORM_IDS_ALLOWLIST || "";
+      const allowlist = {
+        configured: !!allowlistRaw,
+        count: allowlistRaw ? allowlistRaw.split(",").filter(Boolean).length : 0,
+        sample: allowlistRaw.split(",").map((s: string) => s.trim()).filter(Boolean).slice(0, 3),
+      };
+
       return res.status(200).json({
         verdict: "OK",
         page: { id: meBody.id, name: meBody.name },
         debug,
+        subscribed_apps: subscribedApps,
+        form_allowlist: allowlist,
       });
     } catch (err: any) {
       return res.status(500).json({ verdict: "FETCH_ERROR", error: err.message });
