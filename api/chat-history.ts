@@ -1224,7 +1224,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // GET ?action=zoho-create-inhouse-field&secret=<...>
   //   Attempts to CREATE Last_Inhouse_Call_ID via Zoho Metadata API.
   //   Requires the refresh token to have ZohoCRM.settings.fields.CREATE scope.
-  if (req.method === "GET" && (req.query.action === "zoho-fields" || req.query.action === "zoho-create-inhouse-field")) {
+  if (req.method === "GET" && (req.query.action === "zoho-fields" || req.query.action === "zoho-create-inhouse-field" || req.query.action === "zoho-create-recording-field")) {
     const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
     const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
     if (!expectedSecret || incomingSecret !== expectedSecret) {
@@ -1262,6 +1262,33 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           total_fields: allFields.length,
           call_related_fields: callRelated,
           Last_Inhouse_Call_ID_exists: hasInhouse,
+        });
+      }
+
+      // zoho-create-recording-field — creates Last_Recording_URL (text, 500 chars)
+      if (req.query.action === "zoho-create-recording-field") {
+        const hasRecording = allFields.some((f) => f.api_name === "Last_Recording_URL");
+        if (hasRecording) {
+          return res.status(200).json({
+            status: "already_exists",
+            existing: callRelated.find((f) => f.api_name === "Last_Recording_URL"),
+          });
+        }
+        const cr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+          method: "POST",
+          headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            fields: [{
+              field_label: "Last Recording URL",
+              data_type: "text",
+              length: 500,
+            }],
+          }),
+        });
+        return res.status(cr.status).json({
+          attempted: true,
+          http_status: cr.status,
+          response: await cr.json().catch(() => ({})),
         });
       }
 

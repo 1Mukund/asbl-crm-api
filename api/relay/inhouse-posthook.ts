@@ -94,10 +94,65 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     const body = (req.body || {}) as any;
     const event = String(body.event || "").toLowerCase();
-    // Tag every log line in this request with the call_sid so log
-    // interleaving (multiple webhooks in flight) is unambiguous.
     const tag = body.call_sid || body.call_id || "no-id";
     console.log(`[InHouse Posthook ${tag}] Event=${event} payload-keys=${Object.keys(body).join(",")}`);
+
+    // ── recording_ready: async second event from voice-bot once Plivo's
+    //    recording finishes. Carries call_sid + recording_url. We stamp
+    //    Last_Recording_URL on the lead and add a lightweight note with
+    //    the URL so sales can listen back instantly.
+    if (event === "recording_ready") {
+      const callSid: string = body.call_sid || body.call_id || "";
+      const recordingUrl: string = body.recording_url || body.recording_link || "";
+      const phone: string = body.phone_number || body.phone || "";
+      const recDurationSecs: number = Number(body.recording_duration_secs ?? body.duration_seconds ?? 0);
+      if (!callSid || !recordingUrl) {
+        return res.status(400).json({ error: "recording_ready needs call_sid + recording_url" });
+      }
+
+      // Look up the lead by call_id first, phone fallback
+      let lead: any = null;
+      try { lead = await findLeadByInhouseCallId(callSid); } catch {}
+      if (!lead && phone) {
+        const cleanedPhone = String(phone).replace(/^\+/, "");
+        lead = await findLeadByPhone(cleanedPhone);
+      }
+      if (!lead) {
+        console.log(`[InHouse Posthook ${callSid}] recording_ready: no lead found`);
+        return res.status(200).json({ status: "ok", message: "recording_ready: lead not found — ignored" });
+      }
+
+      // 1. Stamp the recording URL on the lead (best-effort — only writes the
+      //    custom field if it exists in Zoho schema).
+      try {
+        await updateLead(lead.id, { Last_Recording_URL: recordingUrl });
+        console.log(`[InHouse Posthook ${callSid}] Last_Recording_URL set on lead ${lead.id}`);
+      } catch (err: any) {
+        console.warn(`[InHouse Posthook ${callSid}] Last_Recording_URL update failed (field may not exist): ${err.message}`);
+      }
+
+      // 2. Add a lightweight note that's just the recording link (so sales
+      //    can click straight from the lead's Notes timeline).
+      try {
+        await createCallNote({
+          leadId: lead.id,
+          externalId: `${callSid} — recording`,
+          callStatus: "Recording",
+          durationSecs: recDurationSecs,
+          recordingUrl,
+        });
+        console.log(`[InHouse Posthook ${callSid}] recording note added to lead ${lead.id}`);
+      } catch (err: any) {
+        console.error(`[InHouse Posthook ${callSid}] recording note failed: ${err.message}`);
+      }
+
+      return res.status(200).json({
+        status: "ok",
+        event: "recording_ready",
+        lead_id: lead.id,
+        recording_url_set: true,
+      });
+    }
 
     // ── Lenient field extraction (covers both call_completed and posthook_received) ──
     const callId: string =
