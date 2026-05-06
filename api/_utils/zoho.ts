@@ -17,27 +17,39 @@ let tokenExpiry = 0;
 export async function getAccessToken(): Promise<string> {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
 
-  try {
-    const res = await axios.post(ZOHO_TOKEN_URL, null, {
-      params: {
-        grant_type: "refresh_token",
-        client_id: ZOHO_CLIENT_ID,
-        client_secret: ZOHO_CLIENT_SECRET,
-        refresh_token: ZOHO_REFRESH_TOKEN,
-      },
-    });
-
-    if (!res.data.access_token) {
-      throw new Error(`Zoho token error: ${JSON.stringify(res.data)}`);
+  // Retry on transient network errors (ETIMEDOUT / ECONNRESET) — Zoho's
+  // accounts.zoho.in occasionally times out on initial connect. Up to 3
+  // attempts with 500ms backoff before throwing.
+  let lastErr: any;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await axios.post(ZOHO_TOKEN_URL, null, {
+        params: {
+          grant_type: "refresh_token",
+          client_id: ZOHO_CLIENT_ID,
+          client_secret: ZOHO_CLIENT_SECRET,
+          refresh_token: ZOHO_REFRESH_TOKEN,
+        },
+        timeout: 8000, // hard 8s timeout instead of axios default
+      });
+      if (!res.data.access_token) {
+        throw new Error(`Zoho token error: ${JSON.stringify(res.data)}`);
+      }
+      cachedToken = res.data.access_token;
+      tokenExpiry = Date.now() + (res.data.expires_in - 60) * 1000;
+      return cachedToken!;
+    } catch (err: any) {
+      lastErr = err;
+      const code = err?.code || "";
+      const isTransient =
+        code === "ETIMEDOUT" || code === "ECONNRESET" || code === "ENOTFOUND" || err?.message?.includes("timeout");
+      if (!isTransient || attempt === 3) break;
+      console.warn(`[Zoho auth] transient ${code} on attempt ${attempt} — retrying...`);
+      await new Promise((r) => setTimeout(r, 500 * attempt));
     }
-
-    cachedToken = res.data.access_token;
-    tokenExpiry = Date.now() + (res.data.expires_in - 60) * 1000;
-    return cachedToken!;
-  } catch (err: any) {
-    const detail = err.response?.data ?? err.message;
-    throw new Error(`Zoho auth failed: ${JSON.stringify(detail)}`);
   }
+  const detail = lastErr?.response?.data ?? lastErr?.message ?? String(lastErr);
+  throw new Error(`Zoho auth failed: ${JSON.stringify(detail)}`);
 }
 
 // ─── Lead Search ─────────────────────────────────────────────────────────────
@@ -148,7 +160,16 @@ export async function triggerBlueprintTransition(
     console.log(`Blueprint transition "${transitionName}" triggered for lead ${leadId}`);
   } catch (err: any) {
     // Non-fatal — log and continue
-    console.error(`Blueprint transition failed for lead ${leadId}:`, err.response?.data ?? err.message);
+    // RECORD_NOT_IN_PROCESS is expected when the lead's current state doesn't
+    // match the transition's "from" state (e.g. transition "Call Connected"
+    // requires Lead_Status = "Lead Initiated", but lead is already at
+    // "Contacted" / "Pre Site"). Quiet warning — not a real failure.
+    const detail = err.response?.data;
+    if (detail?.code === "RECORD_NOT_IN_PROCESS") {
+      console.log(`Blueprint transition "${transitionName}" skipped for lead ${leadId} — lead not in matching state (expected, not an error)`);
+      return;
+    }
+    console.error(`Blueprint transition failed for lead ${leadId}:`, detail ?? err.message);
   }
 }
 

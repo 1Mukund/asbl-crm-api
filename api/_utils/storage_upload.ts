@@ -107,11 +107,28 @@ async function extractWithGeminiVision(pdfBuffer: Buffer): Promise<string> {
     throw new Error(`PDF too large (${(pdfBuffer.length / 1024 / 1024).toFixed(1)} MB) — exceeds inline-vision cap`);
   }
 
-  // gemini-1.5-flash is the most reliable model for PDF vision input on
-  // public API keys. gemini-2.0-flash returned 404 for our key tier.
-  // Override via GEMINI_VISION_MODEL env if needed.
-  const visionModel = process.env.GEMINI_VISION_MODEL || "gemini-1.5-flash";
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${visionModel}:generateContent?key=${apiKey}`;
+  // Try multiple model names — Gemini API model availability varies per
+  // API key tier. We attempt them in order from cheapest/fastest to most
+  // capable until one returns 200.
+  const candidates = (process.env.GEMINI_VISION_MODEL || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!candidates.length) {
+    candidates.push(
+      "gemini-2.5-flash",
+      "gemini-2.0-flash-001",
+      "gemini-1.5-flash-002",
+      "gemini-1.5-flash-latest",
+      "gemini-1.5-flash",
+      "gemini-3-pro-preview",
+      "gemini-3.1-pro-preview",
+    );
+  }
+
+  let lastErr = "";
+  for (const visionModel of candidates) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${visionModel}:generateContent?key=${apiKey}`;
   const body = {
     contents: [
       {
@@ -142,33 +159,46 @@ async function extractWithGeminiVision(pdfBuffer: Buffer): Promise<string> {
     },
   };
 
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 60000); // 60 s — vision can be slow on big PDFs
-  try {
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: ctrl.signal,
-    });
-    clearTimeout(timer);
-    if (!r.ok) {
-      const errText = await r.text();
-      throw new Error(`Vision API ${r.status}: ${errText.slice(0, 200)}`);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 60000);
+    try {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      if (!r.ok) {
+        const errText = await r.text();
+        lastErr = `${visionModel} → ${r.status}: ${errText.slice(0, 100)}`;
+        if (r.status === 404) {
+          // Model not accessible — try next candidate
+          console.warn(`[Vision OCR] ${visionModel} not accessible (404), trying next...`);
+          continue;
+        }
+        throw new Error(`Vision API ${r.status} on ${visionModel}: ${errText.slice(0, 200)}`);
+      }
+      const data = (await r.json()) as any;
+      const parts = data?.candidates?.[0]?.content?.parts || [];
+      const text = parts.map((p: any) => p?.text || "").join("").trim();
+      if (!text) {
+        const finishReason = data?.candidates?.[0]?.finishReason || "unknown";
+        lastErr = `${visionModel} → empty (finishReason: ${finishReason})`;
+        continue;
+      }
+      console.log(`[Vision OCR] ${visionModel} succeeded — ${text.length} chars`);
+      return text;
+    } catch (err: any) {
+      clearTimeout(timer);
+      if (err.name === "AbortError") {
+        lastErr = `${visionModel} timed out`;
+        continue;
+      }
+      throw err;
     }
-    const data = (await r.json()) as any;
-    const parts = data?.candidates?.[0]?.content?.parts || [];
-    const text = parts.map((p: any) => p?.text || "").join("").trim();
-    if (!text) {
-      const finishReason = data?.candidates?.[0]?.finishReason || "unknown";
-      throw new Error(`Empty Vision output (finishReason: ${finishReason})`);
-    }
-    return text;
-  } catch (err: any) {
-    clearTimeout(timer);
-    if (err.name === "AbortError") throw new Error("Vision OCR timed out after 60s");
-    throw err;
   }
+  throw new Error(`All vision models failed. Last error: ${lastErr}`);
 }
 
 /** Decode UTF-8 text from base64 (for TXT KB uploads). */
