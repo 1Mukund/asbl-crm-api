@@ -107,7 +107,11 @@ async function extractWithGeminiVision(pdfBuffer: Buffer): Promise<string> {
     throw new Error(`PDF too large (${(pdfBuffer.length / 1024 / 1024).toFixed(1)} MB) — exceeds inline-vision cap`);
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+  // gemini-1.5-flash is the most reliable model for PDF vision input on
+  // public API keys. gemini-2.0-flash returned 404 for our key tier.
+  // Override via GEMINI_VISION_MODEL env if needed.
+  const visionModel = process.env.GEMINI_VISION_MODEL || "gemini-1.5-flash";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${visionModel}:generateContent?key=${apiKey}`;
   const body = {
     contents: [
       {
