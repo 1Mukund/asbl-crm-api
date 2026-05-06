@@ -65,20 +65,108 @@ export async function uploadToStorage(opts: {
 }
 
 /**
- * Extract text from a PDF buffer using pdf-parse.
- * Returns the extracted plaintext (or empty string on parse failure).
+ * Extract text from a PDF buffer.
+ *
+ * Two-tier:
+ *   1. pdf-parse — fast, free, works for text-layer PDFs (specs sheets, price
+ *      sheets, payment plans).
+ *   2. Gemini 2.0 Flash with vision — handles image-only / scanned PDFs
+ *      (most real-estate brochures, master plans, floor plans, unit plans).
+ *      Uses the same GEMINI_API_KEY we already have — costs ~₹0.50 per PDF.
+ *
+ * Returns extracted plaintext; empty string only if BOTH paths fail.
  */
 export async function extractTextFromPDF(pdfBuffer: Buffer): Promise<string> {
+  // ── Tier 1 — pdf-parse (text-layer PDFs) ─────────────────────────────
   try {
-    // Lazy-load pdf-parse so module doesn't blow up on startup if missing.
-    // pdf-parse ships no types — cast through any.
-    // @ts-ignore — no @types/pdf-parse package
+    // @ts-ignore — pdf-parse ships no types
     const pdfParse: any = (await import("pdf-parse")).default;
     const data = await pdfParse(pdfBuffer);
-    return (data?.text || "").trim();
+    const text = (data?.text || "").trim();
+    if (text && text.length > 100) {
+      return text; // good extract — text-layer PDF
+    }
+    // Otherwise fall through to vision OCR
+    console.log(`[storage_upload] pdf-parse returned ${text.length} chars — falling back to Vision OCR`);
   } catch (err: any) {
-    console.error(`[storage_upload] PDF text extraction failed: ${err.message}`);
+    console.warn(`[storage_upload] pdf-parse threw: ${err.message} — trying Vision OCR`);
+  }
+
+  // ── Tier 2 — Gemini vision OCR (image-only PDFs) ─────────────────────
+  try {
+    return await extractWithGeminiVision(pdfBuffer);
+  } catch (err: any) {
+    console.error(`[storage_upload] Vision OCR failed: ${err.message}`);
     return "";
+  }
+}
+
+/** Extract text from a PDF using Gemini 2.0 Flash vision.
+ *  Cap inline data at 15 MB (Gemini inline limit is 20 MB; leaves headroom). */
+async function extractWithGeminiVision(pdfBuffer: Buffer): Promise<string> {
+  const apiKey = process.env.GEMINI_API_KEY || "";
+  if (!apiKey) throw new Error("GEMINI_API_KEY not configured");
+  if (pdfBuffer.length > 15 * 1024 * 1024) {
+    throw new Error(`PDF too large (${(pdfBuffer.length / 1024 / 1024).toFixed(1)} MB) — exceeds inline-vision cap`);
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+  const body = {
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            inline_data: {
+              mime_type: "application/pdf",
+              data: pdfBuffer.toString("base64"),
+            },
+          },
+          {
+            text:
+              "You are a document OCR + extraction tool. Extract ALL textual content " +
+              "from this real-estate document — every label, dimension, square footage, " +
+              "price, balcony measurement, room size, amenity name, specification, " +
+              "RERA / approval number, and any other text visible on any page. " +
+              "Preserve numbers exactly. Return as plain text — no markdown, no " +
+              "commentary, no preface. Just the document's raw text content, " +
+              "page by page.",
+          },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0,
+      maxOutputTokens: 8000,
+    },
+  };
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 60000); // 60 s — vision can be slow on big PDFs
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (!r.ok) {
+      const errText = await r.text();
+      throw new Error(`Vision API ${r.status}: ${errText.slice(0, 200)}`);
+    }
+    const data = (await r.json()) as any;
+    const parts = data?.candidates?.[0]?.content?.parts || [];
+    const text = parts.map((p: any) => p?.text || "").join("").trim();
+    if (!text) {
+      const finishReason = data?.candidates?.[0]?.finishReason || "unknown";
+      throw new Error(`Empty Vision output (finishReason: ${finishReason})`);
+    }
+    return text;
+  } catch (err: any) {
+    clearTimeout(timer);
+    if (err.name === "AbortError") throw new Error("Vision OCR timed out after 60s");
+    throw err;
   }
 }
 
