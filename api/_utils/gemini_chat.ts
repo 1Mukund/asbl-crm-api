@@ -16,7 +16,10 @@
 import { getBotSetting } from "./bot_settings";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3-pro-preview";
+// Default upgraded from gemini-3-pro-preview → gemini-3.1-pro-preview to match
+// the model the in-house Anandita LLM wrapper now serves. Override with the
+// GEMINI_MODEL env var to roll back if needed.
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.1-pro-preview";
 
 /**
  * Resolve the active system prompt — DB override (bot_settings.system_prompt)
