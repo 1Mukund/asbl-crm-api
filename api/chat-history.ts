@@ -1625,13 +1625,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           continue;
         }
         try {
-          // Reconstruct storage path from public URL — pattern is /object/public/<bucket>/<path>
-          const storagePathMatch = String(row.url || "").match(/\/object\/public\/[^/]+\/(.+)$/);
-          if (!storagePathMatch) {
-            results.push({ id: row.id, error: "couldn't parse storage path from URL" });
+          // Reconstruct storage path from public URL — patterns we've seen:
+          //   .../storage/v1/object/public/<bucket>/<path>
+          //   .../storage/v1/object/<bucket>/<path>           (sometimes seen)
+          //   .../storage/v1/object/sign/<bucket>/<path>?...  (signed URL)
+          const url = String(row.url || "");
+          let storagePath = "";
+          const m =
+            url.match(/\/storage\/v1\/object\/public\/[^/]+\/(.+?)(?:\?.*)?$/) ||
+            url.match(/\/storage\/v1\/object\/sign\/[^/]+\/(.+?)(?:\?.*)?$/) ||
+            url.match(/\/storage\/v1\/object\/[^/]+\/(.+?)(?:\?.*)?$/);
+          if (m) {
+            storagePath = decodeURIComponent(m[1]);
+          } else {
+            results.push({ id: row.id, error: `couldn't parse storage path from URL: ${url.slice(0, 120)}` });
             continue;
           }
-          const storagePath = decodeURIComponent(storagePathMatch[1]);
           const buf = await downloadFromStorage(storagePath);
           const text = await extractTextFromPDF(buf);
           if (!text) {
