@@ -1090,6 +1090,80 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── Lead context for inbound calls ────────────────────────────────────
+  // GET ?action=lead-context&phone=<E164 or 10-digit>&secret=<INHOUSE_POSTHOOK_SECRET>
+  // Returns a compact context object for the voice bot to feed into the
+  // Gemini Live session at inbound-call start. Lets the bot greet by name,
+  // reference the project, and avoid asking duplicate qualifying questions.
+  if (req.method === "GET" && req.query.action === "lead-context") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=" });
+    }
+
+    const phoneRaw = String(req.query.phone || "").trim();
+    if (!phoneRaw) return res.status(400).json({ error: "phone query param required" });
+    const phone = phoneRaw.replace(/^\+/, "").replace(/\D/g, "");
+
+    try {
+      const { findLeadByPhone } = await import("./_utils/zoho");
+      const lead = await findLeadByPhone(phone);
+      if (!lead) {
+        return res.status(200).json({
+          found: false,
+          phone,
+          message: "No lead with this phone in Zoho. Treat as fresh inquiry.",
+        });
+      }
+
+      // Pull last 5 WhatsApp messages to summarise prior intent
+      let lastWaIntent: string | null = null;
+      let lastWaMessage: string | null = null;
+      try {
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/whatsapp_messages?phone=eq.${phone}&order=created_at.desc&limit=5&select=message,intent,direction,created_at`,
+          { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+        );
+        const rows = (await r.json()) as any[];
+        const last = rows?.[0];
+        lastWaMessage = last?.message?.slice(0, 200) || null;
+        lastWaIntent = last?.intent || null;
+      } catch {}
+
+      const fullName = [lead.First_Name, lead.Last_Name]
+        .filter((n) => n && n !== ".")
+        .join(" ")
+        .trim() || null;
+
+      return res.status(200).json({
+        found: true,
+        phone,
+        lead_id: lead.id,
+        customer_name: fullName,
+        first_name: lead.First_Name || null,
+        project: lead.ASBL_Project || null,
+        lead_status: lead.Lead_Status || null,
+        call_status: lead.Call_Status || null,
+        mlid: lead.Master_Lead_ID || null,
+        plid: lead.Project_Lead_ID || null,
+        last_arrowhead_call_id: lead.Last_Arrowhead_Call_ID || null,
+        last_inhouse_call_id: lead.Last_Inhouse_Call_ID || null,
+        total_call_duration_secs: lead.Total_Call_Duration_Secs || 0,
+        recent_whatsapp: lastWaMessage
+          ? { intent: lastWaIntent, last_message: lastWaMessage }
+          : null,
+        // A ready-to-inject snippet the bot can prepend to its system prompt
+        context_snippet:
+          fullName
+            ? `The caller is ${fullName} (Mobile ${phone}). They previously enquired about ASBL ${lead.ASBL_Project || "(project not set)"}. ${lead.Lead_Status ? `Current lead status: ${lead.Lead_Status}.` : ""} ${lastWaMessage ? `Their last WhatsApp message was: "${lastWaMessage.slice(0, 120)}".` : ""}`.trim()
+            : `Caller (Mobile ${phone}) is in our CRM but name is missing. They previously enquired about ASBL ${lead.ASBL_Project || "(project not set)"}.`,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── Zoho daily leads report (since YYYY-MM-DD) ───────────────────────
   // GET ?action=zoho-leads-report&since=YYYY-MM-DD&secret=<INHOUSE_POSTHOOK_SECRET>
   // Pages through all Zoho Leads created on/after `since`, returns per-day
