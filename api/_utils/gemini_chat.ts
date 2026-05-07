@@ -312,6 +312,87 @@ const VALID_INTENTS = [
   "SPAM", "GIBBERISH", "GENERAL",
 ];
 
+// ─── Kimi-as-Gemini-fallback helpers ─────────────────────────────────────
+// When Gemini returns empty / unparseable / Tier-3 deflection, we delegate
+// to Kimi for a quick humanlike reply so the customer doesn't get the
+// generic "Let me confirm that with the project team and revert in a bit"
+// boilerplate. This was the pre-existing failure mode on simple greetings
+// like "Hii" — Gemini 3 Pro's thinking budget burns most of maxOutputTokens
+// and the JSON never makes it out.
+
+const TIER3_DEFLECTION = "Let me confirm that with the project team and revert in a bit.";
+
+/** Extract the inner content of a <TAG>...</TAG> block from the structured
+ *  message. Returns "" if not found. */
+function extractBlock(structured: string, tag: string): string {
+  const re = new RegExp(`<${tag}>\\s*([\\s\\S]*?)\\s*</${tag}>`, "i");
+  const m = structured.match(re);
+  return m?.[1]?.trim() || "";
+}
+
+/** Pull the customer's display name out of the <CUSTOMER> block. */
+function extractCustomerName(structured: string): string {
+  const block = extractBlock(structured, "CUSTOMER");
+  if (!block) return "";
+  const m = block.match(/Name:\s*(.+)/);
+  if (!m) return "";
+  const name = m[1].trim();
+  return name === "(not provided)" ? "" : name;
+}
+
+/** Pull the resolved project out of the <CUSTOMER> block. */
+function extractProject(structured: string): string {
+  const block = extractBlock(structured, "CUSTOMER");
+  if (!block) return "";
+  const m = block.match(/Currently asking about project:\s*(.+)/);
+  if (!m) return "";
+  const proj = m[1].trim();
+  return proj === "not specified" ? "" : proj;
+}
+
+/** Last N lines from the <CONVERSATION_HISTORY> block (most-recent already
+ *  at the bottom in caller's format). */
+function extractConvSnippet(structured: string, n = 6): string {
+  const block = extractBlock(structured, "CONVERSATION_HISTORY");
+  if (!block || block === "no prior conversation") return "";
+  const lines = block.split("\n").filter((l) => l.trim());
+  return lines.slice(-n).join("\n");
+}
+
+/** Try to recover from a Gemini failure by asking Kimi for a quick reply.
+ *  Returns the Kimi reply on success, or an empty string if Kimi also fails
+ *  (caller then uses the original deflection boilerplate). */
+async function tryKimiFallbackReply(structuredUserMessage: string): Promise<string> {
+  // Lazy import — avoids forcing kimi.ts to load when Gemini path is healthy.
+  const { kimiQuickReply, kimiAvailable } = await import("./kimi");
+  if (!kimiAvailable()) return "";
+
+  const customerMessage = extractBlock(structuredUserMessage, "USER_MESSAGE");
+  if (!customerMessage) return "";
+
+  const customerName = extractCustomerName(structuredUserMessage);
+  const project = extractProject(structuredUserMessage);
+  const conversationSnippet = extractConvSnippet(structuredUserMessage, 6);
+
+  try {
+    const reply = await kimiQuickReply(customerMessage, {
+      customerName: customerName || undefined,
+      project: project || undefined,
+      conversationSnippet: conversationSnippet || undefined,
+      hasPriorTouch: !!conversationSnippet,
+    });
+    if (reply && reply.trim().length >= 3) {
+      console.log(`[Gemini→Kimi-fallback] Recovered with Kimi reply (${reply.length} chars)`);
+      return reply;
+    }
+    console.warn(`[Gemini→Kimi-fallback] Kimi returned empty/short reply`);
+    return "";
+  } catch (err: any) {
+    console.error(`[Gemini→Kimi-fallback] Kimi threw: ${err.message}`);
+    return "";
+  }
+}
+
 /**
  * Single-call Gemini: classifies intent + composes reply in one structured
  * JSON output. Returns parsed { intent, flags, project, docToSend, reply }.
@@ -346,12 +427,15 @@ export async function callGemini(
   }
 
   if (!rawText || rawText.trim().length < 5) {
+    // Gemini gave us nothing — last-resort: ask Kimi for a quick reply.
+    console.warn("[Gemini] Empty rawText after retry; trying Kimi fallback");
+    const kimiReply = await tryKimiFallbackReply(structuredUserMessage);
     return {
       intent: "GENERAL",
       flags: [],
       project: null,
       docToSend: null,
-      reply: "Let me confirm that with the project team and revert in a bit.",
+      reply: kimiReply || TIER3_DEFLECTION,
     };
   }
 
@@ -370,6 +454,16 @@ export async function callGemini(
       }
     } catch (err: any) {
       console.error(`[Gemini] Tier-3 retry failed: ${err.message}`);
+    }
+  }
+
+  // If we still have the Tier-3 deflection at this point (Gemini truly
+  // failed on both attempts), give Kimi a shot before serving boilerplate.
+  if (parsed.reply.startsWith("Let me confirm that with the project team")) {
+    console.warn("[Gemini] Tier-3 deflection persisted; trying Kimi fallback");
+    const kimiReply = await tryKimiFallbackReply(structuredUserMessage);
+    if (kimiReply) {
+      return { ...parsed, reply: kimiReply };
     }
   }
 

@@ -149,6 +149,91 @@ async function callOnce(opts: KimiCallOptions): Promise<KimiCallResult> {
   }
 }
 
+// ─── Kimi as Gemini's safety net ─────────────────────────────────────────
+// When Gemini's structured-JSON call fails entirely (empty rawText / Tier-3
+// parser deflection / MAX_TOKENS thinking burn on simple greetings), we
+// delegate to Kimi for a quick humanlike reply so the customer doesn't get
+// the generic "Let me confirm with the project team" boilerplate. Kimi sees
+// the customer message + a few last conversation turns and writes a brief
+// natural reply in Anandita's voice. Returns "" on failure → caller uses
+// its own boilerplate.
+
+export interface KimiQuickReplyContext {
+  customerName?: string;
+  project?: string | null;
+  /** Last few conversation turns formatted as plain text (already sliced
+   *  and labelled by the caller, e.g. "Customer: hi\nAnandita: ..."). */
+  conversationSnippet?: string;
+  /** When set, Kimi will lean into a "follow-up on previous question"
+   *  style instead of greeting fresh. */
+  hasPriorTouch?: boolean;
+}
+
+/**
+ * Quick humanlike fallback reply via Kimi. Used when Gemini drops the ball.
+ * Returns the reply text on success, "" on any failure (caller falls back
+ * to its own boilerplate).
+ */
+export async function kimiQuickReply(
+  customerMessage: string,
+  ctx: KimiQuickReplyContext = {},
+): Promise<string> {
+  if (!ROUTEWAY_API_KEY) return "";
+
+  const name = (ctx.customerName || "").trim();
+  const project = (ctx.project || "").trim();
+
+  const system =
+    "You are Anandita, a Relationship Manager at ASBL (Hyderabad real estate). " +
+    "The primary chatbot (Gemini) failed to produce a reply for this message. " +
+    "Your job: write ONE short, natural-sounding reply (1-2 sentences max). " +
+    "RULES:\n" +
+    "- Address the customer as Sir/Ma'am if you don't know their gender. Use their first name only if it's clearly given.\n" +
+    "- DO NOT re-introduce yourself if there's prior conversation history.\n" +
+    "- DO NOT promise to send any document, price, brochure, or PDF. Only the main bot does that.\n" +
+    "- DO NOT invent specifics (sizes, prices, RERA numbers, dates).\n" +
+    "- For greetings (Hi/Hii/Hello/Hey), greet back warmly and ask how you can help.\n" +
+    "- For unclear messages, politely ask what they need.\n" +
+    "- For thank-yous, acknowledge briefly.\n" +
+    "- Match the customer's language: English message → English reply, Hinglish → Hinglish.\n" +
+    "- Output ONLY the reply text. No JSON, no quotes, no preface.";
+
+  const userParts: string[] = [];
+  if (name) userParts.push(`Customer name: ${name}`);
+  if (project) userParts.push(`Project they enquired about: ${project}`);
+  if (ctx.conversationSnippet) {
+    userParts.push(`Recent conversation:\n${ctx.conversationSnippet}`);
+  }
+  userParts.push(`Customer's latest message: ${JSON.stringify(customerMessage)}`);
+  userParts.push("Write the one-line reply now.");
+
+  const result = await callKimi({
+    system,
+    user: userParts.join("\n\n"),
+    jsonObject: false,
+    maxTokens: 150,
+    temperature: 0.4,
+    timeoutMs: 18000,
+    tag: "quick-reply",
+  });
+
+  if (!result.ok || !result.text) return "";
+  // Strip any accidental JSON wrapping or quote chars Kimi might emit.
+  let txt = result.text.trim();
+  if (txt.startsWith('"') && txt.endsWith('"') && txt.length > 2) {
+    txt = txt.slice(1, -1);
+  }
+  // If Kimi accidentally emits JSON despite jsonObject=false, try to
+  // extract a `reply` field; otherwise return raw.
+  if (txt.startsWith("{")) {
+    try {
+      const j = JSON.parse(txt);
+      if (typeof j.reply === "string" && j.reply.trim()) return j.reply.trim();
+    } catch {}
+  }
+  return txt.slice(0, 600);
+}
+
 /** Public entrypoint with one retry on 429 / 5xx (free tier hits 429 a lot). */
 export async function callKimi(opts: KimiCallOptions): Promise<KimiCallResult> {
   if (!ROUTEWAY_API_KEY) {
