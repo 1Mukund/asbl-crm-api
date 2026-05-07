@@ -149,6 +149,117 @@ async function callOnce(opts: KimiCallOptions): Promise<KimiCallResult> {
   }
 }
 
+// ─── Kimi as full Gemini replacement (when Gemini 503s / fails) ─────────
+// Returns the same shape Gemini does — including intent + doc_to_send —
+// so the rest of the webhook works as if Gemini succeeded. Critical for
+// document delivery: when a customer asks "2035 unit plan bhejdo" and
+// Gemini 503s, the unit_plan dispatcher needs doc_to_send="unit_plan" to
+// fire, otherwise no PDF gets delivered.
+
+const KIMI_SYSTEM_PROMPT = `You are Anandita, a Relationship Manager at ASBL (Hyderabad real estate).
+The primary chatbot (Gemini) is unavailable right now, so you're handling this customer reply directly.
+
+Your job: read the customer message + project context + conversation history below, then classify intent
+and write a brief warm reply. Output STRICT JSON exactly matching the schema.
+
+# PERSONA
+- Address customers as Sir/Ma'am if you don't know their gender. First name is OK if clearly given.
+- Reply in 1-3 sentences, friendly and helpful, like a human RM on WhatsApp.
+- DO NOT re-introduce yourself if there's prior conversation history. Just answer naturally.
+- For SIMPLE GREETINGS (Hi/Hii/Hello/Hey/Namaste): greet back warmly and ask how you can help today.
+  This applies EVEN IF there's prior history — a friendly "Hi Sir! How can I help today?" is always right.
+- DO NOT invent specifics: prices, sft sizes, balcony dimensions, RERA numbers, dates. If unsure, say
+  "Let me check on that and revert" or ask a clarifying question.
+- Match the customer's language: English message → English reply, Hinglish → Hinglish, Hindi → Hindi.
+
+# INTENT CLASSIFICATION (pick ONE)
+PRICE_QUERY UNIT_QUERY FEATURE_QUERY DOCUMENT_REQUEST SITE_VISIT COMPARISON OBJECTION RENTAL_QUERY
+LOCATION_QUERY CONSTRUCTION_QUERY LOAN_QUERY CALLBACK NRI_QUERY REJECTION RTC_QUERY GREETING SPAM
+GIBBERISH GENERAL
+
+# DOC_TO_SEND (set ONLY if customer is asking for a specific document; null otherwise)
+brochure | price_sheet | specifications | master_plan | floor_plan | unit_plan | payment_structure | amenities
+
+When DOCUMENT_REQUEST is the intent, set doc_to_send to the matching slug AND in your reply just say
+"Sending the X now" — DO NOT paste URLs. The relay layer attaches the PDF separately.
+
+# PROJECT (lowercase or null)
+loft | spectra | broadway | landmark | rtc | null
+
+# OUTPUT JSON SCHEMA
+{
+  "intent": "<one of the 19 labels>",
+  "flags": [],
+  "project": "<lowercase or null>",
+  "doc_to_send": "<slug or null>",
+  "reply": "<your 1-3 sentence reply>"
+}
+
+Output ONLY the JSON. No markdown, no preface, no commentary.`;
+
+/**
+ * Full Kimi-as-Gemini-replacement. Used when Gemini fails entirely (503,
+ * MAX_TOKENS, parse failure). Returns the same shape Gemini does so the
+ * webhook's downstream logic (unit-plan dispatcher, doc delivery, factual
+ * grounding, Zoho updates) all work as expected.
+ */
+export interface KimiFullReplyResult {
+  intent: string;
+  flags: string[];
+  project: string | null;
+  doc_to_send: string | null;
+  reply: string;
+}
+
+export async function kimiFullClassifyAndReply(
+  structuredUserMessage: string,
+): Promise<KimiFullReplyResult | null> {
+  if (!ROUTEWAY_API_KEY) return null;
+
+  const result = await callKimi({
+    system: KIMI_SYSTEM_PROMPT,
+    user: structuredUserMessage,
+    jsonObject: true,
+    maxTokens: 600,
+    temperature: 0.2,
+    timeoutMs: 25000,
+    tag: "full-replacement",
+  });
+
+  if (!result.ok || !result.json) {
+    console.warn(`[Kimi:full-replacement] failed: ${result.error}`);
+    return null;
+  }
+
+  const j = result.json;
+  const reply = String(j.reply || "").trim();
+  if (!reply || reply.length < 3) {
+    console.warn(`[Kimi:full-replacement] empty/too-short reply`);
+    return null;
+  }
+
+  const intent = String(j.intent || "GENERAL").toUpperCase();
+  const docToSend = j.doc_to_send && j.doc_to_send !== "null"
+    ? String(j.doc_to_send).toLowerCase()
+    : null;
+  const project = j.project && j.project !== "null"
+    ? String(j.project).toLowerCase()
+    : null;
+
+  console.log(
+    `[Kimi:full-replacement] OK — intent=${intent} doc=${docToSend || "(none)"} ` +
+    `project=${project || "(none)"} replyLen=${reply.length}`,
+  );
+
+  return {
+    intent,
+    flags: Array.isArray(j.flags) ? j.flags.map(String) : [],
+    project,
+    doc_to_send: docToSend,
+    reply: reply.slice(0, 1200),
+  };
+}
+
 // ─── Kimi as Gemini's safety net ─────────────────────────────────────────
 // When Gemini's structured-JSON call fails entirely (empty rawText / Tier-3
 // parser deflection / MAX_TOKENS thinking burn on simple greetings), we

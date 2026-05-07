@@ -16,10 +16,16 @@
 import { getBotSetting } from "./bot_settings";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-// Default upgraded from gemini-3-pro-preview → gemini-3.1-pro-preview to match
+// Default flipped from gemini-3.1-pro-preview → gemini-2.5-pro because the
+// 3.x preview models are throwing intermittent 503 "high demand" errors
+// in production (preview model = unstable). gemini-2.5-pro is GA, has the
+// same JSON-output reliability, and handles our 24KB system prompt fine.
+// Override via GEMINI_MODEL env var if Google promotes a 3.x release.
+//
+// Old default before this change:
 // the model the in-house Anandita LLM wrapper now serves. Override with the
 // GEMINI_MODEL env var to roll back if needed.
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.1-pro-preview";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-pro";
 
 /**
  * Resolve the active system prompt — DB override (bot_settings.system_prompt)
@@ -359,37 +365,39 @@ function extractConvSnippet(structured: string, n = 6): string {
   return lines.slice(-n).join("\n");
 }
 
-/** Try to recover from a Gemini failure by asking Kimi for a quick reply.
- *  Returns the Kimi reply on success, or an empty string if Kimi also fails
- *  (caller then uses the original deflection boilerplate). */
-async function tryKimiFallbackReply(structuredUserMessage: string): Promise<string> {
+/** Try to recover from a Gemini failure by asking Kimi for a FULL Gemini-shape
+ *  reply (intent + flags + project + doc_to_send + reply). Returns the full
+ *  parsed object on success, or null if Kimi also fails (caller then uses
+ *  the original deflection boilerplate as last resort).
+ *
+ *  Why FULL replacement instead of just reply text:
+ *    Real-world bug: customer sent "2035 unit plan", Gemini 503'd, our old
+ *    fallback gave a text reply but doc_to_send stayed null → unit_plan
+ *    dispatcher never fired → customer never got the PDF. By returning the
+ *    full Gemini-shape, the rest of the webhook (dispatcher, doc delivery,
+ *    Zoho intent stamping) just works as if Gemini had succeeded. */
+async function tryKimiFallbackFull(structuredUserMessage: string): Promise<GeminiStructuredReply | null> {
   // Lazy import — avoids forcing kimi.ts to load when Gemini path is healthy.
-  const { kimiQuickReply, kimiAvailable } = await import("./kimi");
-  if (!kimiAvailable()) return "";
-
-  const customerMessage = extractBlock(structuredUserMessage, "USER_MESSAGE");
-  if (!customerMessage) return "";
-
-  const customerName = extractCustomerName(structuredUserMessage);
-  const project = extractProject(structuredUserMessage);
-  const conversationSnippet = extractConvSnippet(structuredUserMessage, 6);
+  const { kimiFullClassifyAndReply, kimiAvailable } = await import("./kimi");
+  if (!kimiAvailable()) return null;
 
   try {
-    const reply = await kimiQuickReply(customerMessage, {
-      customerName: customerName || undefined,
-      project: project || undefined,
-      conversationSnippet: conversationSnippet || undefined,
-      hasPriorTouch: !!conversationSnippet,
-    });
-    if (reply && reply.trim().length >= 3) {
-      console.log(`[Gemini→Kimi-fallback] Recovered with Kimi reply (${reply.length} chars)`);
-      return reply;
-    }
-    console.warn(`[Gemini→Kimi-fallback] Kimi returned empty/short reply`);
-    return "";
+    const result = await kimiFullClassifyAndReply(structuredUserMessage);
+    if (!result) return null;
+    console.log(
+      `[Gemini→Kimi-full-fallback] Recovered — intent=${result.intent} ` +
+      `doc=${result.doc_to_send || "(none)"} replyLen=${result.reply.length}`,
+    );
+    return {
+      intent: result.intent,
+      flags: result.flags,
+      project: result.project,
+      docToSend: result.doc_to_send,
+      reply: result.reply,
+    };
   } catch (err: any) {
-    console.error(`[Gemini→Kimi-fallback] Kimi threw: ${err.message}`);
-    return "";
+    console.error(`[Gemini→Kimi-full-fallback] threw: ${err.message}`);
+    return null;
   }
 }
 
@@ -427,15 +435,18 @@ export async function callGemini(
   }
 
   if (!rawText || rawText.trim().length < 5) {
-    // Gemini gave us nothing — last-resort: ask Kimi for a quick reply.
-    console.warn("[Gemini] Empty rawText after retry; trying Kimi fallback");
-    const kimiReply = await tryKimiFallbackReply(structuredUserMessage);
+    // Gemini gave us nothing — last-resort: full Kimi replacement.
+    // Crucially this preserves doc_to_send so the unit_plan dispatcher
+    // still fires when customer asks for a PDF and Gemini 503s.
+    console.warn("[Gemini] Empty rawText after retry; trying Kimi FULL replacement");
+    const kimiFull = await tryKimiFallbackFull(structuredUserMessage);
+    if (kimiFull) return kimiFull;
     return {
       intent: "GENERAL",
       flags: [],
       project: null,
       docToSend: null,
-      reply: kimiReply || TIER3_DEFLECTION,
+      reply: TIER3_DEFLECTION,
     };
   }
 
@@ -458,13 +469,13 @@ export async function callGemini(
   }
 
   // If we still have the Tier-3 deflection at this point (Gemini truly
-  // failed on both attempts), give Kimi a shot before serving boilerplate.
+  // failed parsing on both attempts), give Kimi the full classification
+  // job. This restores doc_to_send so unit-plan / brochure / etc.
+  // dispatch keeps working under Gemini outages.
   if (parsed.reply.startsWith("Let me confirm that with the project team")) {
-    console.warn("[Gemini] Tier-3 deflection persisted; trying Kimi fallback");
-    const kimiReply = await tryKimiFallbackReply(structuredUserMessage);
-    if (kimiReply) {
-      return { ...parsed, reply: kimiReply };
-    }
+    console.warn("[Gemini] Tier-3 deflection persisted; trying Kimi FULL replacement");
+    const kimiFull = await tryKimiFallbackFull(structuredUserMessage);
+    if (kimiFull) return kimiFull;
   }
 
   return parsed;

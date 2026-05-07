@@ -1561,6 +1561,68 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── Gemini available-models lister ─────────────────────────────────────
+  // GET ?action=gemini-models&secret=<INHOUSE_POSTHOOK_SECRET>
+  //   Hits Google's /v1beta/models endpoint with our GEMINI_API_KEY and
+  //   returns every model the key has access to, plus current GEMINI_MODEL
+  //   env var, plus quick-pick suggestions for stable-vs-preview. Used to
+  //   pick a stable replacement for gemini-3.x preview when it 503s.
+  if (req.method === "GET" && req.query.action === "gemini-models") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    const apiKey = process.env.GEMINI_API_KEY || "";
+    if (!apiKey) return res.status(500).json({ error: "GEMINI_API_KEY not set" });
+
+    try {
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}&pageSize=200`,
+      );
+      if (!r.ok) {
+        return res.status(r.status).json({
+          error: "models list failed",
+          status: r.status,
+          body: (await r.text()).slice(0, 500),
+        });
+      }
+      const data = (await r.json()) as any;
+      const models = (data?.models || []) as any[];
+      const generationCapable = models.filter((m) =>
+        Array.isArray(m.supportedGenerationMethods) &&
+        m.supportedGenerationMethods.includes("generateContent"),
+      );
+      // Stable = no "preview" / "exp" in the name. Preview models 503 a lot
+      // under load (real-world: gemini-3.x-pro-preview throws "high demand").
+      const stableModels = generationCapable.filter((m) =>
+        !/preview|exp/i.test(m.name || ""),
+      );
+      const previewModels = generationCapable.filter((m) =>
+        /preview|exp/i.test(m.name || ""),
+      );
+
+      const slim = (m: any) => ({
+        name: (m.name || "").replace(/^models\//, ""),
+        displayName: m.displayName,
+        version: m.version,
+        inputTokenLimit: m.inputTokenLimit,
+        outputTokenLimit: m.outputTokenLimit,
+      });
+
+      return res.status(200).json({
+        currentEnvModel: process.env.GEMINI_MODEL || "(unset — using code default)",
+        codeDefault: "gemini-2.5-pro",
+        recommendation: "Use gemini-2.5-pro for quality, gemini-2.5-flash for 3x faster cheaper. Avoid *-preview / *-exp — they 503 under load.",
+        stable: stableModels.map(slim),
+        preview: previewModels.map(slim),
+        totalAccessible: generationCapable.length,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── Meta token health check ────────────────────────────────────────────
   // GET ?action=meta-token-check → introspects META_PAGE_ACCESS_TOKEN via
   // Graph API debug_token + /me, returns expiry, app_id, granted scopes,
