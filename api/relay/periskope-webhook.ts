@@ -27,6 +27,8 @@ import { sanitizeReply, stripReintroduction } from "../_utils/sanitizer";
 import { getDocumentFor, sendDocViaPeriskope } from "../_utils/document_dispatcher";
 import { callGemini } from "../_utils/gemini_chat";
 import { customerWordToDocType } from "../_utils/kb_doc_extractor";
+import { dispatchUnitPlan, buildClarificationMessage } from "../_utils/unit_plan_dispatcher";
+import { isFactualQuestion, groundFactualQuestion } from "../_utils/factual_grounder";
 
 const PERISKOPE_API_KEY = process.env.PERISKOPE_API_KEY || "";
 const PERISKOPE_API_URL = "https://api.periskope.app/v1/messages/send";
@@ -703,6 +705,41 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       projectContext = await getProjectContextText(project);
     }
 
+    // 5b. Factual grounding (Kimi K2) — when the customer asks a specific
+    //     spec / dimension / RERA / charge question, Kimi reads uploaded PDF
+    //     text_extracts and pulls the exact answer with a citation. We then
+    //     inject it into PROJECT_CONTEXT as GROUND_TRUTH so Gemini quotes it
+    //     verbatim instead of hallucinating from the loose KB summary.
+    //
+    //     Only fires when: project is resolved (single, not multi) AND the
+    //     message matches a factual-question pattern. Best-effort — Kimi
+    //     unavailable / not_found / low confidence → no injection, Gemini
+    //     proceeds as before. Adds ~3-6s on factual questions only.
+    if (project && !isMultiProject && isFactualQuestion(message)) {
+      try {
+        const grounded = await groundFactualQuestion(message, project);
+        if (grounded?.found && grounded.confidence >= 0.6) {
+          projectContext +=
+            `\n\n## GROUND_TRUTH (verified from uploaded ${grounded.cite || "documents"})\n` +
+            `When the customer's question is about this fact, quote the value below VERBATIM. ` +
+            `Do NOT invent alternative numbers or specs.\n` +
+            `\nFact: ${grounded.answer}\n` +
+            `Confidence: ${grounded.confidence.toFixed(2)} | Source: ${grounded.cite || "uploaded PDFs"}\n`;
+          console.log(
+            `[Periskope Webhook] GROUND_TRUTH injected — "${grounded.answer.slice(0, 80)}…" ` +
+            `cite=${grounded.cite} conf=${grounded.confidence} (${grounded.ms}ms)`,
+          );
+        } else if (grounded) {
+          console.log(
+            `[Periskope Webhook] Factual question detected but no ground truth found ` +
+            `(confidence=${grounded.confidence}, ${grounded.ms}ms) — Gemini proceeding with KB only`,
+          );
+        }
+      } catch (err: any) {
+        console.error(`[Periskope Webhook] groundFactualQuestion threw: ${err.message}`);
+      }
+    }
+
     // 5. Build structured message — Gemini will classify + reply in one call.
     //    No <INTENT>/<FLAGS> blocks because Gemini decides those itself.
     const customerName =
@@ -803,14 +840,65 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (project && isDocRequest) {
       const docTypeFromMsg = geminiOutput.docToSend!;
       try {
-        // For multi-slot doc types (unit_plan / floor_plan), pass the raw
-        // customer message as a hint so the dispatcher fuzzy-matches the right
-        // tower / unit-size variant (e.g. "Tower A floor plan" → Tower-A row).
-        const sizeHint =
-          (docTypeFromMsg === "unit_plan" || docTypeFromMsg === "floor_plan")
-            ? message
-            : null;
-        const doc = await getDocumentFor(project, docTypeFromMsg, sizeHint);
+        // For multi-slot doc types (unit_plan / floor_plan), let Kimi K2
+        // disambiguate between size_labels using the customer's message +
+        // each PDF's text_extract. This is the hallucination-prone path —
+        // simple substring matching previously sent the wrong PDF when
+        // customer was vague ("send unit plan") or when multiple labels
+        // shared a substring ("1695 East" vs "1695 West").
+        //
+        // Kimi returns one of:
+        //   - "match"     → row + confidence ≥ 0.7 → send PDF
+        //   - "ambiguous" → ask customer to pick (fixes the wrong-PDF bug)
+        //   - "no_match"  → fall through to honest "let me check" follow-up
+        //   - "fallback"  → Kimi unavailable → use legacy substring-match
+        let doc: Awaited<ReturnType<typeof getDocumentFor>> | null = null;
+        // When we ask the customer "which size?" we MUST skip the existing
+        // "Actually one sec, not on my phone" broken-promise follow-up below
+        // — otherwise customer sees both messages back-to-back.
+        let clarificationSent = false;
+        const isMultiSlot = docTypeFromMsg === "unit_plan" || docTypeFromMsg === "floor_plan";
+
+        if (isMultiSlot) {
+          const dispatch = await dispatchUnitPlan(message, project, docTypeFromMsg as any);
+          console.log(
+            `[Periskope Webhook] Kimi dispatch (${docTypeFromMsg}): ` +
+            `decision=${dispatch.decision} conf=${dispatch.confidence.toFixed(2)} ` +
+            `reason="${dispatch.reason}" ms=${dispatch.ms}`,
+          );
+
+          if (dispatch.decision === "match" && dispatch.row) {
+            doc = {
+              url: dispatch.row.url,
+              doc_type: docTypeFromMsg,
+              filename: dispatch.row.filename,
+              size_label: dispatch.row.size_label ?? null,
+              source: "kimi" as any,
+            };
+          } else if (dispatch.decision === "ambiguous" && dispatch.options.length) {
+            // Send a clarification question instead of the wrong PDF.
+            const clarif = buildClarificationMessage(project, docTypeFromMsg as any, dispatch.options);
+            await saveMessage(phone, "outbound", clarif, sender, project);
+            try {
+              await sendReply(phone, sender, clarif);
+              console.log(`[Periskope Webhook] Sent clarification (${dispatch.options.length} options) for ${docTypeFromMsg}`);
+              clarificationSent = true;
+            } catch (err: any) {
+              console.error(`[Periskope Webhook] clarification send failed: ${err.message}`);
+            }
+          } else if (dispatch.decision === "fallback") {
+            // Kimi unavailable — drop to legacy substring-match.
+            doc = await getDocumentFor(project, docTypeFromMsg, message);
+          }
+          // "no_match" or "ambiguous" with empty options → leave doc=null;
+          // the broken-promise branch below handles it (unless clarification
+          // was already sent, in which case the guard skips that branch).
+        } else {
+          // Single-slot doc types (brochure, price_sheet, etc.) — Kimi
+          // doesn't add value; legacy lookup is fine.
+          doc = await getDocumentFor(project, docTypeFromMsg, null);
+        }
+
         if (doc) {
           const captionMap: Record<string, string> = {
             brochure: `${project} brochure as discussed.`,
@@ -826,10 +914,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           await sendDocViaPeriskope(phone, sender, doc.url, doc.filename, caption);
           docSent = { doc_type: doc.doc_type, url: doc.url, source: doc.source };
           console.log(`[Periskope Webhook] Doc sent (source=${doc.source}): ${doc.doc_type} → ${doc.url}`);
-        } else {
+        } else if (!clarificationSent) {
           // ATOMIC DELIVERY — Gemini promised the doc but it's not uploaded yet.
           // Send an honest follow-up so customer doesn't wait for a PDF that
           // never arrives (fixes MD-3 broken-promise issue from the test sheet).
+          // Skipped when we already asked the customer "which size?" via Kimi —
+          // sending both back-to-back would confuse them.
           console.log(`[Periskope Webhook] No ${docTypeFromMsg} doc found for ${project} — sending honest follow-up`);
           const followUp = `Actually one sec — that one's not on my phone right now. Let me get it from the project team and send it across shortly.`;
           await saveMessage(phone, "outbound", followUp, sender, project);
