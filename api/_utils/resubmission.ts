@@ -35,6 +35,13 @@ const PERISKOPE_API_URL = "https://api.periskope.app/v1/messages/send";
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || "";
 
+/** Cooldown between outreach attempts. If the same lead resubmits more than
+ *  once inside this window we still increment the Count and append the
+ *  History line (so the audit trail is complete), but we suppress the
+ *  WhatsApp + voice call so sales doesn't spam them on a double-click submit
+ *  or rapid form re-fill across pages. */
+const OUTREACH_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+
 // Self-deploy URL — used so we can call our own /api/relay/inhouse-call
 // from server-side (avoids re-implementing the country-routing here).
 // Vercel exposes VERCEL_URL automatically (no protocol). Falls back to the
@@ -340,6 +347,11 @@ export interface RecordResubmissionResult {
   count: number;
   source: string;
   history_line: string;
+  /** True when WhatsApp + call were skipped because we're inside the
+   *  per-lead outreach cooldown. Audit fields were still updated. */
+  outreach_suppressed: boolean;
+  /** Minutes until cooldown expires (0 if outreach actually fired). */
+  cooldown_remaining_minutes: number;
 }
 
 /**
@@ -369,11 +381,39 @@ export async function recordResubmission(
   const prevCount = Number(existingLead?.Resubmission_Count ?? 0) || 0;
   const newCount = prevCount + 1;
   const source = lead.lead_source;
-  const historyLine = `[${nowIst()}] ${source} — ${buildContextLine(lead)}`;
+
+  // ── Cooldown check ──
+  // We suppress WhatsApp + call when the lead resubmitted within the last
+  // OUTREACH_COOLDOWN_MS. Common case: user double-clicks "Submit" or fills
+  // a different form on the same site within minutes — sales shouldn't get
+  // 3 calls in 5 minutes for what's essentially one buying intent.
+  let outreachSuppressed = false;
+  let cooldownRemainingMinutes = 0;
+  const prevAtRaw = existingLead?.Last_Resubmission_At;
+  if (prevAtRaw) {
+    const prevMs = new Date(prevAtRaw).getTime();
+    if (Number.isFinite(prevMs)) {
+      const elapsed = Date.now() - prevMs;
+      if (elapsed >= 0 && elapsed < OUTREACH_COOLDOWN_MS) {
+        outreachSuppressed = true;
+        cooldownRemainingMinutes = Math.ceil((OUTREACH_COOLDOWN_MS - elapsed) / 60000);
+      }
+    }
+  }
+
+  // History line — always written, with a (suppressed) tag when outreach
+  // was skipped so sales reading the History textarea sees exactly when
+  // we sat one out.
+  const tag = outreachSuppressed ? " (outreach suppressed — within cooldown)" : "";
+  const historyLine = `[${nowIst()}] ${source} — ${buildContextLine(lead)}${tag}`;
   const prevHistory: string = String(existingLead?.Resubmission_History ?? "");
   const newHistory = appendHistory(prevHistory, historyLine);
 
   // ── Zoho stamping (awaited) ──
+  // We always update Last_Resubmission_At even on suppressed events so the
+  // cooldown window slides — that way 3 rapid resubmits in a row still
+  // result in just one outreach (instead of one per cooldown-window
+  // boundary if we kept Last_Resubmission_At anchored to the first event).
   try {
     await updateLead(zohoLeadId, {
       Resubmission_Count: newCount,
@@ -382,7 +422,10 @@ export async function recordResubmission(
       Last_Resubmission_Source: source,
     });
     console.log(
-      `[Resubmission] Lead ${zohoLeadId} stamped — count=${newCount} source=${source}`,
+      `[Resubmission] Lead ${zohoLeadId} stamped — count=${newCount} source=${source}` +
+      (outreachSuppressed
+        ? ` (outreach SUPPRESSED — cooldown ${cooldownRemainingMinutes}m left)`
+        : ` (outreach firing)`),
     );
   } catch (err: any) {
     // Field-may-not-exist-yet (404 INVALID_DATA) is expected the first time
@@ -393,15 +436,28 @@ export async function recordResubmission(
   }
 
   // ── Side-effects (fire-and-forget; ingest doesn't wait) ──
-  Promise.allSettled([
-    fireWhatsApp(lead, newCount),
-    fireVoiceCall(lead, zohoLeadId, input.mlid, input.plid, newCount),
-  ]).then((results) => {
-    const failed = results.filter((r) => r.status === "rejected");
-    if (failed.length) {
-      console.error(`[Resubmission] ${failed.length} side-effect(s) failed`);
-    }
-  });
+  if (outreachSuppressed) {
+    console.log(
+      `[Resubmission] Skipping WhatsApp + call for lead ${zohoLeadId} ` +
+      `(last resubmit ${cooldownRemainingMinutes}m ago, cooldown=${OUTREACH_COOLDOWN_MS / 60000}m)`,
+    );
+  } else {
+    Promise.allSettled([
+      fireWhatsApp(lead, newCount),
+      fireVoiceCall(lead, zohoLeadId, input.mlid, input.plid, newCount),
+    ]).then((results) => {
+      const failed = results.filter((r) => r.status === "rejected");
+      if (failed.length) {
+        console.error(`[Resubmission] ${failed.length} side-effect(s) failed`);
+      }
+    });
+  }
 
-  return { count: newCount, source, history_line: historyLine };
+  return {
+    count: newCount,
+    source,
+    history_line: historyLine,
+    outreach_suppressed: outreachSuppressed,
+    cooldown_remaining_minutes: cooldownRemainingMinutes,
+  };
 }

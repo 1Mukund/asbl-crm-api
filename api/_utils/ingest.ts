@@ -22,12 +22,15 @@ export type IngestResult = {
   mlid: string;
   plid: string;
   /** Set when action = "updated" — the lead resubmitted a form. Includes
-   *  the new total count, source, and the audit-line we just appended.
+   *  the new total count, source, the audit-line we just appended, and
+   *  whether outreach was suppressed by the per-lead cooldown.
    *  Sales debugs this when they ask "did the resubmission trigger fire?". */
   resubmission?: {
     count: number;
     source: string;
     history_line: string;
+    outreach_suppressed: boolean;
+    cooldown_remaining_minutes: number;
   };
 };
 
