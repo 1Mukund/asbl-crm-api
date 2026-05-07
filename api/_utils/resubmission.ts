@@ -135,10 +135,11 @@ function shortPath(url: string): string {
 }
 
 /** Cap the history textarea so we don't blow Zoho's textarea limit
- *  (30000 chars) over years of resubmissions. Keeps the latest ~200 lines. */
+ *  (32000 chars — Zoho textarea tiers are 2000/32000/50000) over years of
+ *  resubmissions. Keep the latest ~200 lines. */
 function appendHistory(prev: string, line: string): string {
   const next = `${line}\n${prev || ""}`.trim();
-  if (next.length <= 28000) return next;
+  if (next.length <= 30000) return next;
   // Keep newest first, trim oldest
   const lines = next.split("\n");
   return lines.slice(0, 200).join("\n");

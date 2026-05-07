@@ -1442,8 +1442,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             spec: { field_label: "Resubmission Count", data_type: "integer" },
           },
           {
+            // Zoho textarea only accepts length 2000 / 32000 / 50000.
+            // 32000 is the right tier — comfortably fits ~200+ resubmission
+            // history lines (~150 chars each).
             api: "Resubmission_History",
-            spec: { field_label: "Resubmission History", data_type: "textarea", length: 30000 },
+            spec: { field_label: "Resubmission History", data_type: "textarea", length: 32000 },
           },
           {
             api: "Last_Resubmission_At",
