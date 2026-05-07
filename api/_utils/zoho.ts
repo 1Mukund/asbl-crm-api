@@ -94,6 +94,15 @@ export async function findLeadByInhouseCallId(callId: string): Promise<any | nul
   }
 }
 
+// Common field list — kept in one place so resubmission tracking stays in
+// sync across both lookup helpers. Resubmission_Count/History are read by
+// recordResubmission() to increment + prepend; if the fields don't exist yet
+// in Zoho schema, Zoho silently drops them from the response and our reader
+// defensively defaults to 0/"".
+const LEAD_LOOKUP_FIELDS =
+  "id,First_Name,Last_Name,Mobile,Master_Lead_ID,Project_Lead_ID,ASBL_Project," +
+  "Resubmission_Count,Resubmission_History,Last_Resubmission_At,Last_Resubmission_Source";
+
 export async function findLeadByPhone(phone: string): Promise<any | null> {
   const token = await getAccessToken();
   try {
@@ -101,7 +110,7 @@ export async function findLeadByPhone(phone: string): Promise<any | null> {
       headers: { Authorization: `Zoho-oauthtoken ${token}` },
       params: {
         criteria: `(Mobile:equals:${phone})`,
-        fields: "id,First_Name,Last_Name,Mobile,Master_Lead_ID,Project_Lead_ID,ASBL_Project",
+        fields: LEAD_LOOKUP_FIELDS,
       },
     });
     return res.data?.data?.[0] ?? null;
@@ -119,7 +128,7 @@ export async function findLeadByPhoneAndProject(phone: string, project: string):
       headers: { Authorization: `Zoho-oauthtoken ${token}` },
       params: {
         criteria: `((Mobile:equals:${phone})and(ASBL_Project:equals:${project}))`,
-        fields: "id,First_Name,Last_Name,Mobile,Master_Lead_ID,Project_Lead_ID,ASBL_Project",
+        fields: LEAD_LOOKUP_FIELDS,
       },
     });
     return res.data?.data?.[0] ?? null;

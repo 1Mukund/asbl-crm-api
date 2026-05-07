@@ -6,6 +6,7 @@ import {
   createLead,
   updateLead,
 } from "./zoho";
+import { recordResubmission } from "./resubmission";
 
 function isValidUrl(url?: string): boolean {
   if (!url) return false;
@@ -20,6 +21,14 @@ export type IngestResult = {
   zoho_lead_id: string;
   mlid: string;
   plid: string;
+  /** Set when action = "updated" — the lead resubmitted a form. Includes
+   *  the new total count, source, and the audit-line we just appended.
+   *  Sales debugs this when they ask "did the resubmission trigger fire?". */
+  resubmission?: {
+    count: number;
+    source: string;
+    history_line: string;
+  };
 };
 
 export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
@@ -83,11 +92,35 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
 
   let zohoLeadId: string;
   let action: "created" | "updated";
+  let resubmission: IngestResult["resubmission"] = undefined;
 
   if (existingLead) {
-    await updateLead(existingLead.id, zohoPayload);
+    // Don't overwrite Born_Date on resubmissions — it should reflect the
+    // ORIGINAL CRM creation date, not the date of the latest resubmit.
+    // (Resubmission timing is captured separately on Last_Resubmission_At.)
+    const { Born_Date: _ignored, ...payloadForUpdate } = zohoPayload;
+    await updateLead(existingLead.id, payloadForUpdate);
     zohoLeadId = existingLead.id;
     action = "updated";
+
+    // ── Resubmission tracking ─────────────────────────────────────────────
+    // Existing-lead-found-by-phone-and-project means the user filled a form
+    // again after their lead was already created — that's a resubmission.
+    // recordResubmission stamps the count/history fields, then fires
+    // WhatsApp + voice call (fire-and-forget).
+    try {
+      const r = await recordResubmission({
+        lead,
+        zohoLeadId,
+        mlid,
+        plid,
+        existingLead,
+      });
+      resubmission = r;
+    } catch (err: any) {
+      // Never block ingest on resubmission tracking — log and move on.
+      console.error(`[Ingest] recordResubmission threw for ${zohoLeadId}: ${err.message}`);
+    }
   } else {
     zohoLeadId = await createLead(zohoPayload);
     action = "created";
@@ -100,5 +133,5 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
   // ── Step 4: Store in Supabase (source of truth + safety net) ─────────────
   await upsertLead(lead, mlid, plid, zohoLeadId, true);
 
-  return { action, zoho_lead_id: zohoLeadId, mlid, plid };
+  return { action, zoho_lead_id: zohoLeadId, mlid, plid, resubmission };
 }

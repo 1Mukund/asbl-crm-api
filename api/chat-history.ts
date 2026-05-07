@@ -1383,7 +1383,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // GET ?action=zoho-create-inhouse-field&secret=<...>
   //   Attempts to CREATE Last_Inhouse_Call_ID via Zoho Metadata API.
   //   Requires the refresh token to have ZohoCRM.settings.fields.CREATE scope.
-  if (req.method === "GET" && (req.query.action === "zoho-fields" || req.query.action === "zoho-create-inhouse-field" || req.query.action === "zoho-create-recording-field")) {
+  // GET ?action=zoho-create-resubmission-fields&secret=<...>
+  //   Creates Resubmission_Count / Resubmission_History / Last_Resubmission_At /
+  //   Last_Resubmission_Source so the resubmission tracking system can stamp
+  //   leads on every form re-fill. Idempotent — skips fields that exist.
+  if (req.method === "GET" && (req.query.action === "zoho-fields" || req.query.action === "zoho-create-inhouse-field" || req.query.action === "zoho-create-recording-field" || req.query.action === "zoho-create-resubmission-fields")) {
     const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
     const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
     if (!expectedSecret || incomingSecret !== expectedSecret) {
@@ -1405,7 +1409,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const fj = await fr.json() as any;
       const allFields = (fj?.fields || []) as any[];
       const callRelated = allFields
-        .filter((f) => /call|inhouse|arrowhead|recording|transcript/i.test(f.api_name || ""))
+        .filter((f) => /call|inhouse|arrowhead|recording|transcript|resubmission/i.test(f.api_name || ""))
         .map((f) => ({
           api_name: f.api_name,
           field_label: f.field_label,
@@ -1421,6 +1425,67 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           total_fields: allFields.length,
           call_related_fields: callRelated,
           Last_Inhouse_Call_ID_exists: hasInhouse,
+        });
+      }
+
+      // zoho-create-resubmission-fields — creates the 4 fields the
+      // resubmission tracking system needs:
+      //   - Resubmission_Count        : integer, default 0
+      //   - Resubmission_History      : textarea (30000), one line per resubmit
+      //   - Last_Resubmission_At      : datetime
+      //   - Last_Resubmission_Source  : text (60 chars), e.g. "Website Inquiry"
+      // Idempotent: skips fields that already exist, creates the rest.
+      if (req.query.action === "zoho-create-resubmission-fields") {
+        const desired: Array<{ api: string; spec: any }> = [
+          {
+            api: "Resubmission_Count",
+            spec: { field_label: "Resubmission Count", data_type: "integer" },
+          },
+          {
+            api: "Resubmission_History",
+            spec: { field_label: "Resubmission History", data_type: "textarea", length: 30000 },
+          },
+          {
+            api: "Last_Resubmission_At",
+            spec: { field_label: "Last Resubmission At", data_type: "datetime" },
+          },
+          {
+            api: "Last_Resubmission_Source",
+            spec: { field_label: "Last Resubmission Source", data_type: "text", length: 60 },
+          },
+        ];
+        const existingApis = new Set(allFields.map((f) => f.api_name));
+        const toCreate = desired.filter((d) => !existingApis.has(d.api));
+        const skipped = desired.filter((d) => existingApis.has(d.api));
+
+        if (!toCreate.length) {
+          return res.status(200).json({
+            status: "all_already_exist",
+            existing: skipped.map((d) => d.api),
+          });
+        }
+
+        // Zoho's Metadata API accepts multiple fields per request, but
+        // partial-failure responses are easier to debug if we send one at a
+        // time — so we loop. Total network cost is 4 small requests.
+        const results: any[] = [];
+        for (const d of toCreate) {
+          const cr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+            method: "POST",
+            headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ fields: [d.spec] }),
+          });
+          const j = await cr.json().catch(() => ({}));
+          results.push({ api_name: d.api, http_status: cr.status, response: j });
+        }
+        return res.status(200).json({
+          status: "attempted",
+          created: results.filter((r) => r.http_status >= 200 && r.http_status < 300).map((r) => r.api_name),
+          skipped: skipped.map((d) => d.api),
+          results,
+          hint: results.some((r) => r.http_status === 401 || r.http_status === 403)
+            ? "Zoho refresh token likely lacks ZohoCRM.settings.fields.CREATE scope. Add the fields manually under Setup → Customization → Modules → Leads → Fields."
+            : undefined,
         });
       }
 
