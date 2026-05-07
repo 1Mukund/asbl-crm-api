@@ -231,6 +231,59 @@ export async function getAllInventoryRows(): Promise<{ rows: InventoryRow[]; fet
   return { rows, fetchedAt: cache?.fetchedAt || Date.now() };
 }
 
+/**
+ * Build a compact one-liner-per-project size index across ALL projects.
+ * Used as a footer in single-project PROJECT_CONTEXT so Gemini can
+ * cross-reference: "Sir, Loft doesn't have 2035 sft but Broadway does —
+ * shall I send Broadway's plan?". Without this, Gemini only sees the
+ * current project's catalog and refuses to mention sizes that exist
+ * elsewhere — even though the customer's request might fit them.
+ *
+ * Output format:
+ *   ASBL Loft: 1695 sft (3BHK East/West), 1870 sft (3BHK East/West)
+ *   ASBL Broadway: 2035 sft (3BHK East/West), 2520 sft (3BHK East)
+ *   ...
+ *
+ * Sold-out + on-hold rows are excluded so the LLM doesn't suggest
+ * something that's actually unavailable.
+ */
+export async function getCrossProjectSizeIndex(): Promise<string> {
+  const all = await fetchAllRows();
+  if (!all.length) return "";
+
+  // Group by project, then by size+bhk (collapsing East/West into one
+  // line per size to keep it compact).
+  const byProject = new Map<string, Map<string, Set<string>>>();
+
+  for (const r of all) {
+    const avail = (r.availability || "").toLowerCase();
+    if (avail.includes("sold")) continue; // skip sold-out
+    if (!r.sizeSft) continue;
+
+    const proj = r.project;
+    const key = `${r.sizeSft} sft ${r.bhk || ""}`.trim();
+    const facing = r.facing || "";
+
+    if (!byProject.has(proj)) byProject.set(proj, new Map());
+    const projMap = byProject.get(proj)!;
+    if (!projMap.has(key)) projMap.set(key, new Set());
+    if (facing) projMap.get(key)!.add(facing);
+  }
+
+  if (!byProject.size) return "";
+
+  const lines: string[] = [];
+  for (const [proj, sizes] of byProject) {
+    const parts: string[] = [];
+    for (const [sizeKey, facings] of sizes) {
+      const facingStr = facings.size ? ` (${[...facings].sort().join("/")})` : "";
+      parts.push(`${sizeKey}${facingStr}`);
+    }
+    lines.push(`${proj}: ${parts.join(", ")}`);
+  }
+  return lines.join("\n");
+}
+
 // ── Public: force-refresh (clears cache) ──────────────────────────────────
 export async function refreshInventoryCache(): Promise<{ count: number; fetchedAt: number }> {
   cache = null;

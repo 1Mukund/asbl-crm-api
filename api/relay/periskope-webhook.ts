@@ -21,7 +21,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { resolveProject, detectMultiProjectIntent, Project } from "../_utils/project_detection";
 import { getProjectFacts } from "../_utils/project_facts";
-import { getInventoryForProject } from "../_utils/inventory_sheet";
+import { getInventoryForProject, getCrossProjectSizeIndex } from "../_utils/inventory_sheet";
 import { getConversationContext } from "../_utils/conversation_context";
 import { sanitizeReply, stripReintroduction } from "../_utils/sanitizer";
 import { getDocumentFor, sendDocViaPeriskope } from "../_utils/document_dispatcher";
@@ -404,6 +404,29 @@ async function getProjectContextText(project: Project | null): Promise<string> {
     console.error(`[Webhook] PDF extracts fetch failed: ${err.message}`);
   }
 
+  // 5. Cross-project SIZE INDEX — compact one-liner-per-project list of every
+  //    available size across ALL projects. Lets Gemini answer "Loft doesn't
+  //    have 2035 sft but Broadway does — shall I send Broadway's plan?"
+  //    instead of the previous behaviour where it said "we don't have 2035"
+  //    and forced the customer to manually try each project. ~200-400 chars,
+  //    negligible context cost.
+  try {
+    const xIndex = await getCrossProjectSizeIndex();
+    if (xIndex) {
+      if (parts.length) parts.push("");
+      parts.push(
+        "## OTHER PROJECTS' AVAILABLE SIZES (cross-reference index)\n" +
+        "If the customer mentions a size that doesn't exist in the current project " +
+        "but DOES exist in another project below, mention that and offer to send " +
+        "that project's plan/details instead. NEVER claim a size doesn't exist when " +
+        "another project has it.\n\n" +
+        xIndex,
+      );
+    }
+  } catch (err: any) {
+    console.error(`[Webhook] Cross-project size-index fetch failed: ${err.message}`);
+  }
+
   const combined = parts.join("\n").trim();
   // Trim to ~24 KB to keep prompt size reasonable (PDFs added headroom)
   return combined.length > 24000 ? combined.slice(0, 24000) + "\n... (truncated)" : combined;
@@ -534,6 +557,62 @@ function buildStructuredMessage(opts: {
     opts.userMessage,
     `</USER_MESSAGE>`,
   ].join("\n");
+}
+
+// ── Pending-doc fast-path helpers ────────────────────────────────────────
+// Used to detect when the bot's previous turn was a size-disambiguation
+// question and the customer is just answering with the size label. We
+// short-circuit Gemini in that case and dispatch the PDF immediately.
+
+/** Extract the most recent OUTBOUND (bot) message from formatted history.
+ *  Looks for "Anandita: ..." or "Bot: ..." style lines (caller's format
+ *  from getConversationContext). Returns "" if none found. */
+function extractLastBotTurn(formattedHistory: string): string {
+  if (!formattedHistory) return "";
+  const lines = formattedHistory.split("\n").filter((l) => l.trim());
+  // Walk from the end backward; the last bot line is the most recent
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = lines[i];
+    // Match "Anandita: ..." / "Bot: ..." / "Outbound: ..."
+    const m = l.match(/^(Anandita|Bot|Outbound|Agent)\s*:\s*(.+)$/i);
+    if (m) return m[2].trim();
+  }
+  return "";
+}
+
+/** True if the bot's last turn was asking the customer to pick a size /
+ *  unit / floor plan / variant. Conservative — matches common phrasings
+ *  used by Gemini and the Kimi unit_plan_dispatcher's clarification msg. */
+function isClarificationAsk(botTurn: string): boolean {
+  if (!botTurn) return false;
+  const t = botTurn.toLowerCase();
+  return (
+    /\bwhich\s+(unit|size|tower|floor|variant|configuration|plan|one)/i.test(t) ||
+    /\bwhich\s+would\s+you\s+like/i.test(t) ||
+    /\bsizes?\s+available/i.test(t) ||
+    /\bkaunsa\b/i.test(t) ||                      // Hinglish "which one"
+    /\bkonsa\b/i.test(t) ||
+    /\bmay i send/i.test(t) ||                    // "May I send the X?"
+    /please\s+(let\s+me\s+know|specify|tell)/i.test(t) ||
+    /\bplease\s+pick/i.test(t)
+  );
+}
+
+/** True if customer's message LOOKS like a size selection — short, contains
+ *  a unit-size signal (digits with sft/sq.ft, BHK, East/West/N/S, "ka bhejo"
+ *  type). Errs on the side of false-positive only when message is short
+ *  (<60 chars) so we don't fast-path complex multi-question replies. */
+function looksLikeSizePick(message: string): boolean {
+  if (!message || message.length > 60) return false;
+  const m = message.toLowerCase();
+  return (
+    /\b\d{3,5}\s*(sft|sq\.?\s*ft|sqft)?\b/.test(m) ||                // 1695 / 2035 / 2520 sft
+    /\b[1-5]\s*bhk\b/.test(m) ||                                       // 3BHK / 2 bhk
+    /\b(east|west|north|south)(\s|$|-|\/|facing)/i.test(m) ||         // east, east-facing
+    /\btower\s*[a-fA-F0-9]\b/.test(m) ||                               // Tower A
+    /\b(1bhk|2bhk|3bhk|4bhk)\b/i.test(m) ||
+    /\b(east|west|north|south)\s+(ka|wala|ki)\b/.test(m)               // "east ka bhejo"
+  );
 }
 
 // ── Pull last N messages from full conversation history (for classifier) ────
@@ -690,6 +769,85 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       phone,
     });
     console.log(`[Periskope Webhook] Initial project resolution: ${project || "(none)"}`);
+
+    // 3b. PENDING-DOC FAST-PATH ──────────────────────────────────────────
+    // If the LAST bot turn was a clarification question ("which unit plan
+    // should I send?") and the customer's current message is a short
+    // size-label answer ("1695 East", "2035 sft", "3BHK East"), bypass
+    // Gemini entirely and run the unit-plan dispatcher directly. Why:
+    // Gemini was treating the size-label answer as a fresh DOCUMENT_REQUEST
+    // and re-asking "which one?" instead of acting on the disambiguation,
+    // forcing the customer to repeat themselves 2-3 turns. This shortcut
+    // delivers the PDF in one shot when the intent is unambiguous.
+    let pendingDocHandled = false;
+    let docSentEarly: { doc_type: string; url: string; source?: string } | null = null;
+    if (project && conversation.formatted && conversation.formatted !== "no prior conversation") {
+      const lastBotTurn = extractLastBotTurn(conversation.formatted);
+      const askedForSize = isClarificationAsk(lastBotTurn);
+      const looksLikeSizeAnswer = looksLikeSizePick(message);
+      if (askedForSize && looksLikeSizeAnswer) {
+        console.log(
+          `[Periskope Webhook] Pending-doc fast-path triggered — last bot asked size, ` +
+          `customer answered "${message.slice(0, 60)}"`,
+        );
+        try {
+          const dispatch = await dispatchUnitPlan(message, project, "unit_plan");
+          console.log(
+            `[Periskope Webhook] Fast-path Kimi dispatch: decision=${dispatch.decision} ` +
+            `conf=${dispatch.confidence.toFixed(2)} ms=${dispatch.ms}`,
+          );
+          if (dispatch.decision === "match" && dispatch.row) {
+            // Send PDF + a short confirmation message, skip Gemini.
+            // sender is already in scope from the outer handler (line ~680).
+            const caption = `${project} unit plan as discussed.`;
+            const ack = `Sending the ${project} ${dispatch.row.size_label || ""} unit plan now, Sir.`.replace(/\s+/g, " ").trim();
+            await saveMessage(phone, "outbound", ack, sender, project);
+            try { await sendReply(phone, sender, ack); } catch (err: any) {
+              console.error(`[Periskope Webhook] fast-path ack send failed: ${err.message}`);
+            }
+            try {
+              await sendDocViaPeriskope(phone, sender, dispatch.row.url, dispatch.row.filename, caption);
+              docSentEarly = { doc_type: "unit_plan", url: dispatch.row.url, source: "fast-path" };
+              pendingDocHandled = true;
+              console.log(`[Periskope Webhook] Fast-path PDF delivered: ${dispatch.row.url}`);
+            } catch (err: any) {
+              console.error(`[Periskope Webhook] fast-path doc send failed: ${err.message}`);
+            }
+          }
+          // For "ambiguous" / "no_match" / "fallback" decisions we DON'T
+          // short-circuit — let Gemini handle it normally, since we don't
+          // want to send the wrong PDF and Gemini might offer a smart
+          // cross-project alternative thanks to the size index above.
+        } catch (err: any) {
+          console.error(`[Periskope Webhook] fast-path dispatch threw: ${err.message}`);
+        }
+      }
+    }
+
+    // If the fast-path delivered the PDF, also stamp Zoho intent and return
+    // — saves a Gemini round-trip and the customer gets the PDF in ~6s
+    // instead of 12-15s end-to-end.
+    if (pendingDocHandled) {
+      if (leadDetails && zohoToken) {
+        try {
+          await updateZohoIntent(leadDetails.id, "Document Sent", zohoToken);
+        } catch (err: any) {
+          console.error(`[Periskope Webhook] fast-path Zoho update failed: ${err.message}`);
+        }
+      }
+      return res.status(200).json({
+        success: true,
+        phone,
+        project,
+        intent: "DOCUMENT_REQUEST",
+        flags: ["pending_doc_resolved"],
+        zohoIntent: "Document Sent",
+        historyMessages: conversation.totalMessages,
+        docSent: docSentEarly,
+        delivered: true,
+        fastPath: true,
+      });
+    }
 
     // 4. Detect "all projects / compare" intent — switch to multi-project context
     //    so Gemini can answer about every project, not just the resolved one.
