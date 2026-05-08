@@ -1952,18 +1952,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       campaign_objective?: string;
       form_id?: string;
       form_in_allowlist?: boolean;
+      running_page_id?: string;
+      running_page_in_token_scope?: boolean;
     }> = [];
 
     for (const acct of adAccounts.slice(0, 5)) {
       const acctId = acct.id;
-      // Only ACTIVE ads, with creative.lead_form details where available.
+      // Only ACTIVE ads, with creative.lead_form details + the page_id the
+      // ad is running from. The page_id is critical: if it differs from
+      // the page our token has access to, we've found the smoking gun.
       const adsData = await fetchJson(
-        `https://graph.facebook.com/v19.0/${acctId}/ads?fields=id,name,effective_status,campaign{objective},creative{object_story_spec{link_data{call_to_action{value}}}}&effective_status=["ACTIVE"]&limit=50&access_token=${encodeURIComponent(metaToken)}`,
+        `https://graph.facebook.com/v19.0/${acctId}/ads?fields=id,name,effective_status,campaign{objective},creative{object_story_spec{page_id,link_data{call_to_action{value}}}}&effective_status=["ACTIVE"]&limit=50&access_token=${encodeURIComponent(metaToken)}`,
       );
       if (adsData?.__error) continue;
       const ads = (adsData?.data || []) as any[];
       for (const ad of ads) {
         const formId = ad?.creative?.object_story_spec?.link_data?.call_to_action?.value?.lead_gen_form_id;
+        const adRunningPageId = ad?.creative?.object_story_spec?.page_id;
         if (formId) {
           activeLeadAds.push({
             ad_account_id: acctId,
@@ -1972,7 +1977,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             campaign_objective: ad?.campaign?.objective,
             form_id: String(formId),
             form_in_allowlist: allowSet.has(String(formId)),
-          });
+            running_page_id: adRunningPageId ? String(adRunningPageId) : undefined,
+            running_page_in_token_scope: adRunningPageId
+              ? pages.some((p) => p.id === String(adRunningPageId))
+              : undefined,
+          } as any);
         }
       }
     }
