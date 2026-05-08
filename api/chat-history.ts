@@ -1214,11 +1214,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             site_visit_booked: 0,   // Lead_Status: "Pre Site" / "Site Visit Booked"
             site_visit_done: 0,     // Lead_Status: "Site Visit Done" / "Site Visited"
             statuses: {} as Record<string, number>,
+            sources: {} as Record<string, number>,   // FIM Forms / Website Inquiry / etc.
           };
         }
         byDate[day].total++;
         const ls = String(lead.Lead_Status || "");
+        const src = String(lead.Lead_Source || "(unknown)");
         byDate[day].statuses[ls] = (byDate[day].statuses[ls] || 0) + 1;
+        byDate[day].sources[src] = (byDate[day].sources[src] || 0) + 1;
         const lsLower = ls.toLowerCase();
         if (
           lsLower.includes("pre site") ||
