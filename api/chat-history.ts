@@ -1708,6 +1708,83 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── Meta recent-leads pull ───────────────────────────────────────────────
+  // GET ?action=meta-recent-leads&days=N
+  //   For each subscribed page, lists ALL lead-form submissions Meta has on
+  //   record in the last N days (default 7). Compares against our Zoho.
+  //   If Meta has leads but we don't → webhook delivery failed silently,
+  //   and we can backfill by replaying these leadgen IDs through ingest.
+  if (req.method === "GET" && req.query.action === "meta-recent-leads") {
+    const token = process.env.META_PAGE_ACCESS_TOKEN || "";
+    if (!token) return res.status(500).json({ error: "META_PAGE_ACCESS_TOKEN not set" });
+    const days = Math.max(1, Math.min(90, Number(req.query.days || 7)));
+    const sinceUnix = Math.floor((Date.now() - days * 86400_000) / 1000);
+    try {
+      // Get pages
+      const ar = await fetch(
+        `https://graph.facebook.com/v19.0/me/accounts?access_token=${encodeURIComponent(token)}&fields=id,name,access_token`,
+      );
+      const ab = await ar.json();
+      const pages = (ab?.data || []) as Array<{ id: string; name: string; access_token?: string }>;
+
+      const summary: any[] = [];
+      const allLeads: any[] = [];
+      for (const p of pages) {
+        const pageToken = p.access_token || token;
+        // Get all forms on this page
+        const fr = await fetch(
+          `https://graph.facebook.com/v19.0/${p.id}/leadgen_forms?access_token=${encodeURIComponent(pageToken)}&fields=id,name,status,leads_count&limit=50`,
+        );
+        const fb = await fr.json();
+        const forms = (fb?.data || []) as Array<{ id: string; name: string; status: string; leads_count: number }>;
+
+        const pageLeads: any[] = [];
+        for (const form of forms.slice(0, 30)) {
+          // Get leads created in last `days` days
+          const lr = await fetch(
+            `https://graph.facebook.com/v19.0/${form.id}/leads?access_token=${encodeURIComponent(pageToken)}&fields=id,created_time,field_data&filtering=[{"field":"time_created","operator":"GREATER_THAN","value":${sinceUnix}}]&limit=200`,
+          );
+          const lb = await lr.json();
+          const leads = (lb?.data || []) as any[];
+          for (const lead of leads) {
+            const phone = (lead.field_data || []).find((f: any) =>
+              /phone/i.test(f.name || ""),
+            )?.values?.[0] || "";
+            pageLeads.push({
+              leadgen_id: lead.id,
+              created_time: lead.created_time,
+              form_id: form.id,
+              form_name: form.name,
+              phone,
+            });
+          }
+        }
+        summary.push({
+          page_id: p.id,
+          page_name: p.name,
+          forms_count: forms.length,
+          leads_in_window: pageLeads.length,
+          forms: forms.map((f) => ({
+            id: f.id, name: f.name, status: f.status, leads_count: f.leads_count,
+          })),
+        });
+        allLeads.push(...pageLeads.map((l) => ({ ...l, page_name: p.name })));
+      }
+
+      return res.status(200).json({
+        days_window: days,
+        pages_checked: pages.length,
+        total_leads_on_meta: allLeads.length,
+        summary,
+        recent_leads: allLeads.sort((a, b) =>
+          String(b.created_time).localeCompare(String(a.created_time)),
+        ).slice(0, 50),
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // GET ?action=meta-token-check → introspects META_PAGE_ACCESS_TOKEN via
   // Graph API debug_token + /me, returns expiry, app_id, granted scopes,
   // and a clear OK / EXPIRED / INVALID verdict.
