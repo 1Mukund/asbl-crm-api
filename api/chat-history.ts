@@ -1977,6 +1977,129 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
+    // 6. CRITICAL — for each page, check webhook subscription using the
+    //    PAGE-level access token (not the System User token). Also resolve
+    //    each active ad's form ID directly to see if our token can read
+    //    the form metadata. This is the actual smoking gun for "leads not
+    //    arriving" cases.
+    const subscriptionResults: Array<{
+      page_id: string;
+      page_name: string;
+      subscribed_to_leadgen: boolean;
+      subscribed_apps: any[];
+      error?: string;
+    }> = [];
+
+    for (const page of pages) {
+      const pageToken = page.access_token || metaToken;
+      const subData = await fetchJson(
+        `https://graph.facebook.com/v19.0/${page.id}/subscribed_apps?access_token=${encodeURIComponent(pageToken)}`,
+      );
+      if (subData?.__error) {
+        subscriptionResults.push({
+          page_id: page.id,
+          page_name: page.name,
+          subscribed_to_leadgen: false,
+          subscribed_apps: [],
+          error: subData.__error,
+        });
+        continue;
+      }
+      const apps = (subData?.data || []) as any[];
+      const slim = apps.map((a) => ({
+        id: a.id,
+        name: a.name,
+        subscribed_fields: a.subscribed_fields || [],
+        has_leadgen: (a.subscribed_fields || []).includes("leadgen"),
+      }));
+      subscriptionResults.push({
+        page_id: page.id,
+        page_name: page.name,
+        subscribed_to_leadgen: slim.some((a) => a.has_leadgen),
+        subscribed_apps: slim,
+      });
+    }
+
+    // 7. Probe each ACTIVE form ID directly. If our token can't read it,
+    //    even an incoming webhook payload would fail when we try to fetch
+    //    field_data via /leadgen_id?fields=field_data.
+    const formProbes: Array<{
+      form_id: string;
+      readable: boolean;
+      name?: string;
+      status?: string;
+      page_id?: string;
+      error?: string;
+    }> = [];
+    const uniqueFormIds = [...new Set(activeLeadAds.map((a) => a.form_id).filter(Boolean) as string[])];
+    for (const fid of uniqueFormIds) {
+      const probe = await fetchJson(
+        `https://graph.facebook.com/v19.0/${fid}?fields=id,name,status,page&access_token=${encodeURIComponent(metaToken)}`,
+      );
+      if (probe?.__error) {
+        formProbes.push({ form_id: fid, readable: false, error: probe.__error });
+      } else {
+        formProbes.push({
+          form_id: fid,
+          readable: true,
+          name: probe.name,
+          status: probe.status,
+          page_id: probe.page?.id,
+        });
+        // Also enrich allFoundForms so summary reflects what we can actually read
+        allFoundForms.push({
+          id: fid,
+          name: probe.name || `(form ${fid})`,
+          status: probe.status,
+          page_id: probe.page?.id,
+          page_name: probe.page?.name,
+          in_allowlist: allowSet.has(fid),
+        });
+      }
+    }
+
+    // 8. AUTO-FIX option — if ?fix=1 is passed AND a page is missing leadgen
+    //    subscription, attempt to subscribe it. Most common root cause when
+    //    a fresh System User token is rotated without re-subscribing.
+    const fixRequested = String(req.query.fix || "") === "1";
+    const subscriptionFixes: Array<{
+      page_id: string;
+      page_name: string;
+      attempted: boolean;
+      success: boolean;
+      response?: any;
+    }> = [];
+    if (fixRequested) {
+      for (const sub of subscriptionResults) {
+        if (sub.subscribed_to_leadgen) continue;
+        const page = pages.find((p) => p.id === sub.page_id);
+        if (!page) continue;
+        const pageToken = page.access_token || metaToken;
+        try {
+          const r = await fetch(
+            `https://graph.facebook.com/v19.0/${page.id}/subscribed_apps?subscribed_fields=leadgen&access_token=${encodeURIComponent(pageToken)}`,
+            { method: "POST" },
+          );
+          const j = await r.json().catch(() => ({}));
+          subscriptionFixes.push({
+            page_id: page.id,
+            page_name: page.name,
+            attempted: true,
+            success: r.ok && (j as any)?.success === true,
+            response: j,
+          });
+        } catch (err: any) {
+          subscriptionFixes.push({
+            page_id: page.id,
+            page_name: page.name,
+            attempted: true,
+            success: false,
+            response: { error: err.message },
+          });
+        }
+      }
+    }
+
     // Summary verdict
     const totalFormsFound = allFoundForms.length;
     const formsInAllowlist = allFoundForms.filter((f) => f.in_allowlist).length;
@@ -1992,6 +2115,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (activeAdsWithUnseenForms.length) diagnosis.push(`${activeAdsWithUnseenForms.length} active ads use form IDs that are NOT in our visible-forms list. Token doesn't see those forms.`);
     if (!diagnosis.length) diagnosis.push("No obvious config issue detected — leads should be flowing if forms are subscribed to our webhook.");
 
+    // Re-compute diagnosis with new info (subscription + form probes)
+    const pagesWithoutLeadgen = subscriptionResults.filter((s) => !s.subscribed_to_leadgen);
+    const unreadableForms = formProbes.filter((p) => !p.readable);
+    if (pagesWithoutLeadgen.length) {
+      diagnosis.unshift(
+        `🚨 CRITICAL: ${pagesWithoutLeadgen.length} page(s) NOT subscribed to 'leadgen' webhook ` +
+        `(${pagesWithoutLeadgen.map((s) => s.page_name).join(", ")}). ` +
+        `New leads from these pages WILL NOT reach our endpoint. ` +
+        `Re-run with &fix=1 to auto-subscribe.`,
+      );
+    }
+    if (unreadableForms.length) {
+      diagnosis.push(
+        `${unreadableForms.length} active form ID(s) cannot be read with this token: ` +
+        `${unreadableForms.map((p) => `${p.form_id} (${p.error})`).join("; ")}. ` +
+        `Even if webhooks fire, fetching field_data will fail.`,
+      );
+    }
+
     return res.status(200).json({
       summary: {
         pages_visible: pages.length,
@@ -2000,6 +2142,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         forms_in_allowlist: formsInAllowlist,
         active_lead_ads_found: activeLeadAds.length,
         active_ads_with_unseen_forms: activeAdsWithUnseenForms.length,
+        pages_subscribed_to_leadgen: subscriptionResults.filter((s) => s.subscribed_to_leadgen).length,
+        active_forms_readable: formProbes.filter((p) => p.readable).length,
+        active_forms_unreadable: formProbes.filter((p) => !p.readable).length,
+        fix_attempted: fixRequested,
       },
       diagnosis,
       allowlist: { configured: !!allowlist.length, count: allowlist.length },
@@ -2008,6 +2154,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       page_level_forms: pageFormsResults,
       ad_account_level_forms: adAccountFormsResults,
       active_lead_ads: activeLeadAds,
+      webhook_subscriptions: subscriptionResults,
+      active_form_probes: formProbes,
+      subscription_fixes: subscriptionFixes,
     });
   }
 
