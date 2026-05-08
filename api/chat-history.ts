@@ -1627,6 +1627,87 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   // ─── Meta token health check ────────────────────────────────────────────
+  // ─── Meta page-subscription audit ───────────────────────────────────────
+  // GET ?action=meta-pages-check → for each page our SYSTEM_USER token has
+  //   access to, fetches the subscribed_apps list and shows whether our
+  //   app is subscribed to the "leadgen" field. This catches the case where
+  //   Meta auto-unsubscribes a page after our webhook returned consecutive
+  //   5xx errors (which is what happened May 7 when ingest broke briefly
+  //   on the new Resubmission fields). If a page shows leadgen=false,
+  //   re-subscribe via Meta Business Manager → Page → Apps.
+  if (req.method === "GET" && req.query.action === "meta-pages-check") {
+    const token = process.env.META_PAGE_ACCESS_TOKEN || "";
+    if (!token) return res.status(500).json({ verdict: "MISSING_TOKEN", error: "META_PAGE_ACCESS_TOKEN not set" });
+    try {
+      // /me/accounts works for SYSTEM_USER tokens — returns ALL pages
+      // the system user has admin access to. If empty, the token's
+      // permissions are wrong.
+      const accountsRes = await fetch(
+        `https://graph.facebook.com/v19.0/me/accounts?access_token=${encodeURIComponent(token)}&fields=id,name,access_token&limit=200`,
+      );
+      const accountsBody = await accountsRes.json();
+      if (!accountsRes.ok || accountsBody.error) {
+        return res.status(200).json({
+          verdict: "ACCOUNTS_FAILED",
+          status: accountsRes.status,
+          error: accountsBody.error || (await accountsRes.text()).slice(0, 300),
+          hint: "If error code 100 'nonexisting field accounts', the token isn't a System User token with the right scopes — needs ads_management + leads_retrieval + pages_show_list.",
+        });
+      }
+      const pages = (accountsBody.data || []) as Array<{ id: string; name: string; access_token?: string }>;
+      if (!pages.length) {
+        return res.status(200).json({
+          verdict: "NO_PAGES",
+          message: "Token is valid but has access to ZERO pages. Re-issue a System User token with the right page assignments.",
+        });
+      }
+
+      // For each page, query its subscribed_apps list
+      const results: any[] = [];
+      for (const p of pages.slice(0, 30)) {
+        const pageToken = p.access_token || token;
+        try {
+          const sr = await fetch(
+            `https://graph.facebook.com/v19.0/${p.id}/subscribed_apps?access_token=${encodeURIComponent(pageToken)}`,
+          );
+          const sb = await sr.json();
+          const apps = (sb?.data || []) as any[];
+          results.push({
+            page_id: p.id,
+            page_name: p.name,
+            apps_subscribed: apps.length,
+            our_app_subscribed: apps.length > 0,
+            leadgen_subscribed: apps.some((a) => (a.subscribed_fields || []).includes("leadgen")),
+            apps: apps.map((a) => ({
+              app_id: a.id,
+              app_name: a.name,
+              subscribed_fields: a.subscribed_fields || [],
+            })),
+            error: sb?.error || null,
+          });
+        } catch (e: any) {
+          results.push({ page_id: p.id, page_name: p.name, error: e.message });
+        }
+      }
+
+      const fullySubscribed = results.filter((r) => r.leadgen_subscribed);
+      const missingLeadgen = results.filter((r) => !r.leadgen_subscribed && !r.error);
+      return res.status(200).json({
+        verdict: missingLeadgen.length > 0 ? "SOME_PAGES_MISSING_LEADGEN" : "ALL_OK",
+        token_scopes_remind: "Token needs: ads_management, leads_retrieval, pages_show_list, pages_manage_metadata",
+        pages_checked: results.length,
+        pages_with_leadgen: fullySubscribed.length,
+        pages_missing_leadgen: missingLeadgen.length,
+        fix_action: missingLeadgen.length > 0
+          ? "Re-subscribe via Meta Business Manager → Pages → [Page] → Apps → ASBL CRM app → toggle leadgen on. Or via API: POST /{page-id}/subscribed_apps?subscribed_fields=leadgen with the page access_token."
+          : null,
+        details: results,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // GET ?action=meta-token-check → introspects META_PAGE_ACCESS_TOKEN via
   // Graph API debug_token + /me, returns expiry, app_id, granted scopes,
   // and a clear OK / EXPIRED / INVALID verdict.
