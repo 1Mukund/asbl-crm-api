@@ -1785,6 +1785,232 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // GET ?action=meta-deep-diag&secret=<INHOUSE_POSTHOOK_SECRET>
+  //   Deep Meta diagnostic — finds where lead forms actually live.
+  //   When the page-level `/leadgen_forms` returns 0 but ads are running,
+  //   the forms are usually at the AD ACCOUNT level (created via Ads
+  //   Manager's inline "create new form" flow). This endpoint:
+  //     1. Lists every page the token has access to
+  //     2. Lists every ad account the token has access to
+  //     3. For each ad account, lists its lead forms
+  //     4. Lists active ads with Lead Generation objective and the
+  //        form IDs they're using
+  //     5. Cross-references against our META_FORM_IDS_ALLOWLIST so we
+  //        can see which incoming forms would be silently dropped
+  //   Critical for debugging "ads running but no leads in Zoho" cases.
+  if (req.method === "GET" && req.query.action === "meta-deep-diag") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    const metaToken = process.env.META_PAGE_ACCESS_TOKEN || "";
+    if (!metaToken || metaToken === "REPLACE_WITH_YOUR_PAGE_ACCESS_TOKEN") {
+      return res.status(500).json({ error: "META_PAGE_ACCESS_TOKEN not configured" });
+    }
+
+    const allowlistRaw = process.env.META_FORM_IDS_ALLOWLIST || "";
+    const allowlist = allowlistRaw.split(",").map((s) => s.trim()).filter(Boolean);
+    const allowSet = new Set(allowlist);
+
+    type FormSummary = {
+      id: string;
+      name: string;
+      status?: string;
+      created_time?: string;
+      page_id?: string;
+      page_name?: string;
+      ad_account_id?: string;
+      in_allowlist: boolean;
+    };
+    const allFoundForms: FormSummary[] = [];
+
+    const fetchJson = async (url: string): Promise<any> => {
+      try {
+        const r = await fetch(url);
+        const data = await r.json();
+        if (!r.ok || data?.error) {
+          return { __error: data?.error?.message || `HTTP ${r.status}`, __status: r.status };
+        }
+        return data;
+      } catch (err: any) {
+        return { __error: err.message };
+      }
+    };
+
+    // 1. List pages this token has access to (could be more than just the
+    //    one we hardcoded — System User tokens often span multiple pages).
+    const pagesData = await fetchJson(
+      `https://graph.facebook.com/v19.0/me/accounts?fields=id,name,access_token&limit=50&access_token=${encodeURIComponent(metaToken)}`,
+    );
+    const pages = (pagesData?.data || []) as any[];
+
+    // 2. List ad accounts this token has access to.
+    const adAccountsData = await fetchJson(
+      `https://graph.facebook.com/v19.0/me/adaccounts?fields=id,name,account_id,account_status&limit=100&access_token=${encodeURIComponent(metaToken)}`,
+    );
+    const adAccounts = (adAccountsData?.data || []) as any[];
+
+    // 3. For each page, list page-level lead forms.
+    const pageFormsResults: Array<{
+      page_id: string;
+      page_name: string;
+      forms_count: number;
+      forms: FormSummary[];
+      error?: string;
+    }> = [];
+
+    for (const page of pages) {
+      const pageToken = page.access_token || metaToken;
+      const formsData = await fetchJson(
+        `https://graph.facebook.com/v19.0/${page.id}/leadgen_forms?fields=id,name,status,created_time&limit=100&access_token=${encodeURIComponent(pageToken)}`,
+      );
+      if (formsData?.__error) {
+        pageFormsResults.push({
+          page_id: page.id,
+          page_name: page.name,
+          forms_count: 0,
+          forms: [],
+          error: formsData.__error,
+        });
+        continue;
+      }
+      const forms = ((formsData?.data || []) as any[]).map((f) => {
+        const summary: FormSummary = {
+          id: f.id,
+          name: f.name,
+          status: f.status,
+          created_time: f.created_time,
+          page_id: page.id,
+          page_name: page.name,
+          in_allowlist: allowSet.has(f.id),
+        };
+        allFoundForms.push(summary);
+        return summary;
+      });
+      pageFormsResults.push({
+        page_id: page.id,
+        page_name: page.name,
+        forms_count: forms.length,
+        forms,
+      });
+    }
+
+    // 4. For each ad account, list ad-account-level lead forms (this is
+    //    the path Ads Manager uses when you "create new form" inline).
+    const adAccountFormsResults: Array<{
+      ad_account_id: string;
+      ad_account_name: string;
+      forms_count: number;
+      forms: FormSummary[];
+      error?: string;
+    }> = [];
+
+    for (const acct of adAccounts.slice(0, 10)) {
+      const acctId = acct.id; // already prefixed "act_..."
+      const formsData = await fetchJson(
+        `https://graph.facebook.com/v19.0/${acctId}/leadgen_forms?fields=id,name,status,created_time,page&limit=100&access_token=${encodeURIComponent(metaToken)}`,
+      );
+      if (formsData?.__error) {
+        adAccountFormsResults.push({
+          ad_account_id: acctId,
+          ad_account_name: acct.name,
+          forms_count: 0,
+          forms: [],
+          error: formsData.__error,
+        });
+        continue;
+      }
+      const forms = ((formsData?.data || []) as any[]).map((f) => {
+        const summary: FormSummary = {
+          id: f.id,
+          name: f.name,
+          status: f.status,
+          created_time: f.created_time,
+          ad_account_id: acctId,
+          page_id: f.page?.id,
+          page_name: f.page?.name,
+          in_allowlist: allowSet.has(f.id),
+        };
+        allFoundForms.push(summary);
+        return summary;
+      });
+      adAccountFormsResults.push({
+        ad_account_id: acctId,
+        ad_account_name: acct.name,
+        forms_count: forms.length,
+        forms,
+      });
+    }
+
+    // 5. List currently-active LEAD_GENERATION ads (the smoking gun — these
+    //    are spending money RIGHT NOW and using a form we may not see).
+    const activeLeadAds: Array<{
+      ad_account_id: string;
+      ad_id: string;
+      ad_name: string;
+      campaign_objective?: string;
+      form_id?: string;
+      form_in_allowlist?: boolean;
+    }> = [];
+
+    for (const acct of adAccounts.slice(0, 5)) {
+      const acctId = acct.id;
+      // Only ACTIVE ads, with creative.lead_form details where available.
+      const adsData = await fetchJson(
+        `https://graph.facebook.com/v19.0/${acctId}/ads?fields=id,name,effective_status,campaign{objective},creative{object_story_spec{link_data{call_to_action{value}}}}&effective_status=["ACTIVE"]&limit=50&access_token=${encodeURIComponent(metaToken)}`,
+      );
+      if (adsData?.__error) continue;
+      const ads = (adsData?.data || []) as any[];
+      for (const ad of ads) {
+        const formId = ad?.creative?.object_story_spec?.link_data?.call_to_action?.value?.lead_gen_form_id;
+        if (formId) {
+          activeLeadAds.push({
+            ad_account_id: acctId,
+            ad_id: ad.id,
+            ad_name: ad.name,
+            campaign_objective: ad?.campaign?.objective,
+            form_id: String(formId),
+            form_in_allowlist: allowSet.has(String(formId)),
+          });
+        }
+      }
+    }
+
+    // Summary verdict
+    const totalFormsFound = allFoundForms.length;
+    const formsInAllowlist = allFoundForms.filter((f) => f.in_allowlist).length;
+    const activeAdsWithUnseenForms = activeLeadAds.filter(
+      (ad) => ad.form_id && !allFoundForms.some((f) => f.id === ad.form_id),
+    );
+
+    const diagnosis: string[] = [];
+    if (!pages.length) diagnosis.push("Token has access to ZERO pages — it may be a user token, not a page/system-user token.");
+    if (!adAccounts.length) diagnosis.push("Token has access to ZERO ad accounts — it can't see ad-account-level forms. May need 'ads_management' permission.");
+    if (totalFormsFound === 0) diagnosis.push("No lead forms found at page OR ad-account level — but if ads are running, leads are being captured somewhere we can't see. Check Meta Business Manager → Lead Center → CRM Integration to find them.");
+    if (allowlist.length && formsInAllowlist === 0 && totalFormsFound > 0) diagnosis.push(`META_FORM_IDS_ALLOWLIST is set (${allowlist.length} IDs) but NONE match the forms found. All incoming leads will be silently dropped! Either clear the env var, or update it to match.`);
+    if (activeAdsWithUnseenForms.length) diagnosis.push(`${activeAdsWithUnseenForms.length} active ads use form IDs that are NOT in our visible-forms list. Token doesn't see those forms.`);
+    if (!diagnosis.length) diagnosis.push("No obvious config issue detected — leads should be flowing if forms are subscribed to our webhook.");
+
+    return res.status(200).json({
+      summary: {
+        pages_visible: pages.length,
+        ad_accounts_visible: adAccounts.length,
+        total_forms_found: totalFormsFound,
+        forms_in_allowlist: formsInAllowlist,
+        active_lead_ads_found: activeLeadAds.length,
+        active_ads_with_unseen_forms: activeAdsWithUnseenForms.length,
+      },
+      diagnosis,
+      allowlist: { configured: !!allowlist.length, count: allowlist.length },
+      pages: pages.map((p) => ({ id: p.id, name: p.name })),
+      ad_accounts: adAccounts.map((a) => ({ id: a.id, name: a.name, status: a.account_status })),
+      page_level_forms: pageFormsResults,
+      ad_account_level_forms: adAccountFormsResults,
+      active_lead_ads: activeLeadAds,
+    });
+  }
+
   // GET ?action=meta-token-check → introspects META_PAGE_ACCESS_TOKEN via
   // Graph API debug_token + /me, returns expiry, app_id, granted scopes,
   // and a clear OK / EXPIRED / INVALID verdict.
