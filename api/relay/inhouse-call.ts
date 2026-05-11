@@ -199,15 +199,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         `external_schedule_id=${externalScheduleId || "(none)"}`,
       );
 
-      // Best-effort Zoho stamping (won't block the response)
+      // Zoho stamping — MUST await in Vercel serverless. Earlier version
+      // used .catch() fire-and-forget which gets killed when the handler
+      // returns 200, so Last_Inhouse_Call_ID never persisted → posthook
+      // could not correlate the completion back to the lead → Call_Status
+      // never set, blueprint never transitioned, sales saw the lead stuck.
+      // Promise.allSettled lets both writes proceed in parallel and we
+      // still log either failure individually.
       if (zohoLeadId) {
-        updateLead(zohoLeadId, {
-          Lead_Status: "Lead Initiated",
-          Last_Inhouse_Call_ID: callId,
-        }).catch((err) =>
-          console.error(`[InHouse Call IN] updateLead failed: ${err.message}`)
-        );
-        triggerBlueprintTransition(zohoLeadId, "Lead Initiated").catch(() => {});
+        const [updateRes, transRes] = await Promise.allSettled([
+          updateLead(zohoLeadId, {
+            Lead_Status: "Lead Initiated",
+            Last_Inhouse_Call_ID: callId,
+          }),
+          triggerBlueprintTransition(zohoLeadId, "Lead Initiated"),
+        ]);
+        if (updateRes.status === "rejected") {
+          console.error(`[InHouse Call IN] updateLead failed: ${updateRes.reason?.message || updateRes.reason}`);
+        } else {
+          console.log(`[InHouse Call IN] Zoho stamped Lead_Status + Last_Inhouse_Call_ID=${callId} on lead ${zohoLeadId}`);
+        }
+        if (transRes.status === "rejected") {
+          console.error(`[InHouse Call IN] blueprint transition failed: ${transRes.reason?.message || transRes.reason}`);
+        }
       }
 
       return res.status(200).json({
@@ -237,12 +251,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       console.log(`[InHouse Call US] Arrowhead campaign triggered for ${phone}`);
 
-      // Move Zoho lead to "Lead Initiated" — same pattern as the legacy relay
+      // Move Zoho lead to "Lead Initiated" — MUST await in Vercel serverless
+      // (see IN branch comment above for why fire-and-forget was wrong).
       if (zohoLeadId) {
-        updateLead(zohoLeadId, { Lead_Status: "Lead Initiated" }).catch((err) =>
-          console.error(`[InHouse Call US] updateLead failed: ${err.message}`)
-        );
-        triggerBlueprintTransition(zohoLeadId, "Lead Initiated").catch(() => {});
+        const [updateRes, transRes] = await Promise.allSettled([
+          updateLead(zohoLeadId, { Lead_Status: "Lead Initiated" }),
+          triggerBlueprintTransition(zohoLeadId, "Lead Initiated"),
+        ]);
+        if (updateRes.status === "rejected") {
+          console.error(`[InHouse Call US] updateLead failed: ${updateRes.reason?.message || updateRes.reason}`);
+        }
+        if (transRes.status === "rejected") {
+          console.error(`[InHouse Call US] blueprint transition failed: ${transRes.reason?.message || transRes.reason}`);
+        }
       }
 
       return res.status(200).json({
