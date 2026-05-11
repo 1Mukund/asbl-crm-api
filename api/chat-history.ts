@@ -1379,6 +1379,179 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── Zoho audit — full custom fields + Blueprint + Lead_Status picklist ──
+  // GET ?action=zoho-audit&secret=<INHOUSE_POSTHOOK_SECRET>
+  //   One-shot diagnostic to map current Zoho state against the spec's
+  //   80+ custom field requirement, 6-stage Blueprint, and Status model.
+  //   Returns:
+  //     - All custom fields grouped by section + flagged with type/length
+  //     - All picklist values for Lead_Status (and other key picklists)
+  //     - Existing Blueprint structure if any
+  //   Used as Step 1 of the ASBL spec implementation: gap analysis.
+  if (req.method === "GET" && req.query.action === "zoho-audit") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+
+      // 1. All Leads-module fields
+      const fr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+        headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      });
+      if (!fr.ok) {
+        return res.status(fr.status).json({ error: "fields fetch failed", body: (await fr.text()).slice(0, 500) });
+      }
+      const fj = await fr.json() as any;
+      const allFields = (fj?.fields || []) as any[];
+
+      // 2. Picklist values for key fields (Lead_Status, ASBL_Project, etc.)
+      const pickFields: Record<string, string[]> = {};
+      const keyPicklists = ["Lead_Status", "ASBL_Project", "Call_Status", "Call_Outcome", "Last_Resubmission_Source", "Lead_Source"];
+      for (const apiName of keyPicklists) {
+        const f = allFields.find((x) => x.api_name === apiName);
+        if (f && Array.isArray(f.pick_list_values)) {
+          pickFields[apiName] = f.pick_list_values.map((p: any) => p.display_value || p.actual_value);
+        }
+      }
+
+      // 3. Blueprint structure — list all blueprints for Leads module
+      let blueprints: any = null;
+      try {
+        const br = await fetch(`${ZOHO_API_BASE}/settings/automation/blueprint?module=Leads`, {
+          headers: { Authorization: `Zoho-oauthtoken ${token}` },
+        });
+        if (br.ok) {
+          const bj = await br.json();
+          blueprints = bj;
+        } else {
+          blueprints = { error: `${br.status}: ${(await br.text()).slice(0, 200)}` };
+        }
+      } catch (err: any) {
+        blueprints = { error: err.message };
+      }
+
+      // 4. Custom field summary — group by lookup_type, system_defined, etc.
+      const customFields = allFields.filter((f) => f.custom_field);
+      const systemFields = allFields.filter((f) => !f.custom_field);
+
+      const customByType: Record<string, number> = {};
+      for (const f of customFields) {
+        const t = f.data_type || "unknown";
+        customByType[t] = (customByType[t] || 0) + 1;
+      }
+
+      // Spec requires these field families — flag which ones we have
+      const specFamilies: Record<string, { spec_count: number; have: string[] }> = {
+        "Identity & Attribution (9.1)": {
+          spec_count: 17,
+          have: customFields
+            .filter((f) => /Project|Visitor|Session|GCLID|FBCLID|WBRAID|GBRAID|UTM|Landing|Referrer|Device|IP/i.test(f.api_name))
+            .map((f) => f.api_name),
+        },
+        "Stage & Status (9.2)": {
+          spec_count: 7,
+          have: customFields
+            .filter((f) => /Stage|Status|Callback_Source|Closure_Reason|State_Change/i.test(f.api_name))
+            .map((f) => f.api_name),
+        },
+        "WhatsApp Channel (9.3)": {
+          spec_count: 6,
+          have: customFields
+            .filter((f) => /WhatsApp|Opt_Out_WhatsApp/i.test(f.api_name))
+            .map((f) => f.api_name),
+        },
+        "Voice Channel (9.4)": {
+          spec_count: 9,
+          have: customFields
+            .filter((f) => /Call_State|Call_Last|Call_Attempt|Call_Connected|Call_Disposition|Recording|Preferred_Callback|Opt_Out_Calls/i.test(f.api_name))
+            .map((f) => f.api_name),
+        },
+        "Bot State (9.5)": {
+          spec_count: 6,
+          have: customFields
+            .filter((f) => /Bot_|Active_Channel|LLM_Cost/i.test(f.api_name))
+            .map((f) => f.api_name),
+        },
+        "Slots (9.6)": {
+          spec_count: 9,
+          have: customFields
+            .filter((f) => /Intent|Budget_Bucket|Timeline_Bucket|Configuration_Interest|Workplace|Loan_Required|Competitor|Slot/i.test(f.api_name))
+            .map((f) => f.api_name),
+        },
+        "Lead Score (9.7)": {
+          spec_count: 4,
+          have: customFields
+            .filter((f) => /Lead_Score|Lead_Tier|Score_Last|Predicted_Value/i.test(f.api_name))
+            .map((f) => f.api_name),
+        },
+        "Site Visit (9.8)": {
+          spec_count: 7,
+          have: customFields
+            .filter((f) => /Site_Visit/i.test(f.api_name))
+            .map((f) => f.api_name),
+        },
+        "Outcome (9.9)": {
+          spec_count: 4,
+          have: customFields
+            .filter((f) => /Booking|Closed_At/i.test(f.api_name))
+            .map((f) => f.api_name),
+        },
+        "Progress Flags (9.10)": {
+          spec_count: 16,
+          have: customFields
+            .filter((f) => /^F_/i.test(f.api_name))
+            .map((f) => f.api_name),
+        },
+        "System/Audit (9.11)": {
+          spec_count: 6,
+          have: customFields
+            .filter((f) => /Last_Inbound|Next_Action|Active_Cadence|Cadence_Step|Lead_Locked/i.test(f.api_name))
+            .map((f) => f.api_name),
+        },
+      };
+
+      const gapSummary = Object.entries(specFamilies).map(([family, info]) => ({
+        family,
+        spec_count: info.spec_count,
+        have_count: info.have.length,
+        missing_count: Math.max(0, info.spec_count - info.have.length),
+        have_fields: info.have,
+      }));
+
+      return res.status(200).json({
+        timestamp: new Date().toISOString(),
+        totals: {
+          all_fields: allFields.length,
+          custom_fields: customFields.length,
+          system_fields: systemFields.length,
+        },
+        custom_fields_by_type: customByType,
+        all_custom_field_api_names: customFields.map((f) => ({
+          api_name: f.api_name,
+          label: f.field_label,
+          type: f.data_type,
+          length: f.length,
+          required: f.required,
+        })),
+        picklists: pickFields,
+        blueprints: blueprints,
+        spec_gap_analysis: gapSummary,
+        spec_gap_totals: {
+          total_spec_fields_needed: gapSummary.reduce((s, g) => s + g.spec_count, 0),
+          total_we_have: gapSummary.reduce((s, g) => s + g.have_count, 0),
+          total_missing: gapSummary.reduce((s, g) => s + g.missing_count, 0),
+        },
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── Zoho field metadata + auto-create Last_Inhouse_Call_ID ────────────
   // GET ?action=zoho-fields&secret=<INHOUSE_POSTHOOK_SECRET>
   //   Lists ALL custom fields on the Leads module + checks for the call-id
