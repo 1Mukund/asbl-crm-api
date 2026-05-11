@@ -47,7 +47,7 @@ async function fetchMetaLeadData(leadgenId: string): Promise<Record<string, any>
 
 // ─── Parse Lead Fields ────────────────────────────────────────────────────────
 
-function parseFieldData(fieldData: Array<{ name: string; values: string[] }>): Record<string, string> {
+export function parseFieldData(fieldData: Array<{ name: string; values: string[] }>): Record<string, string> {
   const fields: Record<string, string> = {};
   if (Array.isArray(fieldData)) {
     for (const f of fieldData) {
@@ -58,7 +58,7 @@ function parseFieldData(fieldData: Array<{ name: string; values: string[] }>): R
 }
 
 // ─── Parse Graph API's created_time which arrives as ISO string OR Unix epoch
-function parseLeadTime(t: any): string {
+export function parseLeadTime(t: any): string {
   if (!t) return new Date().toISOString();
   // Number → Unix epoch seconds
   if (typeof t === "number" && isFinite(t)) {
@@ -75,7 +75,7 @@ function parseLeadTime(t: any): string {
 
 // ─── Build NormalizedLead from Meta data ─────────────────────────────────────
 
-function buildNormalizedLead(data: Record<string, any>): NormalizedLead | null {
+export function buildNormalizedLead(data: Record<string, any>): NormalizedLead | null {
   const fields = parseFieldData(data.field_data ?? []);
 
   const rawPhone = fields["phone_number"] || fields["phone"] || data.phone_number || data.phone || "";

@@ -1379,6 +1379,129 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── Backfill Meta form leads into Zoho ──────────────────────────────────
+  // POST/GET ?action=meta-backfill-form&secret=<...>&form_ids=<csv>
+  //   Fetches every lead from each Meta form via Graph API /{form-id}/leads
+  //   and runs them through our standard ingestLead() pipeline (dedup-safe).
+  //   Existing leads matched by phone+project will have Resubmission_Count
+  //   bumped; brand-new ones get created from scratch. Used to recover the
+  //   leads that were captured by Meta but never reached us because our
+  //   token lacked pages_manage_ads scope until the token rotation.
+  if ((req.method === "POST" || req.method === "GET") && req.query.action === "meta-backfill-form") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    const formIdsRaw = String(req.query.form_ids || "").trim();
+    if (!formIdsRaw) {
+      return res.status(400).json({ error: "form_ids query param required (comma-separated)" });
+    }
+    const formIds = formIdsRaw.split(",").map((s) => s.trim()).filter(Boolean);
+    const metaToken = process.env.META_PAGE_ACCESS_TOKEN || "";
+    if (!metaToken) return res.status(500).json({ error: "META_PAGE_ACCESS_TOKEN not set" });
+
+    const { buildNormalizedLead } = await import("./ingest/meta");
+    const { ingestLead } = await import("./_utils/ingest");
+
+    const overallStart = Date.now();
+    const perFormResults: any[] = [];
+    let totalCreated = 0;
+    let totalUpdated = 0;
+    let totalFailed = 0;
+    let totalSkipped = 0;
+
+    for (const fid of formIds) {
+      const created: any[] = [];
+      const updated: any[] = [];
+      const failed: any[] = [];
+      const skipped: any[] = [];
+      let nextUrl: string | null =
+        `https://graph.facebook.com/v19.0/${fid}/leads?fields=id,created_time,field_data,ad_id,ad_name,adset_id,adset_name,campaign_id,campaign_name,form_id,is_organic&limit=100&access_token=${encodeURIComponent(metaToken)}`;
+      let pageCount = 0;
+      let totalSeen = 0;
+      let formError: string | null = null;
+
+      while (nextUrl && pageCount < 20) {
+        pageCount++;
+        let pageData: any = null;
+        try {
+          const r = await fetch(nextUrl);
+          pageData = await r.json();
+          if (!r.ok || pageData?.error) {
+            formError = pageData?.error?.message || `HTTP ${r.status}`;
+            break;
+          }
+        } catch (err: any) {
+          formError = `fetch threw: ${err.message}`;
+          break;
+        }
+        const items = Array.isArray(pageData?.data) ? pageData.data : [];
+        totalSeen += items.length;
+        for (const item of items) {
+          try {
+            const enriched = { ...item, leadgen_id: item.id, form_id: fid };
+            const lead = buildNormalizedLead(enriched);
+            if (!lead) {
+              skipped.push({ id: item.id, reason: "no_phone_or_normalize_failed" });
+              continue;
+            }
+            const result = await ingestLead(lead);
+            if (result.action === "created") {
+              created.push({
+                id: item.id,
+                zoho_lead_id: result.zoho_lead_id,
+                mobile: lead.mobile,
+                name: `${lead.first_name} ${lead.last_name}`.trim(),
+              });
+            } else {
+              updated.push({
+                id: item.id,
+                zoho_lead_id: result.zoho_lead_id,
+                mobile: lead.mobile,
+                resubmission_count: result.resubmission?.count,
+              });
+            }
+          } catch (err: any) {
+            failed.push({ id: item.id, error: (err.message || String(err)).slice(0, 200) });
+          }
+        }
+        nextUrl = pageData?.paging?.next || null;
+      }
+
+      totalCreated += created.length;
+      totalUpdated += updated.length;
+      totalFailed += failed.length;
+      totalSkipped += skipped.length;
+
+      perFormResults.push({
+        form_id: fid,
+        pages_fetched: pageCount,
+        total_seen: totalSeen,
+        created_count: created.length,
+        updated_count: updated.length,
+        failed_count: failed.length,
+        skipped_count: skipped.length,
+        error: formError,
+        created_sample: created.slice(0, 5),
+        updated_sample: updated.slice(0, 5),
+        failed_sample: failed.slice(0, 5),
+        skipped_sample: skipped.slice(0, 5),
+      });
+    }
+
+    return res.status(200).json({
+      ms: Date.now() - overallStart,
+      totals: {
+        created: totalCreated,
+        updated: totalUpdated,
+        failed: totalFailed,
+        skipped: totalSkipped,
+      },
+      per_form: perFormResults,
+    });
+  }
+
   // ─── Probe specific Meta form IDs — pinpoint ownership + readability ────
   // GET ?action=meta-form-probe&secret=<INHOUSE_POSTHOOK_SECRET>&form_ids=<csv>
   //   For each form_id, calls Graph API directly and returns:
