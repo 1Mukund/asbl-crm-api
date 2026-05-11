@@ -1414,9 +1414,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // Pick a page access token to ALSO try with — sometimes form reads
     // need the page-scoped token, not the System User one.
     const firstPage = visiblePages[0];
-    const pageToken = firstPage?.access_token || "";
-    const pageId = firstPage?.id;
-    const pageName = firstPage?.name;
+    const probePageToken = firstPage?.access_token || "";
+    const probePageId = firstPage?.id;
+    const probePageName = firstPage?.name;
 
     const probes: any[] = [];
     for (const fid of formIds) {
@@ -1434,10 +1434,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       };
 
       // ── Try 2: Page-scoped token (if page visible) ────────────────────
-      let pageTokenAttempt: any = { skipped: !pageToken };
-      if (pageToken) {
+      let pageTokenAttempt: any = { skipped: !probePageToken };
+      if (probePageToken) {
         const pr = await fetch(
-          `https://graph.facebook.com/v19.0/${fid}?fields=id,name,status,locale,leads_count,page,created_time&access_token=${encodeURIComponent(pageToken)}`,
+          `https://graph.facebook.com/v19.0/${fid}?fields=id,name,status,locale,leads_count,page,created_time&access_token=${encodeURIComponent(probePageToken)}`,
         );
         const pd = await pr.json().catch(() => ({}));
         pageTokenAttempt = {
@@ -1453,17 +1453,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
 
       // ── Try 3: List the page's forms and see if this ID is in there ───
-      let foundInPageList: any = { skipped: !pageToken };
-      if (pageToken && pageId) {
+      let foundInPageList: any = { skipped: !probePageToken };
+      if (probePageToken && probePageId) {
         const lr = await fetch(
-          `https://graph.facebook.com/v19.0/${pageId}/leadgen_forms?fields=id,name,status,leads_count&limit=200&access_token=${encodeURIComponent(pageToken)}`,
+          `https://graph.facebook.com/v19.0/${probePageId}/leadgen_forms?fields=id,name,status,leads_count&limit=200&access_token=${encodeURIComponent(probePageToken)}`,
         );
         const ld = await lr.json().catch(() => ({}));
         if (lr.ok && Array.isArray(ld?.data)) {
           const match = ld.data.find((f: any) => String(f.id) === String(fid));
           foundInPageList = {
-            page_id: pageId,
-            page_name: pageName,
+            page_id: probePageId,
+            page_name: probePageName,
             page_form_count: ld.data.length,
             this_form_in_list: !!match,
             this_form_details: match || null,
@@ -1471,8 +1471,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           };
         } else {
           foundInPageList = {
-            page_id: pageId,
-            page_name: pageName,
+            page_id: probePageId,
+            page_name: probePageName,
             error: ld?.error?.message || `HTTP ${lr.status}`,
           };
         }
@@ -1500,7 +1500,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const page = visiblePages.find((p: any) => p.id === pageId);
         const pageToken = page?.access_token || metaToken;
         const sr = await fetch(
-          `https://graph.facebook.com/v19.0/${pageId}/subscribed_apps?access_token=${encodeURIComponent(pageToken)}`,
+          `https://graph.facebook.com/v19.0/${probePageId}/subscribed_apps?access_token=${encodeURIComponent(probePageToken)}`,
         );
         const sd = await sr.json().catch(() => ({}));
         if (sr.ok && Array.isArray(sd?.data)) {
@@ -1521,8 +1521,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         leads_count: data.leads_count,
         locale: data.locale,
         created_time: data.created_time,
-        page_id: pageId,
-        page_name: pageName,
+        page_id: probePageId,
+        page_name: probePageName,
         page_in_token_scope: pageId ? visiblePageIds.has(pageId) : false,
         leadgen_subscribed_on_page: leadgenSubscribed,
         subscribed_apps: subscribedApps,
