@@ -1624,9 +1624,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const hasInhouseId = (l: any) => l.Last_Inhouse_Call_ID && String(l.Last_Inhouse_Call_ID).trim() !== "";
       const hasArrowheadId = (l: any) => l.Last_Arrowhead_Call_ID && String(l.Last_Arrowhead_Call_ID).trim() !== "";
       const all = candidates.filter((l) => hasInhouseId(l) || hasArrowheadId(l));
+
+      // "Not Called" is the INITIAL state Deluge stamps when triggering —
+      // it is NOT a posthook result. Treat it as stuck. Real posthook
+      // outcomes are: Connected, Not Connected, Busy, Switched Off,
+      // Pre Site, Virtual Tour, Not Interested.
+      const isStuckStatus = (s: string | null | undefined): boolean => {
+        const t = String(s || "").trim();
+        return !t || t.toLowerCase() === "not called";
+      };
       // Partition: posthook_fired (Call_Status set) vs stuck (null/empty)
-      const stuck = all.filter((l) => !l.Call_Status || l.Call_Status === "");
-      const completed = all.filter((l) => l.Call_Status && l.Call_Status !== "");
+      const stuck = all.filter((l) => isStuckStatus(l.Call_Status));
+      const completed = all.filter((l) => !isStuckStatus(l.Call_Status));
       const recentSince = all.filter((l) => new Date(l.Modified_Time) >= since);
       const recentStuck = stuck.filter((l) => new Date(l.Modified_Time) >= since);
       // Break down by call source so user can see whether issue is in
