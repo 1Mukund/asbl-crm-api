@@ -1379,6 +1379,112 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── Probe specific Meta form IDs — pinpoint ownership + readability ────
+  // GET ?action=meta-form-probe&secret=<INHOUSE_POSTHOOK_SECRET>&form_ids=<csv>
+  //   For each form_id, calls Graph API directly and returns:
+  //     - whether our token can read it
+  //     - the page that owns the form (with ID + name)
+  //     - the form's current status (ACTIVE / PAUSED / ARCHIVED)
+  //     - whether the owning page is in our token's scope
+  //     - which app is subscribed to that page's leadgen webhook
+  //   This is the surgical follow-up to meta-deep-diag when the user
+  //   knows specific form IDs that should be flowing leads.
+  if (req.method === "GET" && req.query.action === "meta-form-probe") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    const formIdsRaw = String(req.query.form_ids || "").trim();
+    if (!formIdsRaw) {
+      return res.status(400).json({ error: "form_ids query param required (comma-separated)" });
+    }
+    const formIds = formIdsRaw.split(",").map((s) => s.trim()).filter(Boolean);
+    const metaToken = process.env.META_PAGE_ACCESS_TOKEN || "";
+    if (!metaToken) return res.status(500).json({ error: "META_PAGE_ACCESS_TOKEN not set" });
+
+    // Get list of pages this token can access so we can flag in-scope vs not
+    const pagesRes = await fetch(
+      `https://graph.facebook.com/v19.0/me/accounts?fields=id,name,access_token&limit=50&access_token=${encodeURIComponent(metaToken)}`,
+    );
+    const pagesData = await pagesRes.json().catch(() => ({}));
+    const visiblePages = (pagesData?.data || []) as any[];
+    const visiblePageIds = new Set(visiblePages.map((p: any) => p.id));
+
+    const probes: any[] = [];
+    for (const fid of formIds) {
+      const r = await fetch(
+        `https://graph.facebook.com/v19.0/${fid}?fields=id,name,status,locale,leads_count,page,created_time&access_token=${encodeURIComponent(metaToken)}`,
+      );
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || data?.error) {
+        probes.push({
+          form_id: fid,
+          readable: false,
+          error: data?.error?.message || `HTTP ${r.status}`,
+          error_code: data?.error?.code,
+        });
+        continue;
+      }
+      const pageId = data?.page?.id;
+      const pageName = data?.page?.name;
+      // Check leadgen webhook subscription on the form's owning page
+      let leadgenSubscribed: boolean | null = null;
+      let subscribedApps: any[] = [];
+      if (pageId && visiblePageIds.has(pageId)) {
+        const page = visiblePages.find((p: any) => p.id === pageId);
+        const pageToken = page?.access_token || metaToken;
+        const sr = await fetch(
+          `https://graph.facebook.com/v19.0/${pageId}/subscribed_apps?access_token=${encodeURIComponent(pageToken)}`,
+        );
+        const sd = await sr.json().catch(() => ({}));
+        if (sr.ok && Array.isArray(sd?.data)) {
+          subscribedApps = sd.data.map((a: any) => ({
+            id: a.id,
+            name: a.name,
+            subscribed_fields: a.subscribed_fields || [],
+            has_leadgen: (a.subscribed_fields || []).includes("leadgen"),
+          }));
+          leadgenSubscribed = subscribedApps.some((a) => a.has_leadgen);
+        }
+      }
+      probes.push({
+        form_id: fid,
+        readable: true,
+        name: data.name,
+        status: data.status,
+        leads_count: data.leads_count,
+        locale: data.locale,
+        created_time: data.created_time,
+        page_id: pageId,
+        page_name: pageName,
+        page_in_token_scope: pageId ? visiblePageIds.has(pageId) : false,
+        leadgen_subscribed_on_page: leadgenSubscribed,
+        subscribed_apps: subscribedApps,
+      });
+    }
+    const issues: string[] = [];
+    for (const p of probes) {
+      if (!p.readable) {
+        issues.push(`Form ${p.form_id}: NOT readable (${p.error}). Token can't see it.`);
+      } else {
+        if (!p.page_in_token_scope) {
+          issues.push(`Form ${p.form_id} is owned by page ${p.page_id} (${p.page_name}) which is NOT in our token's scope — leads from this form will never reach us.`);
+        } else if (p.leadgen_subscribed_on_page === false) {
+          issues.push(`Form ${p.form_id}'s page (${p.page_name}) is in scope but NOT subscribed to leadgen webhook. Use &fix=1 on meta-deep-diag to subscribe.`);
+        }
+      }
+    }
+    if (!issues.length) {
+      issues.push("All probed forms are readable, owned by in-scope pages, and the pages are subscribed to leadgen. Leads should flow — check our webhook handler logs for downstream issues.");
+    }
+    return res.status(200).json({
+      token_visible_pages: visiblePages.map((p) => ({ id: p.id, name: p.name })),
+      probed_forms: probes,
+      issues,
+    });
+  }
+
   // ─── Zoho audit — full custom fields + Blueprint + Lead_Status picklist ──
   // GET ?action=zoho-audit&secret=<INHOUSE_POSTHOOK_SECRET>
   //   One-shot diagnostic to map current Zoho state against the spec's
