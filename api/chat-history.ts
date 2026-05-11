@@ -1379,6 +1379,215 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── ASBL spec webhook handlers — spec section 13 ───────────────────────
+  // Per spec, vendors call dedicated Zoho REST endpoints. We expose them as
+  // chat-history actions to stay within the 12-function Vercel cap.
+  //   POST ?action=webhook-phone-verified           — chatbot → create lead
+  //   POST ?action=webhook-site-visit-confirmed     — bot → schedule visit
+  //   POST ?action=webhook-visit-outcome            — visit-coord → attended/no-show
+  //   POST ?action=webhook-booking-paid             — booking system → Booked
+  // Auth: X-Webhook-Secret header OR ?secret= must match INHOUSE_POSTHOOK_SECRET.
+
+  const validateSpecWebhook = (): boolean => {
+    const incoming =
+      (req.headers["x-webhook-secret"] as string) ||
+      (req.query.secret as string) ||
+      "";
+    const expected = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    return !!expected && incoming === expected;
+  };
+
+  if (req.method === "POST" && req.query.action === "webhook-phone-verified") {
+    if (!validateSpecWebhook()) return res.status(401).json({ error: "Unauthorized" });
+    const body = (req.body || {}) as any;
+    try {
+      const { ingestLead } = await import("./_utils/ingest");
+      const { transitionStage } = await import("./_utils/state_machine");
+      const { computeAndPersistLeadScore } = await import("./_utils/lead_scoring");
+      const { enrollCadence } = await import("./_utils/cadence");
+      const { fireAdEvent } = await import("./_utils/ad_platform");
+
+      const phone = String(body.phone || "").replace(/\D/g, "");
+      if (!phone || phone.length < 10) return res.status(400).json({ error: "valid phone required" });
+
+      const result = await ingestLead({
+        first_name: (body.name || "").split(" ")[0] || "",
+        last_name: (body.name || "").split(" ").slice(1).join(" ") || ".",
+        mobile: phone,
+        email: body.email || "",
+        lead_source: "Website Inquiry",
+        source_lead_id: body.session_id || "",
+        campaign_name: body.attribution?.utm_campaign || "",
+        utm_source: body.attribution?.utm_source || "",
+        utm_medium: body.attribution?.utm_medium || "",
+        utm_campaign: body.attribution?.utm_campaign || "",
+        utm_content: body.attribution?.utm_content || "",
+        utm_term: body.attribution?.utm_term || "",
+        lead_received_at: new Date().toISOString(),
+        project: body.project || undefined,
+        budget: body.qualification?.budget_bucket || "",
+        size_preference: body.qualification?.configuration_interest || "",
+        possession_timeline: body.qualification?.timeline_bucket || "",
+        purchase_purpose: body.qualification?.intent || "",
+        first_page_visited: body.attribution?.landing_page || "",
+        last_page_visited: body.attribution?.landing_page || "",
+        referrer_url: body.attribution?.referrer_domain || "",
+      });
+
+      await transitionStage({
+        leadId: result.zoho_lead_id, newStage: "New Lead", newStatus: "Outreach Pending",
+        reason: "phone_verified", source: "chatbot", existingLead: {},
+      });
+
+      const scoreResult = await computeAndPersistLeadScore(result.zoho_lead_id, {
+        Intent: body.qualification?.intent || null,
+        Budget_Bucket: body.qualification?.budget_bucket || null,
+        Timeline_Bucket: body.qualification?.timeline_bucket || null,
+        Configuration_Interest: body.qualification?.configuration_interest || null,
+        Workplace_Area: body.qualification?.workplace_area || null,
+        ASBL_Project: body.project || null,
+        Bot_Turn_Count: 0,
+      });
+
+      if (scoreResult.tier_crossed_to_hot) {
+        fireAdEvent("lead_qualified", {
+          zoho_lead_id: result.zoho_lead_id, Phone: phone, Email: body.email,
+          FBCLID: body.attribution?.fbclid, GCLID: body.attribution?.gclid,
+          WBRAID: body.attribution?.wbraid, GBRAID: body.attribution?.gbraid,
+          ASBL_Project: body.project, Lead_Tier: scoreResult.new_tier,
+        }).catch(() => {});
+      }
+      enrollCadence(result.zoho_lead_id, "outreach").catch(() => {});
+
+      return res.status(200).json({
+        ok: true, lead_id: result.zoho_lead_id, action: result.action,
+        lead_score: scoreResult.score, lead_tier: scoreResult.new_tier,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  if (req.method === "POST" && req.query.action === "webhook-site-visit-confirmed") {
+    if (!validateSpecWebhook()) return res.status(401).json({ error: "Unauthorized" });
+    const body = (req.body || {}) as any;
+    try {
+      const { transitionStage } = await import("./_utils/state_machine");
+      const { findLeadByPhone, updateLead } = await import("./_utils/zoho");
+      const { enrollCadence, cancelCadence } = await import("./_utils/cadence");
+      const { fireAdEvent } = await import("./_utils/ad_platform");
+      let leadId = body.lead_id;
+      let existing: any = null;
+      if (!leadId && body.phone) {
+        const phone = String(body.phone).replace(/\D/g, "");
+        existing = await findLeadByPhone(phone);
+        if (existing) leadId = existing.id;
+      }
+      if (!leadId) return res.status(400).json({ error: "lead_id or phone required" });
+      await updateLead(leadId, {
+        Site_Visit_Date: body.visit_date,
+        Site_Visit_Slot: body.visit_slot,
+        Site_Visit_Confirmation_Source: body.confirmation_source || "WhatsApp",
+        F_Site_Visit_Confirmed: true,
+      });
+      await transitionStage({
+        leadId, newStage: "Site Visit Scheduled", newStatus: "Awaiting Reply",
+        reason: "site_visit_confirmed", source: body.source || "whatsapp_bot", existingLead: existing || {},
+      });
+      cancelCadence(leadId).catch(() => {});
+      enrollCadence(leadId, "reminder", { siteVisitDate: body.visit_date }).catch(() => {});
+      fireAdEvent("site_visit_scheduled", { zoho_lead_id: leadId, ...(existing || {}) }).catch(() => {});
+      return res.status(200).json({ ok: true, lead_id: leadId });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  if (req.method === "POST" && req.query.action === "webhook-visit-outcome") {
+    if (!validateSpecWebhook()) return res.status(401).json({ error: "Unauthorized" });
+    const body = (req.body || {}) as any;
+    try {
+      const { transitionStage, closeLead } = await import("./_utils/state_machine");
+      const { updateLead } = await import("./_utils/zoho");
+      const { enrollCadence, cancelCadence } = await import("./_utils/cadence");
+      const { fireAdEvent } = await import("./_utils/ad_platform");
+      const leadId = body.lead_id;
+      if (!leadId) return res.status(400).json({ error: "lead_id required" });
+      const outcome = String(body.outcome || "").toLowerCase();
+      if (outcome === "attended") {
+        await updateLead(leadId, {
+          Site_Visit_Attended: true,
+          Site_Visit_Attended_At: body.attended_at || new Date().toISOString(),
+          F_Site_Visit_Attended: true,
+        });
+        await transitionStage({
+          leadId, newStage: "Site Visit Done", newStatus: "Outreach Pending",
+          reason: "visit_attended", source: "vendor_webhook", existingLead: {},
+        });
+        cancelCadence(leadId).catch(() => {});
+        enrollCadence(leadId, "decision_followup").catch(() => {});
+        fireAdEvent("site_visit_completed", { zoho_lead_id: leadId }).catch(() => {});
+      } else if (outcome === "no_show") {
+        await closeLead(leadId, {}, "visit_no_show", "vendor_webhook");
+        fireAdEvent("lost", { zoho_lead_id: leadId }).catch(() => {});
+      } else if (outcome === "cancelled") {
+        await transitionStage({
+          leadId, newStage: "In Conversation", newStatus: "Talking",
+          reason: "visit_cancelled", source: "vendor_webhook", existingLead: {},
+        });
+      } else return res.status(400).json({ error: `Unknown outcome: ${outcome}` });
+      return res.status(200).json({ ok: true, lead_id: leadId, outcome });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  if (req.method === "POST" && req.query.action === "webhook-booking-paid") {
+    if (!validateSpecWebhook()) return res.status(401).json({ error: "Unauthorized" });
+    const body = (req.body || {}) as any;
+    try {
+      const { transitionStage } = await import("./_utils/state_machine");
+      const { updateLead } = await import("./_utils/zoho");
+      const { cancelCadence } = await import("./_utils/cadence");
+      const { fireAdEvent } = await import("./_utils/ad_platform");
+      const leadId = body.lead_id;
+      if (!leadId) return res.status(400).json({ error: "lead_id required" });
+      const amount = Number(body.amount_inr) || 0;
+      await updateLead(leadId, {
+        Booking_Token_Paid: true,
+        Booking_Amount: amount,
+        Booking_Date: (body.paid_at || new Date().toISOString()).slice(0, 10),
+        F_Token_Paid: true,
+      });
+      await transitionStage({
+        leadId, newStage: "Booked", newStatus: null,
+        reason: "token_paid", source: "vendor_webhook", existingLead: {},
+      });
+      cancelCadence(leadId).catch(() => {});
+      fireAdEvent("booking_token_paid", { zoho_lead_id: leadId, Booking_Amount: amount }).catch(() => {});
+      return res.status(200).json({ ok: true, lead_id: leadId, amount });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── ASBL spec — legacy lead migration (Phase 8) ─────────────────────────
+  // POST ?action=asbl-spec-migrate-legacy&secret=<...>&max=200&page=1
+  if (req.method === "POST" && req.query.action === "asbl-spec-migrate-legacy") {
+    if (!validateSpecWebhook()) return res.status(401).json({ error: "Unauthorized" });
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const { runLegacyMigration } = await import("./_utils/lead_migration");
+      const zohoToken = await getAccessToken();
+      const max = Math.min(Number(req.query.max) || 200, 1000);
+      const startPage = Number(req.query.page) || 1;
+      const result = await runLegacyMigration({ zohoToken, max, startPage });
+      return res.status(200).json(result);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── ASBL Loft spec — create ALL custom fields per Section 9 ──────────
   // GET ?action=asbl-spec-create-fields&secret=<INHOUSE_POSTHOOK_SECRET>
   //   One-shot creation of every custom field the spec requires that

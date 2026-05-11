@@ -96,7 +96,7 @@ export async function enrollCadence(
   cadence: CadenceName,
   opts: { siteVisitDate?: string } = {},
 ): Promise<{ ok: boolean; next_action_at: string; next_action_type: StepActionType }> {
-  const steps = CADENCES[cadence];
+  const steps = CADENCES[cadence as CadenceName];
   if (!steps || !steps.length) {
     throw new Error(`unknown cadence: ${cadence}`);
   }
@@ -155,11 +155,11 @@ export async function advanceCadence(
   leadId: string,
   lead: any,
 ): Promise<{ ok: boolean; advanced: boolean; exhausted: boolean; new_step?: number; next_action_at?: string; next_action_type?: StepActionType }> {
-  const cadence = lead?.Active_Cadence as CadenceName;
-  if (!cadence || cadence === "none") {
+  const cadence = lead?.Active_Cadence as CadenceName | "none" | undefined;
+  if (!cadence || (cadence as string) === "none") {
     return { ok: true, advanced: false, exhausted: false };
   }
-  const steps = CADENCES[cadence];
+  const steps = CADENCES[cadence as CadenceName];
   if (!steps) return { ok: false, advanced: false, exhausted: false };
 
   const currentStep = Number(lead?.Cadence_Step) || 0;
@@ -199,9 +199,9 @@ export async function advanceCadence(
 
 /** Look up the step config for a lead's current cadence + step. */
 export function currentStepConfig(lead: any): CadenceStep | null {
-  const cadence = lead?.Active_Cadence as CadenceName;
+  const cadence = lead?.Active_Cadence as CadenceName | "none" | undefined;
   if (!cadence || cadence === "none") return null;
-  const steps = CADENCES[cadence];
+  const steps = CADENCES[cadence as CadenceName];
   if (!steps) return null;
   const idx = (Number(lead?.Cadence_Step) || 1) - 1;
   return steps[idx] || null;
