@@ -19,12 +19,41 @@
 import { VercelRequest, VercelResponse } from "@vercel/node";
 import {
   findLeadByInhouseCallId,
+  findLeadByArrowheadCallId,
   findLeadByPhone,
   updateLead,
   createCallLog,
   createCallNote,
   triggerBlueprintTransition,
 } from "../_utils/zoho";
+
+/** Lookup chain: Last_Inhouse_Call_ID → Last_Arrowhead_Call_ID → phone.
+ *  Deluge still stamps the call_id in Last_Arrowhead_Call_ID (the legacy
+ *  field) even for the new in-house voice-bot flow, so we must check both
+ *  custom fields before falling back to phone (which is ambiguous for
+ *  customers with multiple project leads). */
+async function locateLead(callId: string, phoneRaw: string): Promise<any | null> {
+  if (callId) {
+    try {
+      const lead = await findLeadByInhouseCallId(callId);
+      if (lead) return lead;
+    } catch {}
+    try {
+      const lead = await findLeadByArrowheadCallId(callId);
+      if (lead) return lead;
+    } catch {}
+  }
+  if (phoneRaw) {
+    const cleaned = String(phoneRaw).replace(/^\+/, "").replace(/\D/g, "");
+    if (cleaned.length >= 10) {
+      try {
+        const lead = await findLeadByPhone(cleaned);
+        if (lead) return lead;
+      } catch {}
+    }
+  }
+  return null;
+}
 
 const POSTHOOK_SECRET = process.env.INHOUSE_POSTHOOK_SECRET || "";
 
@@ -110,13 +139,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return res.status(400).json({ error: "recording_ready needs call_sid + recording_url" });
       }
 
-      // Look up the lead by call_id first, phone fallback
-      let lead: any = null;
-      try { lead = await findLeadByInhouseCallId(callSid); } catch {}
-      if (!lead && phone) {
-        const cleanedPhone = String(phone).replace(/^\+/, "");
-        lead = await findLeadByPhone(cleanedPhone);
-      }
+      // Look up the lead via the full chain (inhouse → arrowhead → phone)
+      const lead = await locateLead(callSid, phone);
       if (!lead) {
         console.log(`[InHouse Posthook ${callSid}] recording_ready: no lead found`);
         return res.status(200).json({ status: "ok", message: "recording_ready: lead not found — ignored" });
@@ -189,15 +213,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ error: "Missing call_sid / phone_number" });
     }
 
-    // ── 1. Find the Zoho lead — call_id first (precise), phone fallback ──
-    let lead: any = null;
-    if (callId) {
-      lead = await findLeadByInhouseCallId(callId);
-    }
-    if (!lead && phoneRaw) {
-      const phone = String(phoneRaw).replace(/^\+/, "");
-      lead = await findLeadByPhone(phone);
-    }
+    // ── 1. Find the Zoho lead via full chain:
+    //    Last_Inhouse_Call_ID → Last_Arrowhead_Call_ID → phone fallback.
+    //    Deluge stamps the call_id under Last_Arrowhead_Call_ID for legacy
+    //    reasons, so we must check both call-id fields before phone.
+    const lead = await locateLead(callId, phoneRaw);
 
     if (!lead) {
       console.log(`[InHouse Posthook] No Zoho lead found for call_id=${callId} phone=${phoneRaw}`);
