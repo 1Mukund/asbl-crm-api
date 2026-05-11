@@ -1411,18 +1411,83 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const visiblePages = (pagesData?.data || []) as any[];
     const visiblePageIds = new Set(visiblePages.map((p: any) => p.id));
 
+    // Pick a page access token to ALSO try with — sometimes form reads
+    // need the page-scoped token, not the System User one.
+    const firstPage = visiblePages[0];
+    const pageToken = firstPage?.access_token || "";
+    const pageId = firstPage?.id;
+    const pageName = firstPage?.name;
+
     const probes: any[] = [];
     for (const fid of formIds) {
+      // ── Try 1: System User token (current behaviour) ──────────────────
       const r = await fetch(
         `https://graph.facebook.com/v19.0/${fid}?fields=id,name,status,locale,leads_count,page,created_time&access_token=${encodeURIComponent(metaToken)}`,
       );
       const data = await r.json().catch(() => ({}));
-      if (!r.ok || data?.error) {
+      const systemUserAttempt = {
+        ok: r.ok && !data?.error,
+        error: data?.error?.message,
+        error_code: data?.error?.code,
+        error_subcode: data?.error?.error_subcode,
+        error_type: data?.error?.type,
+      };
+
+      // ── Try 2: Page-scoped token (if page visible) ────────────────────
+      let pageTokenAttempt: any = { skipped: !pageToken };
+      if (pageToken) {
+        const pr = await fetch(
+          `https://graph.facebook.com/v19.0/${fid}?fields=id,name,status,locale,leads_count,page,created_time&access_token=${encodeURIComponent(pageToken)}`,
+        );
+        const pd = await pr.json().catch(() => ({}));
+        pageTokenAttempt = {
+          ok: pr.ok && !pd?.error,
+          name: pd?.name,
+          status: pd?.status,
+          page_id: pd?.page?.id,
+          page_name: pd?.page?.name,
+          leads_count: pd?.leads_count,
+          error: pd?.error?.message,
+          error_code: pd?.error?.code,
+        };
+      }
+
+      // ── Try 3: List the page's forms and see if this ID is in there ───
+      let foundInPageList: any = { skipped: !pageToken };
+      if (pageToken && pageId) {
+        const lr = await fetch(
+          `https://graph.facebook.com/v19.0/${pageId}/leadgen_forms?fields=id,name,status,leads_count&limit=200&access_token=${encodeURIComponent(pageToken)}`,
+        );
+        const ld = await lr.json().catch(() => ({}));
+        if (lr.ok && Array.isArray(ld?.data)) {
+          const match = ld.data.find((f: any) => String(f.id) === String(fid));
+          foundInPageList = {
+            page_id: pageId,
+            page_name: pageName,
+            page_form_count: ld.data.length,
+            this_form_in_list: !!match,
+            this_form_details: match || null,
+            sample_form_ids: ld.data.slice(0, 5).map((f: any) => `${f.id} (${f.name})`),
+          };
+        } else {
+          foundInPageList = {
+            page_id: pageId,
+            page_name: pageName,
+            error: ld?.error?.message || `HTTP ${lr.status}`,
+          };
+        }
+      }
+
+      const anyOk = systemUserAttempt.ok || pageTokenAttempt?.ok;
+      if (!anyOk) {
         probes.push({
           form_id: fid,
           readable: false,
-          error: data?.error?.message || `HTTP ${r.status}`,
-          error_code: data?.error?.code,
+          system_user_attempt: systemUserAttempt,
+          page_token_attempt: pageTokenAttempt,
+          found_in_page_list: foundInPageList,
+          error: systemUserAttempt.error || pageTokenAttempt?.error,
+          error_code: systemUserAttempt.error_code,
         });
         continue;
       }
