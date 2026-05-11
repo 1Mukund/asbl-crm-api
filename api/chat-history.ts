@@ -3305,8 +3305,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   if (req.method === "POST") {
-    // Send a message via Lazybot
-    const { phone, message } = req.body as { phone: string; message: string };
+    // Send a message via Lazybot (default fallthrough — last resort, no action matched)
+    // Defensive: req.body can be undefined if Vercel didn't parse it
+    // (e.g. wrong content-type, empty body, internal POST). Without this
+    // guard, the destructure throws TypeError "Cannot destructure of undefined".
+    const body = (req.body || {}) as { phone?: string; message?: string };
+    const { phone, message } = body;
     if (!phone || !message) return res.status(400).json({ error: "phone and message required" });
 
     try {

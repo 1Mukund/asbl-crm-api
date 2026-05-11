@@ -44,11 +44,12 @@ const OUTREACH_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
 
 // Self-deploy URL — used so we can call our own /api/relay/inhouse-call
 // from server-side (avoids re-implementing the country-routing here).
-// Vercel exposes VERCEL_URL automatically (no protocol). Falls back to the
-// known prod domain so this still works in local dev.
-const SELF_BASE_URL =
-  (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "") ||
-  "https://asbl-crm-api.vercel.app";
+// IMPORTANT: must be the PUBLIC alias, NOT VERCEL_URL — the deployment-
+// specific URL (asbl-crm-api-<hash>.vercel.app) has Vercel deployment
+// protection enabled and returns 401 to unauthenticated internal calls,
+// breaking the resubmission outreach. The public alias is stable across
+// deploys and isn't gated by deployment protection.
+const SELF_BASE_URL = process.env.SELF_PUBLIC_URL || "https://asbl-crm-api.vercel.app";
 
 // Same 10-sender pool as api/relay/periskope.ts — kept in sync so a returning
 // lead gets paired with the same RM-pool variety they saw on first contact.
