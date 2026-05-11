@@ -1591,7 +1591,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // Reliable + works for both the "field doesn't exist" and "field
       // exists but empty" cases.
       const candidates: any[] = [];
-      const fieldsList = "id,First_Name,Last_Name,Mobile,Last_Inhouse_Call_ID,Call_Status,Call_Duration,Lead_Status,Modified_Time,Created_Time";
+      // Check BOTH call-id fields — older calls were stamped under
+      // Last_Arrowhead_Call_ID (legacy Arrowhead flow), newer under
+      // Last_Inhouse_Call_ID (in-house voice bot). Either one indicates
+      // a call was triggered.
+      const fieldsList = "id,First_Name,Last_Name,Mobile,Last_Inhouse_Call_ID,Last_Arrowhead_Call_ID,Call_Status,Call_Duration,Lead_Status,Modified_Time,Created_Time";
       for (let page = 1; page <= 4; page++) {
         const r = await fetch(
           `https://www.zohoapis.in/crm/v3/Leads?` +
@@ -1616,15 +1620,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const hasMore = data?.info?.more_records;
         if (!hasMore) break;
       }
-      // Only consider leads that actually have a Last_Inhouse_Call_ID stamped
-      const all = candidates.filter(
-        (l) => l.Last_Inhouse_Call_ID && String(l.Last_Inhouse_Call_ID).trim() !== "",
-      );
+      // Consider leads with EITHER call-id field set (inhouse OR arrowhead)
+      const hasInhouseId = (l: any) => l.Last_Inhouse_Call_ID && String(l.Last_Inhouse_Call_ID).trim() !== "";
+      const hasArrowheadId = (l: any) => l.Last_Arrowhead_Call_ID && String(l.Last_Arrowhead_Call_ID).trim() !== "";
+      const all = candidates.filter((l) => hasInhouseId(l) || hasArrowheadId(l));
       // Partition: posthook_fired (Call_Status set) vs stuck (null/empty)
       const stuck = all.filter((l) => !l.Call_Status || l.Call_Status === "");
       const completed = all.filter((l) => l.Call_Status && l.Call_Status !== "");
       const recentSince = all.filter((l) => new Date(l.Modified_Time) >= since);
       const recentStuck = stuck.filter((l) => new Date(l.Modified_Time) >= since);
+      // Break down by call source so user can see whether issue is in
+      // the legacy Arrowhead path, the new in-house path, or both.
+      const inhouseAll = all.filter(hasInhouseId);
+      const arrowheadAll = all.filter(hasArrowheadId);
+      const inhouseStuck = stuck.filter(hasInhouseId);
+      const arrowheadStuck = stuck.filter(hasArrowheadId);
+
       return res.status(200).json({
         window_hours: hours,
         summary: {
@@ -1633,6 +1644,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           posthook_missing: stuck.length,
           recent_total: recentSince.length,
           recent_stuck: recentStuck.length,
+          inhouse_total: inhouseAll.length,
+          inhouse_stuck: inhouseStuck.length,
+          arrowhead_total: arrowheadAll.length,
+          arrowhead_stuck: arrowheadStuck.length,
         },
         diagnosis:
           recentStuck.length === 0
@@ -1640,17 +1655,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             : recentStuck.length === recentSince.length && recentSince.length > 0
             ? `100% of recent calls are stuck (${recentStuck.length}/${recentSince.length}). Voice bot is either not firing posthooks or firing to wrong URL/secret.`
             : `${recentStuck.length} of ${recentSince.length} recent calls are stuck. Partial failure — possibly lead-lookup mismatch (call_id vs call_sid).`,
-        recent_stuck_sample: recentStuck.slice(0, 10).map((l) => ({
+        recent_stuck_sample: recentStuck.slice(0, 15).map((l) => ({
           lead_id: l.id,
           name: `${l.First_Name || ""} ${l.Last_Name || ""}`.trim(),
           mobile: l.Mobile,
-          call_id: l.Last_Inhouse_Call_ID,
+          inhouse_call_id: l.Last_Inhouse_Call_ID || null,
+          arrowhead_call_id: l.Last_Arrowhead_Call_ID || null,
+          source: hasInhouseId(l) ? "inhouse" : "arrowhead",
           lead_status: l.Lead_Status,
           modified_time: l.Modified_Time,
         })),
         completed_sample: completed.slice(0, 5).map((l) => ({
           lead_id: l.id,
-          call_id: l.Last_Inhouse_Call_ID,
+          inhouse_call_id: l.Last_Inhouse_Call_ID || null,
+          arrowhead_call_id: l.Last_Arrowhead_Call_ID || null,
           call_status: l.Call_Status,
           duration: l.Call_Duration,
           modified_time: l.Modified_Time,
