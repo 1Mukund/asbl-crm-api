@@ -1564,6 +1564,148 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── Stuck calls — outbound calls whose posthook never arrived ─────────
+  // GET ?action=stuck-calls&secret=<INHOUSE_POSTHOOK_SECRET>&hours=24
+  //   Lists recent Zoho leads where we triggered an outbound voice call
+  //   (Last_Inhouse_Call_ID is set) but never got the completion posthook
+  //   (Call_Status is null / Modified_Time hasn't moved past the call
+  //   trigger). Scope of "posthooks not arriving" issue.
+  if (req.method === "GET" && req.query.action === "stuck-calls") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    const hours = Math.min(168, Math.max(1, Number(req.query.hours) || 24));
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const token = await getAccessToken();
+      // Search for leads with Last_Inhouse_Call_ID set, sorted by Modified
+      // time desc. Then filter client-side for missing Call_Status.
+      // Note: Zoho's search api doesn't support null/empty negation cleanly,
+      // so we fetch the recently-modified set and partition in JS.
+      const since = new Date(Date.now() - hours * 3600 * 1000);
+      const sinceIso = since.toISOString().replace(/\.\d{3}Z$/, "+00:00");
+      const r = await fetch(
+        `https://www.zohoapis.in/crm/v3/Leads/search?` +
+        `criteria=(Last_Inhouse_Call_ID:not_equal:null)` +
+        `&fields=id,First_Name,Last_Name,Mobile,Last_Inhouse_Call_ID,Call_Status,Call_Duration,Lead_Status,Modified_Time` +
+        `&per_page=100&sort_by=Modified_Time&sort_order=desc`,
+        { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
+      );
+      if (!r.ok) {
+        const txt = (await r.text()).slice(0, 300);
+        return res.status(r.status).json({ error: "zoho-search failed", body: txt });
+      }
+      const data = (await r.json()) as any;
+      const all = (data?.data || []) as any[];
+      // Partition: posthook_fired (Call_Status set) vs stuck (null/empty)
+      const stuck = all.filter((l) => !l.Call_Status || l.Call_Status === "");
+      const completed = all.filter((l) => l.Call_Status && l.Call_Status !== "");
+      const recentSince = all.filter((l) => new Date(l.Modified_Time) >= since);
+      const recentStuck = stuck.filter((l) => new Date(l.Modified_Time) >= since);
+      return res.status(200).json({
+        window_hours: hours,
+        summary: {
+          total_with_call_id: all.length,
+          posthook_received: completed.length,
+          posthook_missing: stuck.length,
+          recent_total: recentSince.length,
+          recent_stuck: recentStuck.length,
+        },
+        diagnosis:
+          recentStuck.length === 0
+            ? "No stuck calls in window — every recent outbound call got its posthook."
+            : recentStuck.length === recentSince.length && recentSince.length > 0
+            ? `100% of recent calls are stuck (${recentStuck.length}/${recentSince.length}). Voice bot is either not firing posthooks or firing to wrong URL/secret.`
+            : `${recentStuck.length} of ${recentSince.length} recent calls are stuck. Partial failure — possibly lead-lookup mismatch (call_id vs call_sid).`,
+        recent_stuck_sample: recentStuck.slice(0, 10).map((l) => ({
+          lead_id: l.id,
+          name: `${l.First_Name || ""} ${l.Last_Name || ""}`.trim(),
+          mobile: l.Mobile,
+          call_id: l.Last_Inhouse_Call_ID,
+          lead_status: l.Lead_Status,
+          modified_time: l.Modified_Time,
+        })),
+        completed_sample: completed.slice(0, 5).map((l) => ({
+          lead_id: l.id,
+          call_id: l.Last_Inhouse_Call_ID,
+          call_status: l.Call_Status,
+          duration: l.Call_Duration,
+          modified_time: l.Modified_Time,
+        })),
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── Simulate posthook — verify OUR side works end-to-end ──────────────
+  // POST ?action=simulate-posthook&secret=<INHOUSE_POSTHOOK_SECRET>
+  // Body: { call_id, phone, duration_seconds, call_outcome, summary }
+  //   Fires a fake call_completed payload at our own /inhouse-posthook
+  //   endpoint and returns the full chain result. Isolates whether the
+  //   break is on the voice-bot side (webhook not firing) or our side
+  //   (lookup/Zoho-update failing).
+  if (req.method === "POST" && req.query.action === "simulate-posthook") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    const body = (req.body || {}) as any;
+    const callId = String(body.call_id || "").trim();
+    const phone = String(body.phone || body.phone_number || "").trim();
+    if (!callId && !phone) {
+      return res.status(400).json({
+        error: "Pass at least one of call_id (matching a Zoho Last_Inhouse_Call_ID) or phone.",
+        example: { call_id: "call_abc123", phone: "+918700432466", duration_seconds: 45, call_outcome: "CONNECTED" },
+      });
+    }
+    const fakePayload = {
+      event: "call_completed",
+      call_sid: callId,
+      call_id: callId,
+      phone_number: phone,
+      duration_seconds: Number(body.duration_seconds) || 35,
+      call_outcome: body.call_outcome || "CONNECTED",
+      summary: body.summary || "[SIMULATED POSTHOOK] Test reach to verify Zoho update path.",
+      full_text: body.full_text || "Bot: Hello. Customer: Hi.",
+      started_at: new Date(Date.now() - 60_000).toISOString(),
+      ended_at: new Date().toISOString(),
+    };
+    const target = `https://${req.headers.host}/api/relay/inhouse-posthook`;
+    try {
+      const r = await fetch(target, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Webhook-Secret": expectedSecret,
+        },
+        body: JSON.stringify(fakePayload),
+      });
+      const txt = await r.text();
+      let parsed: any = null;
+      try { parsed = JSON.parse(txt); } catch {}
+      return res.status(200).json({
+        target,
+        request_sent: fakePayload,
+        response_status: r.status,
+        response_ok: r.ok,
+        response_body: parsed || txt.slice(0, 500),
+        verdict: r.ok && parsed?.status === "ok" && parsed?.lead_id
+          ? "✓ Our posthook chain is HEALTHY. Issue is on voice-bot side (not firing webhooks)."
+          : r.ok && parsed?.message?.includes("not found")
+          ? "✗ Our endpoint works but lead lookup FAILED. Check that the call_id matches what we stamped (Last_Inhouse_Call_ID in Zoho)."
+          : r.status === 401
+          ? "✗ Secret rejected — INHOUSE_POSTHOOK_SECRET mismatch."
+          : `✗ Posthook returned HTTP ${r.status}. Inspect response_body.`,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── Gemini available-models lister ─────────────────────────────────────
   // GET ?action=gemini-models&secret=<INHOUSE_POSTHOOK_SECRET>
   //   Hits Google's /v1beta/models endpoint with our GEMINI_API_KEY and
