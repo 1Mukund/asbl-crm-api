@@ -1456,7 +1456,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         // 9.5 Bot State
         { section: "9.5", api: "Bot_Turn_Count", spec: { field_label: "Bot Turn Count", data_type: "integer" } },
-        { section: "9.5", api: "Bot_Last_Intent", spec: { field_label: "Last Intent", data_type: "picklist", pick_list_values: pickList(["pricing", "amenities", "floor_plan", "location", "timeline", "objection", "book_visit", "other"]) } },
+        { section: "9.5", api: "Bot_Last_Intent", spec: { field_label: "Bot Intent Tag", data_type: "picklist", pick_list_values: pickList(["pricing", "amenities", "floor_plan", "location", "timeline", "objection", "book_visit", "other"]) } },
         { section: "9.5", api: "Bot_Last_Confidence", spec: { field_label: "Last Intent Confidence", data_type: "double" } },
         { section: "9.5", api: "Active_Channel", spec: { field_label: "Active Channel", data_type: "picklist", pick_list_values: pickList(["WhatsApp", "Voice", "Web", "None"]) } },
         { section: "9.5", api: "LLM_Cost_Total_Micros", spec: { field_label: "LLM Cost (micros)", data_type: "integer" } },
@@ -1464,7 +1464,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         // 9.6 Slots (filled by AI conversation layer)
         { section: "9.6", api: "Intent", spec: { field_label: "Intent", data_type: "picklist", pick_list_values: pickList(["End Use", "Investment", "NRI", "Upgrade", "Exploring"]) } },
-        { section: "9.6", api: "Budget_Bucket", spec: { field_label: "Budget", data_type: "picklist", pick_list_values: pickList(["under_1_5cr", "1_5_to_2cr", "2_to_2_5cr", "above_2_5cr", "undisclosed"]) } },
+        { section: "9.6", api: "Budget_Bucket", spec: { field_label: "Budget Range Bucket", data_type: "picklist", pick_list_values: pickList(["under_1_5cr", "1_5_to_2cr", "2_to_2_5cr", "above_2_5cr", "undisclosed"]) } },
         { section: "9.6", api: "Timeline_Bucket", spec: { field_label: "Timeline", data_type: "picklist", pick_list_values: pickList(["immediate", "1_3_months", "3_6_months", "exploring"]) } },
         { section: "9.6", api: "Configuration_Interest", spec: { field_label: "Configuration Interest", data_type: "picklist", pick_list_values: pickList(["3bhk_1695", "3bhk_1870", "either", "undecided"]) } },
         { section: "9.6", api: "Current_Location", spec: { field_label: "Current Location", data_type: "text", length: 100 } },
@@ -1474,8 +1474,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         { section: "9.6", api: "Slot_Last_Updated_At", spec: { field_label: "Slots Last Updated", data_type: "datetime" } },
 
         // 9.7 Lead Score
-        { section: "9.7", api: "Lead_Score", spec: { field_label: "Lead Score", data_type: "integer" } },
-        { section: "9.7", api: "Lead_Tier", spec: { field_label: "Lead Tier", data_type: "picklist", pick_list_values: pickList(["Hot", "Warm", "Cold", "Disqualified"]) } },
+        { section: "9.7", api: "Lead_Score", spec: { field_label: "Qualification Score", data_type: "integer" } },
+        { section: "9.7", api: "Lead_Tier", spec: { field_label: "Qualification Tier", data_type: "picklist", pick_list_values: pickList(["Hot", "Warm", "Cold", "Disqualified"]) } },
         { section: "9.7", api: "Score_Last_Computed_At", spec: { field_label: "Score Updated At", data_type: "datetime" } },
         { section: "9.7", api: "Predicted_Value_INR", spec: { field_label: "Predicted Value", data_type: "currency" } },
 
@@ -1495,22 +1495,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         { section: "9.9", api: "Closed_At", spec: { field_label: "Closed At", data_type: "datetime" } },
 
         // 9.10 Progress Flags (16 booleans for fast view filtering)
-        { section: "9.10", api: "F_WA_Template_Sent", spec: { field_label: "[F] WA Template Sent", data_type: "boolean" } },
-        { section: "9.10", api: "F_WA_Replied", spec: { field_label: "[F] WA Replied", data_type: "boolean" } },
-        { section: "9.10", api: "F_Call_Attempted", spec: { field_label: "[F] Call Attempted", data_type: "boolean" } },
-        { section: "9.10", api: "F_Call_Connected", spec: { field_label: "[F] Call Connected", data_type: "boolean" } },
-        { section: "9.10", api: "F_Intent_Captured", spec: { field_label: "[F] Intent Captured", data_type: "boolean" } },
-        { section: "9.10", api: "F_Budget_Captured", spec: { field_label: "[F] Budget Captured", data_type: "boolean" } },
-        { section: "9.10", api: "F_Timeline_Captured", spec: { field_label: "[F] Timeline Captured", data_type: "boolean" } },
-        { section: "9.10", api: "F_Configuration_Captured", spec: { field_label: "[F] Configuration Captured", data_type: "boolean" } },
-        { section: "9.10", api: "F_Site_Visit_Offered", spec: { field_label: "[F] Visit Offered", data_type: "boolean" } },
-        { section: "9.10", api: "F_Site_Visit_Slot_Proposed", spec: { field_label: "[F] Slot Proposed", data_type: "boolean" } },
-        { section: "9.10", api: "F_Site_Visit_Confirmed", spec: { field_label: "[F] Visit Confirmed", data_type: "boolean" } },
-        { section: "9.10", api: "F_Site_Visit_Attended", spec: { field_label: "[F] Visit Attended", data_type: "boolean" } },
-        { section: "9.10", api: "F_Token_Paid", spec: { field_label: "[F] Token Paid", data_type: "boolean" } },
-        { section: "9.10", api: "F_Marked_Not_Interested", spec: { field_label: "[F] Not Interested", data_type: "boolean" } },
-        { section: "9.10", api: "F_Marked_Broker", spec: { field_label: "[F] Broker Suspected", data_type: "boolean" } },
-        { section: "9.10", api: "F_Opt_Out_All", spec: { field_label: "[F] Opted Out (All)", data_type: "boolean" } },
+        { section: "9.10", api: "F_WA_Template_Sent", spec: { field_label: "WA Template Sent Flag", data_type: "boolean" } },
+        { section: "9.10", api: "F_WA_Replied", spec: { field_label: "WA Replied Flag", data_type: "boolean" } },
+        { section: "9.10", api: "F_Call_Attempted", spec: { field_label: "Call Attempted Flag", data_type: "boolean" } },
+        { section: "9.10", api: "F_Call_Connected", spec: { field_label: "Call Connected Flag", data_type: "boolean" } },
+        { section: "9.10", api: "F_Intent_Captured", spec: { field_label: "Intent Captured Flag", data_type: "boolean" } },
+        { section: "9.10", api: "F_Budget_Captured", spec: { field_label: "Budget Captured Flag", data_type: "boolean" } },
+        { section: "9.10", api: "F_Timeline_Captured", spec: { field_label: "Timeline Captured Flag", data_type: "boolean" } },
+        { section: "9.10", api: "F_Configuration_Captured", spec: { field_label: "Configuration Captured Flag", data_type: "boolean" } },
+        { section: "9.10", api: "F_Site_Visit_Offered", spec: { field_label: "Visit Offered Flag", data_type: "boolean" } },
+        { section: "9.10", api: "F_Site_Visit_Slot_Proposed", spec: { field_label: "Slot Proposed Flag", data_type: "boolean" } },
+        { section: "9.10", api: "F_Site_Visit_Confirmed", spec: { field_label: "Visit Confirmed Flag", data_type: "boolean" } },
+        { section: "9.10", api: "F_Site_Visit_Attended", spec: { field_label: "Visit Attended Flag", data_type: "boolean" } },
+        { section: "9.10", api: "F_Token_Paid", spec: { field_label: "Token Paid Flag", data_type: "boolean" } },
+        { section: "9.10", api: "F_Marked_Not_Interested", spec: { field_label: "Not Interested Flag", data_type: "boolean" } },
+        { section: "9.10", api: "F_Marked_Broker", spec: { field_label: "Broker Suspected Flag", data_type: "boolean" } },
+        { section: "9.10", api: "F_Opt_Out_All", spec: { field_label: "Opted Out All Flag", data_type: "boolean" } },
 
         // 9.11 System / Audit
         { section: "9.11", api: "Last_Inbound_At", spec: { field_label: "Last Inbound", data_type: "datetime" } },
