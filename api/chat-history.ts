@@ -1585,26 +1585,41 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // Note: Zoho's search api doesn't support null/empty negation cleanly,
       // so we fetch the recently-modified set and partition in JS.
       const since = new Date(Date.now() - hours * 3600 * 1000);
-      const sinceIso = since.toISOString().replace(/\.\d{3}Z$/, "+00:00");
-      const r = await fetch(
-        `https://www.zohoapis.in/crm/v3/Leads/search?` +
-        `criteria=(Last_Inhouse_Call_ID:not_equal:null)` +
-        `&fields=id,First_Name,Last_Name,Mobile,Last_Inhouse_Call_ID,Call_Status,Call_Duration,Lead_Status,Modified_Time` +
-        `&per_page=100&sort_by=Modified_Time&sort_order=desc`,
-        { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
+      // Zoho search's "not_equal:null" doesn't reliably match custom-field
+      // presence — fetch the most-recently-modified leads (page through up
+      // to 400) and filter client-side for Last_Inhouse_Call_ID presence.
+      // Reliable + works for both the "field doesn't exist" and "field
+      // exists but empty" cases.
+      const candidates: any[] = [];
+      const fieldsList = "id,First_Name,Last_Name,Mobile,Last_Inhouse_Call_ID,Call_Status,Call_Duration,Lead_Status,Modified_Time,Created_Time";
+      for (let page = 1; page <= 4; page++) {
+        const r = await fetch(
+          `https://www.zohoapis.in/crm/v3/Leads?` +
+          `fields=${encodeURIComponent(fieldsList)}` +
+          `&per_page=100&page=${page}&sort_by=Modified_Time&sort_order=desc`,
+          { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
+        );
+        if (r.status === 204) break;
+        if (!r.ok) {
+          const txt = (await r.text()).slice(0, 300);
+          return res.status(r.status).json({ error: "zoho-list failed", body: txt, page });
+        }
+        const rawText = await r.text();
+        let data: any = null;
+        if (rawText.trim()) { try { data = JSON.parse(rawText); } catch {} }
+        const rows = (data?.data || []) as any[];
+        if (!rows.length) break;
+        candidates.push(...rows);
+        // Stop early if we've gone past the time window
+        const oldest = rows[rows.length - 1]?.Modified_Time;
+        if (oldest && new Date(oldest) < since) break;
+        const hasMore = data?.info?.more_records;
+        if (!hasMore) break;
+      }
+      // Only consider leads that actually have a Last_Inhouse_Call_ID stamped
+      const all = candidates.filter(
+        (l) => l.Last_Inhouse_Call_ID && String(l.Last_Inhouse_Call_ID).trim() !== "",
       );
-      if (!r.ok && r.status !== 204) {
-        const txt = (await r.text()).slice(0, 300);
-        return res.status(r.status).json({ error: "zoho-search failed", body: txt });
-      }
-      // Zoho returns 204 No Content (empty body) when no results match.
-      // r.json() throws on empty body — read as text first and tolerate.
-      const rawText = await r.text();
-      let data: any = null;
-      if (rawText.trim()) {
-        try { data = JSON.parse(rawText); } catch {}
-      }
-      const all = (data?.data || []) as any[];
       // Partition: posthook_fired (Call_Status set) vs stuck (null/empty)
       const stuck = all.filter((l) => !l.Call_Status || l.Call_Status === "");
       const completed = all.filter((l) => l.Call_Status && l.Call_Status !== "");
