@@ -1593,11 +1593,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         `&per_page=100&sort_by=Modified_Time&sort_order=desc`,
         { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
       );
-      if (!r.ok) {
+      if (!r.ok && r.status !== 204) {
         const txt = (await r.text()).slice(0, 300);
         return res.status(r.status).json({ error: "zoho-search failed", body: txt });
       }
-      const data = (await r.json()) as any;
+      // Zoho returns 204 No Content (empty body) when no results match.
+      // r.json() throws on empty body — read as text first and tolerate.
+      const rawText = await r.text();
+      let data: any = null;
+      if (rawText.trim()) {
+        try { data = JSON.parse(rawText); } catch {}
+      }
       const all = (data?.data || []) as any[];
       // Partition: posthook_fired (Call_Status set) vs stuck (null/empty)
       const stuck = all.filter((l) => !l.Call_Status || l.Call_Status === "");
