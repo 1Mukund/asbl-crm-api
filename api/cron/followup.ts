@@ -312,6 +312,101 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
+  // ── Meta lead backfill safety-net (runs every 15 min) ────────────────────
+  // If Meta's webhook for any reason doesn't deliver a leadgen event to
+  // our /api/ingest/meta endpoint (network blip, Meta auto-pause after
+  // failures, app webhook URL drift), this cron polls the Meta Graph API
+  // directly for each configured form, fetches the latest leads, and runs
+  // them through ingestLead(). Idempotent — duplicates only bump
+  // Resubmission_Count and outreach is suppressed by the 30-min cooldown.
+  //
+  // Form IDs come from env META_BACKFILL_FORM_IDS (comma-separated). If
+  // unset, falls back to the two known ASBL Loft forms from May 2026.
+  // Lookback window: last 2 hours (matches expected webhook delivery
+  // window + 4x safety margin).
+  if (req.query.task === "meta-backfill") {
+    const start = Date.now();
+    const result: any = { ms: 0, scanned: 0, created: 0, updated: 0, failed: 0, per_form: [] };
+    try {
+      const metaToken = process.env.META_PAGE_ACCESS_TOKEN || "";
+      if (!metaToken) throw new Error("META_PAGE_ACCESS_TOKEN missing");
+
+      const formIdsRaw = process.env.META_BACKFILL_FORM_IDS ||
+        "3894470884180255,980466747851896";
+      const formIds = formIdsRaw.split(",").map((s) => s.trim()).filter(Boolean);
+
+      const { buildNormalizedLead } = await import("../ingest/meta");
+      const { ingestLead } = await import("../_utils/ingest");
+
+      // Lookback 2 hours
+      const sinceUnix = Math.floor((Date.now() - 2 * 3600 * 1000) / 1000);
+
+      for (const fid of formIds) {
+        const created: any[] = [];
+        const updated: any[] = [];
+        const failed: any[] = [];
+        let seen = 0;
+        let errorMsg: string | null = null;
+        try {
+          const url =
+            `https://graph.facebook.com/v19.0/${fid}/leads?` +
+            `fields=id,created_time,field_data,ad_id,ad_name,adset_id,adset_name,campaign_id,campaign_name,form_id&` +
+            `limit=50&` +
+            `filtering=${encodeURIComponent(JSON.stringify([{ field: "time_created", operator: "GREATER_THAN", value: sinceUnix }]))}&` +
+            `access_token=${encodeURIComponent(metaToken)}`;
+          const r = await fetch(url);
+          const data = (await r.json()) as any;
+          if (!r.ok || data?.error) {
+            errorMsg = data?.error?.message || `HTTP ${r.status}`;
+          } else {
+            const items = Array.isArray(data?.data) ? data.data : [];
+            seen = items.length;
+            for (const item of items) {
+              try {
+                const enriched = { ...item, leadgen_id: item.id, form_id: fid };
+                const lead = buildNormalizedLead(enriched);
+                if (!lead) {
+                  failed.push({ id: item.id, reason: "normalize_failed" });
+                  continue;
+                }
+                const ir = await ingestLead(lead);
+                if (ir.action === "created") created.push({ id: item.id, zoho: ir.zoho_lead_id, mobile: lead.mobile });
+                else updated.push({ id: item.id, zoho: ir.zoho_lead_id });
+              } catch (err: any) {
+                failed.push({ id: item.id, error: (err.message || String(err)).slice(0, 200) });
+              }
+            }
+          }
+        } catch (err: any) {
+          errorMsg = err.message;
+        }
+        result.per_form.push({
+          form_id: fid,
+          seen,
+          created_count: created.length,
+          updated_count: updated.length,
+          failed_count: failed.length,
+          error: errorMsg,
+          created_sample: created.slice(0, 5),
+          failed_sample: failed.slice(0, 3),
+        });
+        result.scanned += seen;
+        result.created += created.length;
+        result.updated += updated.length;
+        result.failed += failed.length;
+      }
+
+      result.ms = Date.now() - start;
+      await logCronRun("meta-backfill", result.ms, result, null);
+      return res.status(200).json({ task: "meta-backfill", ...result });
+    } catch (err: any) {
+      result.ms = Date.now() - start;
+      console.error("[Meta Backfill Cron] Fatal:", err.message);
+      await logCronRun("meta-backfill", result.ms, result, err.message);
+      return res.status(500).json({ error: err.message, ...result });
+    }
+  }
+
   // ── ASBL spec cadence processor branch (runs every 15 min) ───────────────
   // Spec section 12 — process cadence steps when Next_Action_At <= now.
   if (req.query.task === "cadence") {
