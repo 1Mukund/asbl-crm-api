@@ -4,6 +4,10 @@
     {
       "path": "/api/cron/followup",
       "schedule": "30 4 * * *"
+    },
+    {
+      "path": "/api/cron/followup?task=cadence",
+      "schedule": "*/15 * * * *"
     }
   ]
 }

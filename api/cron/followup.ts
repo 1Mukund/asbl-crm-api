@@ -179,6 +179,131 @@ async function sendMessage(phone: string, sender: string, message: string): Prom
   }
 }
 
+// ─── ASBL spec cadence step processor (runs every 15 min) ─────────────────
+// Query Zoho for leads with Active_Cadence != none AND Next_Action_At <= now,
+// then for each lead: run the current step's action (WA template / dial /
+// reminder), call advanceCadence to bump to next step. Compliance checks
+// run inline before any outbound. Failures logged, never throw — must
+// keep ticking even if one lead errors.
+async function runCadenceProcessor(): Promise<{
+  ms: number;
+  scanned: number;
+  processed: number;
+  skipped: number;
+  exhausted: number;
+  errors: any[];
+}> {
+  const start = Date.now();
+  const errors: any[] = [];
+  let scanned = 0;
+  let processed = 0;
+  let skipped = 0;
+  let exhausted = 0;
+
+  try {
+    const { getAccessToken } = await import("../_utils/zoho");
+    const { advanceCadence, currentStepConfig } = await import("../_utils/cadence");
+    const { closeLead } = await import("../_utils/state_machine");
+    const { checkCompliance } = await import("../_utils/compliance");
+
+    const token = await getAccessToken();
+    const nowIso = new Date().toISOString().replace(/\.\d{3}Z$/, "+00:00");
+
+    // Pull up to 200 leads with Next_Action_At <= now and Active_Cadence not "none"
+    const r = await fetch(
+      `https://www.zohoapis.in/crm/v3/Leads/search?` +
+      `criteria=((Next_Action_At:less_equal:${encodeURIComponent(nowIso)})and(Active_Cadence:not_equal:none))` +
+      `&fields=id,First_Name,Last_Name,Mobile,Phone,ASBL_Project,Stage,Status,Active_Cadence,Cadence_Step,Next_Action_At,Next_Action_Type,Site_Visit_Date,WhatsApp_Service_Window_Expires_At,WhatsApp_Reply_Count,Call_Attempt_Count,Call_Last_Attempt_At,Last_Call_At,Opt_Out_WhatsApp,Opt_Out_Calls,F_Opt_Out_All,F_Marked_Broker` +
+      `&per_page=100`,
+      { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
+    );
+
+    if (r.status === 204) {
+      return { ms: Date.now() - start, scanned: 0, processed: 0, skipped: 0, exhausted: 0, errors: [] };
+    }
+    if (!r.ok) {
+      const body = (await r.text()).slice(0, 300);
+      throw new Error(`Zoho search failed: ${r.status} ${body}`);
+    }
+
+    const rawText = await r.text();
+    let data: any = null;
+    if (rawText.trim()) { try { data = JSON.parse(rawText); } catch {} }
+    const leads = (data?.data || []) as any[];
+    scanned = leads.length;
+
+    for (const lead of leads) {
+      try {
+        const step = currentStepConfig(lead);
+        if (!step) { skipped++; continue; }
+
+        const channel: "whatsapp" | "voice" =
+          step.action === "dial" ? "voice" :
+          (step.action === "send_wa_template" || step.action === "send_wa_message" || step.action === "send_reminder") ? "whatsapp" :
+          "whatsapp";
+
+        const verdict = checkCompliance({
+          lead,
+          channel,
+          isTemplateMessage: step.action === "send_wa_template" || step.action === "send_reminder",
+        });
+
+        if (verdict.verdict === "abort") {
+          // Mark Closed if opt-out/broker/terminal
+          if (verdict.reason.startsWith("opt_out_all")) {
+            await closeLead(lead.id, lead, "opt_out", "system");
+          } else if (verdict.reason === "marked_broker") {
+            await closeLead(lead.id, lead, "broker", "system");
+          }
+          skipped++;
+          continue;
+        }
+        if (verdict.verdict === "defer") {
+          // Push Next_Action_At forward to retry_after; don't advance step
+          if (verdict.retry_after) {
+            const { updateLead } = await import("../_utils/zoho");
+            await updateLead(lead.id, { Next_Action_At: verdict.retry_after });
+          }
+          skipped++;
+          continue;
+        }
+
+        // Actual outreach — fire-and-forget the resubmission outreach flow
+        // we already have (which handles WhatsApp + voice calling).
+        // For now, we just log + advance — production rollout will wire
+        // up the real cadence-step actions once Periskope templates are
+        // approved + voice-bot side ready.
+        console.log(`[Cadence Step] Lead ${lead.id} step=${lead.Cadence_Step}/${lead.Active_Cadence} action=${step.action} channel=${channel} verdict=${verdict.verdict}`);
+
+        const advance = await advanceCadence(lead.id, lead);
+        if (advance.exhausted) {
+          // Cadence done — let webhooks handle terminal transition
+          exhausted++;
+          // For outreach/recovery exhausted with no engagement, close as Unreachable.
+          if (lead.Active_Cadence === "outreach" || lead.Active_Cadence === "recovery" || lead.Active_Cadence === "cooled" || lead.Active_Cadence === "decision_followup") {
+            await closeLead(lead.id, lead, "cadence_exhausted", "system");
+          }
+        } else {
+          processed++;
+        }
+      } catch (err: any) {
+        errors.push({ lead_id: lead.id, error: err.message });
+      }
+    }
+  } catch (err: any) {
+    errors.push({ stage: "cadence_processor", error: err.message });
+  }
+
+  return {
+    ms: Date.now() - start,
+    scanned,
+    processed,
+    skipped,
+    exhausted,
+    errors: errors.slice(0, 10),
+  };
+}
+
 // ── Main Handler ──────────────────────────────────────────────────────────────
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // Security: only allow Vercel cron or internal calls
@@ -187,9 +312,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  // Project KBs are now manually curated via the dashboard's Edit KB form,
-  // so the auto-crawl task has been removed. Only the followup task remains.
+  // ── ASBL spec cadence processor branch (runs every 15 min) ───────────────
+  // Spec section 12 — process cadence steps when Next_Action_At <= now.
+  if (req.query.task === "cadence") {
+    try {
+      const result = await runCadenceProcessor();
+      await logCronRun("cadence", result.ms, result, result.errors.length ? `${result.errors.length} errors` : null);
+      return res.status(200).json({ task: "cadence", ...result });
+    } catch (err: any) {
+      console.error("[Cadence Cron] Fatal:", err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  }
 
+  // Default = daily follow-up sequence (legacy 10-message cron at 10AM IST).
   const followupStartTs = Date.now();
   try {
     const now = Date.now();
