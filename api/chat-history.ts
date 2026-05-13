@@ -1379,6 +1379,107 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── Arrowhead diagnostic + manual test ─────────────────────────────────
+  // GET  ?action=arrowhead-diag&secret=<...>
+  //   Reports current Arrowhead config (URL + token presence).
+  // POST ?action=arrowhead-test&secret=<...>&phone=+12266411111
+  //   Fires a verbose dry-run POST to Arrowhead and returns the full
+  //   response chain. Used when "calls scheduled by our endpoint but
+  //   nothing shows in Arrowhead dashboard" — pinpoints whether we're
+  //   actually reaching Arrowhead vs failing silently.
+  if (req.method === "GET" && req.query.action === "arrowhead-diag") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    const url = process.env.ARROWHEAD_CAMPAIGN_URL_US ||
+      "https://api.agent.arrowhead.team/api/v2/public/domain/932f86fc-ed03-42d5-a127-7dfc63216a8a/campaign/adcc6884-03d1-4bfa-8b2f-ce4da5ddc527/schedule";
+    const tokenSet = !!process.env.ARROWHEAD_BEARER_TOKEN;
+    const tokenLen = (process.env.ARROWHEAD_BEARER_TOKEN || "").length;
+    return res.status(200).json({
+      campaign_url: url,
+      token_configured: tokenSet,
+      token_length: tokenLen,
+      note: tokenSet
+        ? "Token configured. Use ?action=arrowhead-test&phone=<E164> to fire a verbose test."
+        : "Token MISSING — set ARROWHEAD_BEARER_TOKEN env var and redeploy.",
+    });
+  }
+
+  if ((req.method === "POST" || req.method === "GET") && req.query.action === "arrowhead-test") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    const phone = String(req.query.phone || "").trim();
+    if (!phone) return res.status(400).json({ error: "phone query param required (E.164)" });
+
+    const url = process.env.ARROWHEAD_CAMPAIGN_URL_US ||
+      "https://api.agent.arrowhead.team/api/v2/public/domain/932f86fc-ed03-42d5-a127-7dfc63216a8a/campaign/adcc6884-03d1-4bfa-8b2f-ce4da5ddc527/schedule";
+    const token = process.env.ARROWHEAD_BEARER_TOKEN || "";
+    if (!token) {
+      return res.status(500).json({ error: "ARROWHEAD_BEARER_TOKEN env var missing" });
+    }
+    const dryRun = String(req.query.dry || "") === "1";
+    const payload: any = {
+      phone_number: phone,
+      retell_llm_dynamic_variables: {
+        customer_name: "Test Customer",
+        customer_phone: phone,
+        project_name: "ASBL Loft",
+        is_test: "true",
+      },
+    };
+    if (dryRun) {
+      return res.status(200).json({
+        dry_run: true,
+        would_POST_to: url,
+        would_use_token_prefix: token.slice(0, 8) + "...",
+        would_send_payload: payload,
+      });
+    }
+    const t0 = Date.now();
+    try {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(payload),
+      });
+      const ms = Date.now() - t0;
+      const respText = await r.text();
+      let respJson: any = null;
+      try { respJson = JSON.parse(respText); } catch {}
+      return res.status(200).json({
+        request: {
+          url,
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token.slice(0, 8)}...` },
+          body: payload,
+        },
+        response: {
+          ok: r.ok,
+          status: r.status,
+          headers: Object.fromEntries(r.headers.entries()),
+          body: respJson || respText.slice(0, 1000),
+        },
+        latency_ms: ms,
+        verdict: r.ok
+          ? "✓ Arrowhead returned 2xx. Check their dashboard now — if still nothing, the URL is pointing to a stale/wrong campaign."
+          : `✗ Arrowhead returned ${r.status}. Token expired, URL changed, or campaign disabled.`,
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        error: `arrowhead fetch threw: ${err.message}`,
+        url,
+      });
+    }
+  }
+
   // ─── ASBL spec webhook handlers — spec section 13 ───────────────────────
   // Per spec, vendors call dedicated Zoho REST endpoints. We expose them as
   // chat-history actions to stay within the 12-function Vercel cap.

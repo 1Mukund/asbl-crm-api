@@ -3,7 +3,8 @@
  *
  *   +91 (India) → in-house ASBL Voice Bot (Anandita) at
  *                 https://asbl-voice-bot.onrender.com/api/trigger-call
- *   +1  (US)    → Arrowhead campaign (legacy, still in use for US leads)
+ *   ANY other   → Arrowhead campaign (international leads — US, UK,
+ *                 UAE, Canada, AUS, etc.)
  *
  * Contract (kept compatible with existing Zoho Deluge):
  *   POST /api/relay/inhouse-call
@@ -38,12 +39,18 @@ function toE164(raw: string): string {
   return `+${digits}`;
 }
 
-/** Detect country region from E.164 number. India = "IN", US = "US". */
-function detectRegion(e164: string): "IN" | "US" | "OTHER" {
+/** Detect country region from E.164 number.
+ *  India (+91)         → in-house voice bot
+ *  ANY other country   → Arrowhead campaign (international leads)
+ *
+ *  Previously only +1 (US/Canada) went to Arrowhead and other intl
+ *  numbers (UAE +971, UK +44, AUS +61, etc.) were rejected with 400.
+ *  Per Mukund: all non-Indian international leads should be routed to
+ *  Arrowhead. */
+function detectRegion(e164: string): "IN" | "INTL" {
   const digits = e164.replace(/^\+/, "");
   if (digits.startsWith("91")) return "IN";
-  if (digits.startsWith("1")) return "US";
-  return "OTHER";
+  return "INTL";
 }
 
 /** Trigger the in-house ASBL voice bot (India calls).
@@ -235,21 +242,32 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    // ── B. US (+1) → Arrowhead campaign ────────────────────────────────
-    if (region === "US") {
+    // ── B. International (any non-IN number) → Arrowhead campaign ──────
+    if (region === "INTL") {
       if (!ARROWHEAD_BEARER_TOKEN) {
-        return res.status(500).json({ error: "ARROWHEAD_BEARER_TOKEN env var not configured" });
-      }
-
-      const result = await triggerArrowheadUs(phone, body);
-      if (!result.ok) {
-        console.error(`[InHouse Call US] Arrowhead trigger failed (${result.status}):`, result.data);
-        return res.status(result.status || 500).json({
-          error: result.data?.error || result.data || `arrowhead ${result.status}`,
+        console.error(`[InHouse Call INTL] ARROWHEAD_BEARER_TOKEN env var missing — call to ${phone} NOT scheduled`);
+        return res.status(500).json({
+          error: "ARROWHEAD_BEARER_TOKEN env var not configured. International calls cannot be scheduled.",
+          attempted_phone: phone,
         });
       }
 
-      console.log(`[InHouse Call US] Arrowhead campaign triggered for ${phone}`);
+      const result = await triggerArrowheadUs(phone, body);
+      console.log(
+        `[InHouse Call INTL] Arrowhead POST → ${ARROWHEAD_CAMPAIGN_URL_US} | status=${result.status} ok=${result.ok} ` +
+        `response=${JSON.stringify(result.data).slice(0, 300)}`,
+      );
+
+      if (!result.ok) {
+        console.error(`[InHouse Call INTL] Arrowhead trigger FAILED for ${phone} (${result.status}):`, result.data);
+        return res.status(result.status || 500).json({
+          error: result.data?.error || result.data || `arrowhead ${result.status}`,
+          arrowhead_response: result.data,
+          attempted_phone: phone,
+        });
+      }
+
+      console.log(`[InHouse Call INTL] Arrowhead campaign triggered for ${phone} ✓`);
 
       // Move Zoho lead to "Lead Initiated" — MUST await in Vercel serverless
       // (see IN branch comment above for why fire-and-forget was wrong).
@@ -259,26 +277,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           triggerBlueprintTransition(zohoLeadId, "Lead Initiated"),
         ]);
         if (updateRes.status === "rejected") {
-          console.error(`[InHouse Call US] updateLead failed: ${updateRes.reason?.message || updateRes.reason}`);
+          console.error(`[InHouse Call INTL] updateLead failed: ${updateRes.reason?.message || updateRes.reason}`);
         }
         if (transRes.status === "rejected") {
-          console.error(`[InHouse Call US] blueprint transition failed: ${transRes.reason?.message || transRes.reason}`);
+          console.error(`[InHouse Call INTL] blueprint transition failed: ${transRes.reason?.message || transRes.reason}`);
         }
       }
 
       return res.status(200).json({
         success: true,
-        region: "US",
+        region: "INTL",
         provider: "arrowhead",
         to: phone,
         arrowhead_response: result.data,
       });
     }
 
-    // ── C. Unsupported country — refuse rather than guess ──────────────
-    return res.status(400).json({
-      error: `Unsupported country code for ${phone}. Only +91 (India, in-house bot) and +1 (US, Arrowhead) are routed.`,
-    });
+    // Should never reach here — IN + INTL cover all cases now
+    return res.status(500).json({ error: `Unexpected region for ${phone}` });
   } catch (err: any) {
     console.error("[InHouse Call] Unexpected error:", err.message);
     return res.status(500).json({ error: err.message });
