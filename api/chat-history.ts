@@ -1423,13 +1423,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(500).json({ error: "ARROWHEAD_BEARER_TOKEN env var missing" });
     }
     const dryRun = String(req.query.dry || "") === "1";
+    // Arrowhead's current schema (as of May 2026 — confirmed via curl
+    // from their team). All 5 top-level fields are required.
     const payload: any = {
-      phone_number: phone,
-      retell_llm_dynamic_variables: {
+      customer_full_name: "Test Customer",
+      mobile_number: phone.replace(/^\+/, ""),
+      external_customer_id: `TEST-${Date.now()}`,
+      external_schedule_id: `TEST-${Date.now()}-call-1`,
+      input_variables: {
+        budget: "",
+        intent: "",
+        country: "",
+        project: "ASBL Loft",
+        comments: "Test call from CRM diag endpoint",
         customer_name: "Test Customer",
-        customer_phone: phone,
-        project_name: "ASBL Loft",
-        is_test: "true",
+        web_time_spent: "",
+        size_preference: "",
+        call_enrichment_data: "",
+        floor_level_preference: "",
+        handover_timeline_preference: "",
       },
     };
     if (dryRun) {

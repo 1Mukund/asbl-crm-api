@@ -109,17 +109,68 @@ async function triggerInHouseBot(
   return { ok: r.ok && (data as any)?.success === true, status: r.status, data };
 }
 
-/** Trigger Arrowhead campaign (US calls — legacy, still active). */
+/** Trigger Arrowhead campaign for international leads.
+ *
+ * Translates Deluge's legacy Retell-style payload to Arrowhead's current
+ * schema. As of May 2026, Arrowhead requires:
+ *   - mobile_number (Deluge sends phone_number — rename)
+ *   - external_customer_id (Deluge doesn't send — derive from mlid/lead_id)
+ *   - external_schedule_id (Deluge sends ✓)
+ *   - customer_full_name (Deluge sends inside retell_llm_dynamic_variables.customer_name)
+ *   - input_variables (Deluge sends retell_llm_dynamic_variables — rename + flatten)
+ *
+ * Updating Deluge code requires Zoho admin access + testing; transforming
+ * on the Vercel side is cheaper and keeps Deluge stable.
+ */
 async function triggerArrowheadUs(
   phone: string,
   rawBody: any,
 ): Promise<{ ok: boolean; status: number; data: any }> {
-  // Strip our internal _zoho_lead_id before forwarding — Arrowhead doesn't need it
-  const { _zoho_lead_id, ...arrowheadPayload } = rawBody;
-  // Make sure Arrowhead sees the phone in its expected field
-  if (!arrowheadPayload.phone_number && !arrowheadPayload.mobile_number) {
-    arrowheadPayload.phone_number = phone;
-  }
+  const {
+    _zoho_lead_id,
+    phone_number,
+    mobile_number,
+    retell_llm_dynamic_variables,
+    input_variables,
+    external_schedule_id,
+    external_customer_id,
+    customer_full_name,
+    agent_id, // ignored — Arrowhead's new schema doesn't use agent_id in body
+    ...rest
+  } = rawBody || {};
+
+  const dyn = retell_llm_dynamic_variables || {};
+
+  // Translate Retell-style dynamic variables → Arrowhead input_variables
+  const builtInputVars = input_variables || {
+    budget:                       dyn.budget                       || "",
+    intent:                       dyn.intent                       || "",
+    country:                      dyn.country                      || "",
+    project:                      dyn.project_name                 || dyn.project || "",
+    comments:                     dyn.comments                     || "",
+    customer_name:                dyn.customer_name                || "",
+    web_time_spent:               dyn.web_time_spent               || dyn.time_spent_minutes || "",
+    size_preference:              dyn.size_preference              || "",
+    call_enrichment_data:         dyn.call_enrichment_data         || "",
+    floor_level_preference:       dyn.floor_level_preference       || dyn.floor_preference || "",
+    handover_timeline_preference: dyn.handover_timeline_preference || dyn.timeline || "",
+  };
+
+  const arrowheadPayload = {
+    customer_full_name:    customer_full_name      || dyn.customer_name || "",
+    mobile_number:         mobile_number           || phone_number       || phone,
+    external_customer_id:  external_customer_id    || dyn.mlid           || _zoho_lead_id || "",
+    external_schedule_id:  external_schedule_id    || "",
+    input_variables:       builtInputVars,
+  };
+
+  console.log(
+    `[Arrowhead] POST ${ARROWHEAD_CAMPAIGN_URL_US} | ` +
+    `payload keys=${Object.keys(arrowheadPayload).join(",")} ` +
+    `ext_customer=${arrowheadPayload.external_customer_id} ` +
+    `ext_schedule=${arrowheadPayload.external_schedule_id}`,
+  );
+
   const r = await fetch(ARROWHEAD_CAMPAIGN_URL_US, {
     method: "POST",
     headers: {
