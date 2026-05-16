@@ -38,13 +38,24 @@ function normSize(s: string | null | undefined): string {
   return (s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
+// Doc types where the same doc_type can have MULTIPLE rows in
+// project_documents, each disambiguated by size_label.
+//   - floor_plan  → per-tower (Tower A, Tower B, ...)
+//   - unit_plan   → per-unit-size (1695 East, 1870 West, ...)
+//   - price_sheet → per-config / per-tower price sheets
+const MULTI_SLOT_DOC_TYPES = new Set(["unit_plan", "floor_plan", "price_sheet"]);
+
+export function isMultiSlotDocType(docType: string): boolean {
+  return MULTI_SLOT_DOC_TYPES.has(docType);
+}
+
 /** List the available size_labels for a multi-slot doc type (for asking
  *  the customer "which tower / which size?" when the request is ambiguous). */
 export async function listAvailableLabels(
   project: string,
   docType: string,
 ): Promise<string[]> {
-  if (docType !== "unit_plan" && docType !== "floor_plan") return [];
+  if (!MULTI_SLOT_DOC_TYPES.has(docType)) return [];
   try {
     const r = await fetch(
       `${SUPABASE_URL}/rest/v1/project_documents` +
@@ -92,9 +103,10 @@ export async function getDocumentFor(
     const rows = (await r.json()) as ProjectDoc[];
 
     if (rows?.length) {
-      // For multi-slot doc types (unit_plan / floor_plan), try to match
-      // size_label fuzzily using the customer's message as a hint.
-      const isMulti = docType === "unit_plan" || docType === "floor_plan";
+      // For multi-slot doc types (unit_plan / floor_plan / price_sheet),
+      // try to match size_label fuzzily using the customer's message
+      // as a hint. Single-slot types just return the most recent row.
+      const isMulti = isMultiSlotDocType(docType);
       if (isMulti) {
         const hint = normSize(sizeHint);
         if (hint) {

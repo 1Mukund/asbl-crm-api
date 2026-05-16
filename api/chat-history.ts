@@ -443,18 +443,21 @@ async function renderDashboard(): Promise<string> {
 
   const SINGLE_SLOTS: Array<{ key: string; label: string }> = [
     { key: "master_plan", label: "Master Plan" },
-    { key: "price_sheet", label: "Price Sheet" },
     { key: "payment_structure", label: "Payment Structure" },
     { key: "brochure", label: "Brochure" },
     { key: "specifications", label: "Specifications" },
     { key: "amenities", label: "Amenities" },
   ];
 
-  // Multi-PDF slots — one row per label (e.g. tower / unit size).
+  // Multi-PDF slots — one row per label (e.g. tower / unit size / configuration).
   // The bot fuzzy-matches by label when a customer asks for a specific one.
+  // Price Sheet upgraded to multi-slot so projects can have per-config /
+  // per-tower price sheets (e.g. "Tower A 3BHK", "Tower B 2BHK") instead of
+  // forcing one giant price sheet for the whole project.
   const MULTI_SLOTS: Array<{ key: string; title: string; placeholder: string }> = [
-    { key: "floor_plan", title: "Floor Plans", placeholder: "tower label e.g. Tower A" },
-    { key: "unit_plan", title: "Unit Plans", placeholder: "size label e.g. 1695 East" },
+    { key: "floor_plan",  title: "Floor Plans",  placeholder: "tower label e.g. Tower A" },
+    { key: "unit_plan",   title: "Unit Plans",   placeholder: "size label e.g. 1695 East" },
+    { key: "price_sheet", title: "Price Sheets", placeholder: "config/tower e.g. Tower A 3BHK" },
   ];
 
   const renderDocSlot = (project: string, docKey: string, label: string) => {
@@ -480,7 +483,10 @@ async function renderDashboard(): Promise<string> {
 
   const renderMultiSlot = (project: string, docType: string, title: string, placeholder: string) => {
     const items = docsByProj[project]?.[docType] || [];
-    const labelHeader = docType === "floor_plan" ? "Tower" : "Size";
+    const labelHeader =
+      docType === "floor_plan"  ? "Tower" :
+      docType === "price_sheet" ? "Config" :
+      "Size";
     const list = items.map((p) => `<tr>
       <td>${esc(p.size_label || "—")}</td>
       <td><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.filename || "open")}</a></td>

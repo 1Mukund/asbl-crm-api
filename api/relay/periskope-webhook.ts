@@ -1015,7 +1015,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         // "Actually one sec, not on my phone" broken-promise follow-up below
         // — otherwise customer sees both messages back-to-back.
         let clarificationSent = false;
-        const isMultiSlot = docTypeFromMsg === "unit_plan" || docTypeFromMsg === "floor_plan";
+        // Multi-slot doc types — same doc_type can have N rows in
+        // project_documents disambiguated by size_label. Kimi dispatcher
+        // handles fuzzy match + asks customer if ambiguous.
+        // (Kept in sync with isMultiSlotDocType in document_dispatcher.ts.)
+        const isMultiSlot =
+          docTypeFromMsg === "unit_plan"  ||
+          docTypeFromMsg === "floor_plan" ||
+          docTypeFromMsg === "price_sheet";
 
         if (isMultiSlot) {
           const dispatch = await dispatchUnitPlan(message, project, docTypeFromMsg as any);

@@ -56,7 +56,7 @@ export interface UnitPlanDispatchResult {
 /** Fetch all unit_plan / floor_plan rows for a project, including text_extract. */
 async function fetchAvailableRows(
   project: string,
-  docType: "unit_plan" | "floor_plan",
+  docType: "unit_plan" | "floor_plan" | "price_sheet",
 ): Promise<UnitPlanRow[]> {
   const r = await fetch(
     `${SUPABASE_URL}/rest/v1/project_documents` +
@@ -92,7 +92,11 @@ function buildPrompt(message: string, project: string, docType: string, rows: Un
     "plausible options — DO NOT GUESS. " +
     "If nothing in the catalog matches at all, set decision='no_match'.";
 
-  const docTypeLabel = docType === "unit_plan" ? "Unit Plan (per-unit-size floor layouts)" : "Floor Plan (per-tower full-floor layouts)";
+  const docTypeLabel =
+    docType === "unit_plan"   ? "Unit Plan (per-unit-size floor layouts)"   :
+    docType === "floor_plan"  ? "Floor Plan (per-tower full-floor layouts)" :
+    docType === "price_sheet" ? "Price Sheet (per-config / per-tower price breakdown)" :
+    "Document";
 
   const catalog = rows
     .map((row, i) => {
@@ -144,7 +148,7 @@ function buildPrompt(message: string, project: string, docType: string, rows: Un
 export async function dispatchUnitPlan(
   message: string,
   project: string,
-  docType: "unit_plan" | "floor_plan",
+  docType: "unit_plan" | "floor_plan" | "price_sheet",
   confidenceThreshold = 0.7,
 ): Promise<UnitPlanDispatchResult> {
   const t0 = Date.now();
@@ -258,10 +262,14 @@ export async function dispatchUnitPlan(
  *  decision = "ambiguous". Kept Anandita-style (Sir/Ma'am, conversational). */
 export function buildClarificationMessage(
   project: string,
-  docType: "unit_plan" | "floor_plan",
+  docType: "unit_plan" | "floor_plan" | "price_sheet",
   options: string[],
 ): string {
-  const docLabel = docType === "unit_plan" ? "unit plan" : "floor plan";
+  const docLabel =
+    docType === "unit_plan"   ? "unit plan"   :
+    docType === "floor_plan"  ? "floor plan"  :
+    docType === "price_sheet" ? "price sheet" :
+    "document";
   const list = options.map((o) => `• ${o}`).join("\n");
   return (
     `Sure Sir, just to send the right one — we have a few ${docLabel}s for ${project}:\n\n` +
