@@ -6,10 +6,6 @@
       "schedule": "30 4 * * *"
     },
     {
-      "path": "/api/cron/followup?task=cadence",
-      "schedule": "*/15 * * * *"
-    },
-    {
       "path": "/api/cron/followup?task=meta-backfill",
       "schedule": "*/15 * * * *"
     }
