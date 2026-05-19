@@ -1630,7 +1630,36 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       ];
 
       const results: any[] = [];
+      // Fields where the primary api_name pre-exists with INCOMPATIBLE
+      // picklist values (yesterday's spec or older). Force fallback for these.
+      const FORCE_FALLBACK = new Set(["Stage", "Status"]);
+
       for (const d of desired) {
+        if (FORCE_FALLBACK.has(d.primary_api)) {
+          // Skip primary, create fallback directly
+          if (existingApis.has(d.fallback_api)) {
+            results.push({ api: d.fallback_api, status: "already_exists", which: "fallback_forced" });
+            continue;
+          }
+          // Force creation under fallback name + label
+          const body = { fields: [{ field_label: d.fallback_label, ...d.spec_base }] };
+          const cr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+            method: "POST",
+            headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const j = await cr.json().catch(() => ({}));
+          const success = cr.status >= 200 && cr.status < 300;
+          results.push({
+            api_intended: d.fallback_api,
+            label_tried: [d.fallback_label],
+            status: success ? "created_fallback_forced" : "failed",
+            http_status: cr.status,
+            response: success ? "ok" : j,
+            reason: "primary api pre-exists with incompatible picklist",
+          });
+          continue;
+        }
         if (existingApis.has(d.primary_api)) {
           results.push({ api: d.primary_api, status: "already_exists", which: "primary" });
           continue;
