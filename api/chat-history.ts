@@ -1498,6 +1498,90 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── PRD v1.0 — overwrite Stage / Status picklist values ────────────────
+  // GET ?action=prd-fix-stage-status&secret=<INHOUSE_POSTHOOK_SECRET>&dry=1
+  //   Stage and Status existed pre-yesterday with old picklist values.
+  //   This endpoint REPLACES their picklist values with PRD's 4-stage and
+  //   5-status taxonomy. Existing leads with old values become "blank" —
+  //   the migration script (Phase 8) re-populates them.
+  if (req.method === "GET" && req.query.action === "prd-fix-stage-status") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    const dryRun = String(req.query.dry || "") === "1";
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+
+      const fr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+        headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      });
+      if (!fr.ok) {
+        return res.status(fr.status).json({ error: "field-list failed", body: (await fr.text()).slice(0, 500) });
+      }
+      const fj = (await fr.json()) as any;
+      const allFields = (fj?.fields || []) as any[];
+
+      const stageField = allFields.find((f) => f.api_name === "Stage");
+      const statusField = allFields.find((f) => f.api_name === "Status");
+
+      const targets: Array<{ field: any; new_values: string[] }> = [];
+      if (stageField) {
+        targets.push({
+          field: stageField,
+          new_values: ["New Lead", "Lead Initiated", "Pre Site Visit", "Not Interested"],
+        });
+      }
+      if (statusField) {
+        targets.push({
+          field: statusField,
+          new_values: ["NA", "CF", "SF", "CS", "SS"],
+        });
+      }
+
+      const summary: any[] = [];
+      for (const t of targets) {
+        const before = (t.field.pick_list_values || []).map((p: any) => p.display_value || p.actual_value);
+        summary.push({
+          api_name: t.field.api_name,
+          field_id: t.field.id,
+          before_values: before,
+          target_values: t.new_values,
+          would_change: JSON.stringify(before.sort()) !== JSON.stringify([...t.new_values].sort()),
+        });
+      }
+
+      if (dryRun) {
+        return res.status(200).json({ dry_run: true, summary });
+      }
+
+      // Actually apply — PUT /settings/fields/{id} with new pick_list_values
+      const apply: any[] = [];
+      for (const t of targets) {
+        const newPicks = t.new_values.map((v) => ({ display_value: v, actual_value: v }));
+        const body = { fields: [{ pick_list_values: newPicks }] };
+        const ur = await fetch(`${ZOHO_API_BASE}/settings/fields/${t.field.id}?module=Leads`, {
+          method: "PUT",
+          headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const j = await ur.json().catch(() => ({}));
+        apply.push({
+          api_name: t.field.api_name,
+          http_status: ur.status,
+          success: ur.status >= 200 && ur.status < 300,
+          response: ur.status >= 200 && ur.status < 300 ? "ok" : j,
+        });
+      }
+      return res.status(200).json({ summary, apply });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── PRD v1.0 — create the 13 required Zoho fields ──────────────────────
   // GET ?action=prd-create-fields&secret=<INHOUSE_POSTHOOK_SECRET>
   //   Creates the 13 custom fields per PRD section 11. Each field has a
