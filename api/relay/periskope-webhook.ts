@@ -24,11 +24,35 @@ import { getProjectFacts } from "../_utils/project_facts";
 import { getInventoryForProject, getCrossProjectSizeIndex } from "../_utils/inventory_sheet";
 import { getConversationContext } from "../_utils/conversation_context";
 import { sanitizeReply, stripReintroduction } from "../_utils/sanitizer";
-import { getDocumentFor, sendDocViaPeriskope } from "../_utils/document_dispatcher";
+import {
+  getDocumentFor,
+  getDocumentStrict,
+  listAvailableMetaLabels,
+  sendDocViaPeriskope,
+} from "../_utils/document_dispatcher";
 import { callGemini } from "../_utils/gemini_chat";
-import { customerWordToDocType } from "../_utils/kb_doc_extractor";
 import { dispatchUnitPlan, buildClarificationMessage } from "../_utils/unit_plan_dispatcher";
 import { isFactualQuestion, groundFactualQuestion } from "../_utils/factual_grounder";
+import {
+  getOrCreateProfile,
+  setActiveProject,
+  diffExtractedFacts,
+  mergeProfile,
+  advanceFunnel,
+  inferQualifiedSignal,
+  appendDocSent,
+  renderUserProfileBlock,
+  UserProfile,
+} from "../_utils/user_profile";
+import {
+  validateDocSend,
+  logDocSend,
+  SAFE_FALLBACK_REPLY,
+} from "../_utils/doc_validator";
+import {
+  computeOfferTimeRemaining,
+  renderOfferUrgencyBlock,
+} from "../_utils/offer_time";
 
 const PERISKOPE_API_KEY = process.env.PERISKOPE_API_KEY || "";
 const PERISKOPE_API_URL = "https://api.periskope.app/v1/messages/send";
@@ -529,6 +553,7 @@ function buildStructuredMessage(opts: {
   projectContext: string;
   history: string;
   userMessage: string;
+  userProfileBlock: string;
   intent?: string;
   flags?: string[];
 }): string {
@@ -544,6 +569,10 @@ function buildStructuredMessage(opts: {
     `Currently asking about project: ${currentProjectTag}`,
     `Days since last interaction: ${daysTag}`,
     `</CUSTOMER>`,
+    ``,
+    `<USER_PROFILE>`,
+    opts.userProfileBlock,
+    `</USER_PROFILE>`,
     ``,
     `<PROJECT_CONTEXT>`,
     opts.projectContext,
@@ -742,8 +771,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     console.log(`[Periskope Webhook] Inbound from ${phone} | msg: ${message.slice(0, 80)}`);
 
-    // 1+2. Run Zoho lookup AND conversation history fetch in parallel —
-    //      they're independent and account for ~1.5-2s sequentially.
+    // 1+2+3. Run Zoho lookup, conversation history fetch, AND user profile
+    //         fetch in parallel — all independent, ~1.5-2s sequentially.
     const zohoTask: Promise<{ token: string; lead: LeadDetails | null }> = (async () => {
       try {
         const token = await getZohoToken();
@@ -756,9 +785,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     })();
 
     const historyTask = getConversationContext(phone);
-    const [zohoResult, conversation] = await Promise.all([zohoTask, historyTask]);
+    const profileTask = getOrCreateProfile(phone);
+    const [zohoResult, conversation, profileInitial] = await Promise.all([
+      zohoTask,
+      historyTask,
+      profileTask,
+    ]);
     const zohoToken = zohoResult.token;
     const leadDetails: LeadDetails | null = zohoResult.lead;
+    let userProfile: UserProfile = profileInitial;
+    console.log(
+      `[Periskope Webhook] Profile loaded — funnel=${userProfile.funnel_stage} ` +
+      `current_project=${userProfile.current_project || "(none)"} ` +
+      `budget_cr=${userProfile.budget_cr ?? "(unknown)"} ` +
+      `docs_sent=${userProfile.docs_sent.length}`,
+    );
 
     // PRD v1.0: every customer reply moves status to CF + global override
     // detection (site visit / not interested). Fire-and-forget so the
@@ -879,6 +920,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       projectContext = await getProjectContextText(project);
     }
 
+    // 5a. OFFER_TIME_REMAINING — append urgency tier so the bot calibrates
+    //     CTA tone. Skip on multi-project (no single offer to compute).
+    if (!isMultiProject && project && project !== "LEGACY") {
+      try {
+        const offerInfo = await computeOfferTimeRemaining(project);
+        const offerBlock = renderOfferUrgencyBlock(offerInfo);
+        if (offerBlock) {
+          projectContext += `\n\n${offerBlock}`;
+          console.log(
+            `[Periskope Webhook] OFFER_TIME_REMAINING injected — months=${offerInfo.months_remaining} ` +
+            `tier=${offerInfo.urgency_tier}`,
+          );
+        }
+      } catch (err: any) {
+        console.error(`[Periskope Webhook] offer-time compute failed: ${err.message}`);
+      }
+    }
+
     // 5b. Factual grounding (Kimi K2) — when the customer asks a specific
     //     spec / dimension / RERA / charge question, Kimi reads uploaded PDF
     //     text_extracts and pulls the exact answer with a citation. We then
@@ -919,6 +978,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const customerName =
       [leadDetails?.firstName, leadDetails?.lastName].filter(Boolean).join(" ").trim();
 
+    // Persist current_project hint into the profile BEFORE rendering it, so
+    // the block the bot sees has the live resolution. setActiveProject is
+    // a no-op when the project hasn't changed.
+    userProfile = await setActiveProject(phone, userProfile, project);
+    const userProfileBlock = renderUserProfileBlock(userProfile);
+
     const structuredMsg = buildStructuredMessage({
       customerName,
       phone,
@@ -928,6 +993,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       projectContext,
       history: conversation.formatted,
       userMessage: message,
+      userProfileBlock,
       intent: "(to be classified by Gemini)",
       flags: [],
     });
@@ -949,6 +1015,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         flags: regexResult.flags,
         project: regexResult.project,
         docToSend: null,
+        docMeta: { unit_size_sft: null, facing: null, tower: null },
+        extractedFacts: {},
         reply: fallbackReply,
       };
     }
@@ -968,6 +1036,64 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (projectFromGemini && projectFromGemini !== project) {
       console.log(`[Periskope Webhook] Project override from Gemini: ${project} → ${projectFromGemini}`);
       project = projectFromGemini;
+      userProfile = await setActiveProject(phone, userProfile, project);
+    }
+
+    // 7b. Merge extracted_facts into user_profiles. Scalars overwrite if
+    //     new value is non-null + different; arrays append+dedupe. The
+    //     in-memory userProfile is updated so funnel checks below see fresh data.
+    try {
+      const delta = diffExtractedFacts(userProfile, geminiOutput.extractedFacts);
+      if (Object.keys(delta).length > 0) {
+        userProfile = await mergeProfile(phone, userProfile, delta);
+        console.log(
+          `[Periskope Webhook] Profile merged — fields=${Object.keys(delta).join(",")}`,
+        );
+      }
+    } catch (err: any) {
+      console.error(`[Periskope Webhook] profile merge failed: ${err.message}`);
+    }
+
+    // 7c. Funnel-stage advancement:
+    //     - Every inbound → at least "engaged" (from "new")
+    //     - Captured budget OR (size + timeline) → "qualified"
+    //     - Site visit / negotiating / rejection get bumped by intent below
+    //       OR by the doc-send block (brochure_sent / cost_sheet_sent).
+    try {
+      userProfile.funnel_stage = await advanceFunnel(
+        phone,
+        userProfile.funnel_stage,
+        "INBOUND_MSG",
+      );
+      const qualifiedSignal = inferQualifiedSignal(userProfile);
+      if (qualifiedSignal) {
+        userProfile.funnel_stage = await advanceFunnel(
+          phone,
+          userProfile.funnel_stage,
+          qualifiedSignal,
+        );
+      }
+      if (classification.intent === "SITE_VISIT") {
+        userProfile.funnel_stage = await advanceFunnel(
+          phone,
+          userProfile.funnel_stage,
+          "SITE_VISIT_SCHEDULED",
+        );
+      } else if (classification.intent === "REJECTION") {
+        userProfile.funnel_stage = await advanceFunnel(
+          phone,
+          userProfile.funnel_stage,
+          "LOST",
+        );
+      } else if (classification.intent === "OBJECTION") {
+        userProfile.funnel_stage = await advanceFunnel(
+          phone,
+          userProfile.funnel_stage,
+          "NEGOTIATING",
+        );
+      }
+    } catch (err: any) {
+      console.error(`[Periskope Webhook] funnel advance failed: ${err.message}`);
     }
 
     // 8. Map fine-grained intent → Zoho's 6-value picklist (for analytics)
@@ -1000,118 +1126,325 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       console.error(`[Periskope Webhook] Periskope send failed (reply saved to DB but not delivered): ${err.message}`);
     }
 
-    // 12. Auto-deliver document via Periskope when Gemini signals it.
-    //     STRICT GATING — only fire doc lookup when Gemini EXPLICITLY set
-    //     doc_to_send to a non-null slug. Earlier we also fired on
-    //     intent === DOCUMENT_REQUEST with doc_to_send=null, which caused
-    //     the "Sure, which tower? — Actually one sec, not on my phone"
-    //     double-message bug when Gemini purposely asked a clarifying
-    //     question instead of sending a doc. Now Gemini is the single
-    //     source of truth for whether a doc should be delivered.
-    let docSent: { doc_type: string; url: string; source?: string } | null = null;
+    // 12. Auto-deliver document — v5 STRICT FLOW.
+    //
+    //   (a) Bot must set doc_to_send + (for multi-slot types) doc_meta.
+    //   (b) Strict equality lookup against project_documents on
+    //       (project, doc_type, unit_size_sft, facing, tower).
+    //   (c) Pre-send validator: extract sizes from reply text, compare
+    //       to doc_meta and filename. BLOCK if mismatch.
+    //   (d) Every send (passed / blocked / errored) gets structured-logged
+    //       to doc_send_log for audit.
+    //
+    //   The previous Kimi-based fuzzy dispatcher is GONE — strict lookup
+    //   + LLM-supplied meta is the v5 contract. Legacy fuzzy lookup is
+    //   retained only as a fallback when strict returns NOT_FOUND on a
+    //   single-slot doc type (e.g. brochure has no meta to match on).
+    type DocSendInfo = { doc_type: string; url: string; source?: string };
+    let docSent: DocSendInfo | null = null;
+    let docBlocked: { reason: string } | null = null;
     const isDocRequest = geminiOutput.docToSend !== null;
 
     if (project && isDocRequest) {
       const docTypeFromMsg = geminiOutput.docToSend!;
+      const docMeta = geminiOutput.docMeta;
+      const isMultiSlot =
+        docTypeFromMsg === "unit_plan"  ||
+        docTypeFromMsg === "floor_plan" ||
+        docTypeFromMsg === "price_sheet";
+
       try {
-        // For multi-slot doc types (unit_plan / floor_plan), let Kimi K2
-        // disambiguate between size_labels using the customer's message +
-        // each PDF's text_extract. This is the hallucination-prone path —
-        // simple substring matching previously sent the wrong PDF when
-        // customer was vague ("send unit plan") or when multiple labels
-        // shared a substring ("1695 East" vs "1695 West").
-        //
-        // Kimi returns one of:
-        //   - "match"     → row + confidence ≥ 0.7 → send PDF
-        //   - "ambiguous" → ask customer to pick (fixes the wrong-PDF bug)
-        //   - "no_match"  → fall through to honest "let me check" follow-up
-        //   - "fallback"  → Kimi unavailable → use legacy substring-match
-        let doc: Awaited<ReturnType<typeof getDocumentFor>> | null = null;
-        // When we ask the customer "which size?" we MUST skip the existing
-        // "Actually one sec, not on my phone" broken-promise follow-up below
-        // — otherwise customer sees both messages back-to-back.
-        let clarificationSent = false;
-        // Multi-slot doc types — same doc_type can have N rows in
-        // project_documents disambiguated by size_label. Kimi dispatcher
-        // handles fuzzy match + asks customer if ambiguous.
-        // (Kept in sync with isMultiSlotDocType in document_dispatcher.ts.)
-        const isMultiSlot =
-          docTypeFromMsg === "unit_plan"  ||
-          docTypeFromMsg === "floor_plan" ||
-          docTypeFromMsg === "price_sheet";
+        const strictResult = await getDocumentStrict({
+          project,
+          docType: docTypeFromMsg,
+          unit_size_sft: docMeta.unit_size_sft,
+          facing: docMeta.facing,
+          tower: docMeta.tower,
+        });
 
-        if (isMultiSlot) {
-          const dispatch = await dispatchUnitPlan(message, project, docTypeFromMsg as any);
-          console.log(
-            `[Periskope Webhook] Kimi dispatch (${docTypeFromMsg}): ` +
-            `decision=${dispatch.decision} conf=${dispatch.confidence.toFixed(2)} ` +
-            `reason="${dispatch.reason}" ms=${dispatch.ms}`,
-          );
+        if (strictResult.ok) {
+          const doc = strictResult.doc;
 
-          if (dispatch.decision === "match" && dispatch.row) {
-            doc = {
-              url: dispatch.row.url,
+          // Pre-send VALIDATOR — verbal mention in reply must match doc_meta + filename
+          const validation = validateDocSend(reply, docMeta, doc.filename);
+          if (!validation.ok) {
+            // Block the doc; send a safe verbal fallback instead.
+            console.warn(
+              `[Periskope Webhook] DOC BLOCKED — ${validation.reason} (file=${doc.filename})`,
+            );
+            await logDocSend({
+              phone,
+              project,
               doc_type: docTypeFromMsg,
-              filename: dispatch.row.filename,
-              size_label: dispatch.row.size_label ?? null,
-              source: "kimi" as any,
-            };
-          } else if (dispatch.decision === "ambiguous" && dispatch.options.length) {
-            // Send a clarification question instead of the wrong PDF.
-            const clarif = buildClarificationMessage(project, docTypeFromMsg as any, dispatch.options);
-            await saveMessage(phone, "outbound", clarif, sender, project);
+              doc_meta: docMeta,
+              matched_url: doc.url,
+              matched_file: doc.filename,
+              reply_text: reply,
+              outcome: "blocked_mismatch",
+              block_reason: validation.reason,
+              sizes_in_reply: validation.sizes_in_reply,
+            });
+            await saveMessage(phone, "outbound", SAFE_FALLBACK_REPLY, sender, project);
             try {
-              await sendReply(phone, sender, clarif);
-              console.log(`[Periskope Webhook] Sent clarification (${dispatch.options.length} options) for ${docTypeFromMsg}`);
-              clarificationSent = true;
+              await sendReply(phone, sender, SAFE_FALLBACK_REPLY);
             } catch (err: any) {
-              console.error(`[Periskope Webhook] clarification send failed: ${err.message}`);
+              console.error(`[Periskope Webhook] blocked-fallback send failed: ${err.message}`);
             }
-          } else if (dispatch.decision === "fallback") {
-            // Kimi unavailable — drop to legacy substring-match.
-            doc = await getDocumentFor(project, docTypeFromMsg, message);
-          }
-          // "no_match" or "ambiguous" with empty options → leave doc=null;
-          // the broken-promise branch below handles it (unless clarification
-          // was already sent, in which case the guard skips that branch).
-        } else {
-          // Single-slot doc types (brochure, price_sheet, etc.) — Kimi
-          // doesn't add value; legacy lookup is fine.
-          doc = await getDocumentFor(project, docTypeFromMsg, null);
-        }
+            docBlocked = { reason: validation.reason };
+          } else {
+            // Validation passed → send the PDF
+            const captionMap: Record<string, string> = {
+              brochure: `${project} brochure as discussed.`,
+              price_sheet: `${project} price sheet as discussed.`,
+              specifications: `${project} specifications as discussed.`,
+              master_plan: `${project} master plan as discussed.`,
+              tower_plan: `${project} tower plan as discussed.`,
+              floor_plan: `${project} floor plan as discussed.`,
+              payment_structure: `${project} payment structure as discussed.`,
+              amenities: `${project} amenities sheet as discussed.`,
+              unit_plan: `${project} unit plan as discussed.`,
+            };
+            const caption = captionMap[doc.doc_type] || `${project} ${doc.doc_type} as discussed.`;
 
-        if (doc) {
-          const captionMap: Record<string, string> = {
-            brochure: `${project} brochure as discussed.`,
-            price_sheet: `${project} price sheet as discussed.`,
-            specifications: `${project} specifications as discussed.`,
-            master_plan: `${project} master plan as discussed.`,
-            tower_plan: `${project} tower plan as discussed.`,
-            floor_plan: `${project} floor plan as discussed.`,
-            payment_structure: `${project} payment structure as discussed.`,
-            amenities: `${project} amenities sheet as discussed.`,
-          };
-          const caption = captionMap[doc.doc_type] || `${project} ${doc.doc_type} as discussed.`;
-          await sendDocViaPeriskope(phone, sender, doc.url, doc.filename, caption);
-          docSent = { doc_type: doc.doc_type, url: doc.url, source: doc.source };
-          console.log(`[Periskope Webhook] Doc sent (source=${doc.source}): ${doc.doc_type} → ${doc.url}`);
-        } else if (!clarificationSent) {
-          // ATOMIC DELIVERY — Gemini promised the doc but it's not uploaded yet.
-          // Send an honest follow-up so customer doesn't wait for a PDF that
-          // never arrives (fixes MD-3 broken-promise issue from the test sheet).
-          // Skipped when we already asked the customer "which size?" via Kimi —
-          // sending both back-to-back would confuse them.
-          console.log(`[Periskope Webhook] No ${docTypeFromMsg} doc found for ${project} — sending honest follow-up`);
-          const followUp = `Actually one sec — that one's not on my phone right now. Let me get it from the project team and send it across shortly.`;
-          await saveMessage(phone, "outbound", followUp, sender, project);
-          try {
-            await sendReply(phone, sender, followUp);
-          } catch (err: any) {
-            console.error(`[Periskope Webhook] doc-missing follow-up failed: ${err.message}`);
+            try {
+              await sendDocViaPeriskope(phone, sender, doc.url, doc.filename, caption);
+              docSent = { doc_type: doc.doc_type, url: doc.url, source: doc.source };
+              console.log(
+                `[Periskope Webhook] Doc sent STRICT (source=${doc.source}): ` +
+                `${doc.doc_type} meta=${JSON.stringify(docMeta)} → ${doc.url}`,
+              );
+
+              // Log + advance funnel + track in user_profiles.docs_sent
+              await logDocSend({
+                phone,
+                project,
+                doc_type: docTypeFromMsg,
+                doc_meta: docMeta,
+                matched_url: doc.url,
+                matched_file: doc.filename,
+                reply_text: reply,
+                outcome: "sent",
+                block_reason: null,
+                sizes_in_reply: validation.sizes_in_reply,
+              });
+
+              userProfile.docs_sent = await appendDocSent(
+                phone,
+                docTypeFromMsg,
+                docMeta,
+                userProfile.docs_sent,
+              );
+
+              if (docTypeFromMsg === "brochure") {
+                userProfile.funnel_stage = await advanceFunnel(
+                  phone,
+                  userProfile.funnel_stage,
+                  "DOC_BROCHURE_SENT",
+                );
+              } else if (docTypeFromMsg === "price_sheet") {
+                userProfile.funnel_stage = await advanceFunnel(
+                  phone,
+                  userProfile.funnel_stage,
+                  "DOC_PRICE_SHEET_SENT",
+                );
+              }
+            } catch (err: any) {
+              console.error(`[Periskope Webhook] doc send error: ${err.message}`);
+              await logDocSend({
+                phone,
+                project,
+                doc_type: docTypeFromMsg,
+                doc_meta: docMeta,
+                matched_url: doc.url,
+                matched_file: doc.filename,
+                reply_text: reply,
+                outcome: "error",
+                block_reason: err.message,
+                sizes_in_reply: validation.sizes_in_reply,
+              });
+            }
           }
+        } else if (strictResult.reason === "NOT_FOUND") {
+          // No exact match. For multi-slot docs, surface the available options
+          // and ask the customer to pick. For single-slot docs (no meta to
+          // match on), try the legacy fuzzy lookup as a last resort — the
+          // existing brochure / master-plan tables predate strict columns.
+          if (isMultiSlot) {
+            const labels = await listAvailableMetaLabels(project, docTypeFromMsg);
+            if (labels.length) {
+              const clarif = buildClarificationMessage(
+                project,
+                docTypeFromMsg as any,
+                labels.map((label) => ({ size_label: label } as any)),
+              );
+              await saveMessage(phone, "outbound", clarif, sender, project);
+              try {
+                await sendReply(phone, sender, clarif);
+                console.log(
+                  `[Periskope Webhook] STRICT NOT_FOUND — sent clarification with ` +
+                  `${labels.length} available options`,
+                );
+              } catch (err: any) {
+                console.error(`[Periskope Webhook] clarification send failed: ${err.message}`);
+              }
+              await logDocSend({
+                phone,
+                project,
+                doc_type: docTypeFromMsg,
+                doc_meta: docMeta,
+                matched_url: null,
+                matched_file: null,
+                reply_text: reply,
+                outcome: "blocked_not_found",
+                block_reason: `no row matches meta; offered ${labels.length} alternatives`,
+                sizes_in_reply: [],
+              });
+            } else {
+              // No PDFs uploaded for this doc_type yet → honest deflection
+              await saveMessage(phone, "outbound", SAFE_FALLBACK_REPLY, sender, project);
+              try {
+                await sendReply(phone, sender, SAFE_FALLBACK_REPLY);
+              } catch (err: any) {
+                console.error(`[Periskope Webhook] not-found fallback failed: ${err.message}`);
+              }
+              await logDocSend({
+                phone,
+                project,
+                doc_type: docTypeFromMsg,
+                doc_meta: docMeta,
+                matched_url: null,
+                matched_file: null,
+                reply_text: reply,
+                outcome: "blocked_not_found",
+                block_reason: "no PDFs uploaded for this doc_type",
+                sizes_in_reply: [],
+              });
+            }
+          } else {
+            // Single-slot legacy fallback
+            const legacy = await getDocumentFor(project, docTypeFromMsg, null);
+            if (legacy) {
+              const validation = validateDocSend(reply, docMeta, legacy.filename);
+              if (validation.ok) {
+                const captionMap: Record<string, string> = {
+                  brochure: `${project} brochure as discussed.`,
+                  master_plan: `${project} master plan as discussed.`,
+                  payment_structure: `${project} payment structure as discussed.`,
+                  amenities: `${project} amenities sheet as discussed.`,
+                  specifications: `${project} specifications as discussed.`,
+                };
+                const caption = captionMap[legacy.doc_type] || `${project} ${legacy.doc_type} as discussed.`;
+                await sendDocViaPeriskope(phone, sender, legacy.url, legacy.filename, caption);
+                docSent = { doc_type: legacy.doc_type, url: legacy.url, source: `legacy:${legacy.source}` };
+                console.log(`[Periskope Webhook] Doc sent LEGACY (source=${legacy.source}): ${legacy.doc_type} → ${legacy.url}`);
+                await logDocSend({
+                  phone,
+                  project,
+                  doc_type: docTypeFromMsg,
+                  doc_meta: docMeta,
+                  matched_url: legacy.url,
+                  matched_file: legacy.filename,
+                  reply_text: reply,
+                  outcome: "sent",
+                  block_reason: null,
+                  sizes_in_reply: validation.sizes_in_reply,
+                });
+                if (docTypeFromMsg === "brochure") {
+                  userProfile.funnel_stage = await advanceFunnel(phone, userProfile.funnel_stage, "DOC_BROCHURE_SENT");
+                }
+              } else {
+                console.warn(`[Periskope Webhook] legacy doc found but validator blocked: ${validation.reason}`);
+                await saveMessage(phone, "outbound", SAFE_FALLBACK_REPLY, sender, project);
+                try { await sendReply(phone, sender, SAFE_FALLBACK_REPLY); } catch {}
+                await logDocSend({
+                  phone,
+                  project,
+                  doc_type: docTypeFromMsg,
+                  doc_meta: docMeta,
+                  matched_url: legacy.url,
+                  matched_file: legacy.filename,
+                  reply_text: reply,
+                  outcome: "blocked_mismatch",
+                  block_reason: validation.reason,
+                  sizes_in_reply: validation.sizes_in_reply,
+                });
+                docBlocked = { reason: validation.reason };
+              }
+            } else {
+              await saveMessage(phone, "outbound", SAFE_FALLBACK_REPLY, sender, project);
+              try { await sendReply(phone, sender, SAFE_FALLBACK_REPLY); } catch {}
+              await logDocSend({
+                phone,
+                project,
+                doc_type: docTypeFromMsg,
+                doc_meta: docMeta,
+                matched_url: null,
+                matched_file: null,
+                reply_text: reply,
+                outcome: "blocked_not_found",
+                block_reason: "strict + legacy both empty",
+                sizes_in_reply: [],
+              });
+            }
+          }
+        } else if (strictResult.reason === "AMBIGUOUS") {
+          // Multiple rows matched the bot's full meta — unusual; ask customer
+          // to pick. Most often this fires because the schema upload has
+          // duplicate rows; we still respond gracefully.
+          const labels = (strictResult.candidates || []).map((c) => {
+            const parts: string[] = [];
+            if (c.unit_size_sft) parts.push(`${c.unit_size_sft} sft`);
+            if (c.facing) parts.push(String(c.facing));
+            if (c.tower) parts.push(`Tower ${c.tower}`);
+            return parts.length ? parts.join(" ") : (c.size_label || "");
+          }).filter(Boolean);
+          const clarif = labels.length
+            ? buildClarificationMessage(project, docTypeFromMsg as any, labels.map((l) => ({ size_label: l } as any)))
+            : SAFE_FALLBACK_REPLY;
+          await saveMessage(phone, "outbound", clarif, sender, project);
+          try { await sendReply(phone, sender, clarif); } catch {}
+          await logDocSend({
+            phone,
+            project,
+            doc_type: docTypeFromMsg,
+            doc_meta: docMeta,
+            matched_url: null,
+            matched_file: null,
+            reply_text: reply,
+            outcome: "blocked_mismatch",
+            block_reason: `AMBIGUOUS: ${strictResult.details}`,
+            sizes_in_reply: [],
+          });
+        } else {
+          // ERROR
+          console.error(`[Periskope Webhook] strict lookup ERROR: ${strictResult.details}`);
+          await logDocSend({
+            phone,
+            project,
+            doc_type: docTypeFromMsg,
+            doc_meta: docMeta,
+            matched_url: null,
+            matched_file: null,
+            reply_text: reply,
+            outcome: "error",
+            block_reason: strictResult.details || "unknown",
+            sizes_in_reply: [],
+          });
         }
       } catch (err: any) {
-        console.error(`[Periskope Webhook] Doc send failed: ${err.message}`);
+        console.error(`[Periskope Webhook] doc routing threw: ${err.message}`);
+        await logDocSend({
+          phone,
+          project,
+          doc_type: docTypeFromMsg,
+          doc_meta: docMeta,
+          matched_url: null,
+          matched_file: null,
+          reply_text: reply,
+          outcome: "error",
+          block_reason: err.message,
+          sizes_in_reply: [],
+        });
       }
     }
 
@@ -1133,8 +1466,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       intent: classification.intent,
       flags: classification.flags,
       zohoIntent,
+      funnelStage: userProfile.funnel_stage,
       historyMessages: conversation.totalMessages,
       docSent,
+      docBlocked,
       delivered: sendOk,
     });
 

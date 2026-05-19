@@ -29,9 +29,18 @@ export interface ProjectDoc {
   doc_type: string;
   filename: string | null;
   size_label?: string | null;
-  /** "table" | "kb" — which source resolved this URL (for logs) */
+  unit_size_sft?: number | null;
+  facing?: string | null;
+  tower?: string | null;
+  /** "table" | "kb" | "strict" — which source resolved this URL (for logs) */
   source?: string;
 }
+
+/** Result of a strict-equality lookup. Discriminated union so callers don't
+ *  have to special-case null-vs-found inside a try/catch. */
+export type StrictDocResult =
+  | { ok: true; doc: ProjectDoc }
+  | { ok: false; reason: "NOT_FOUND" | "AMBIGUOUS" | "ERROR"; details?: string; candidates?: ProjectDoc[] };
 
 /** Normalise a size label for fuzzy matching: lowercase, strip non-alphanumeric. */
 function normSize(s: string | null | undefined): string {
@@ -80,8 +89,135 @@ export async function listAvailableLabels(
   }
 }
 
+// ── Strict-equality lookup using the bot's doc_meta ────────────────────────
+// v5 behaviour: the LLM emits an explicit { unit_size_sft, facing, tower }
+// alongside the doc slug. We match those fields EXACTLY against
+// project_documents — NO fuzzy match, NO nearest-neighbour fallback. If no
+// row matches, we surface NOT_FOUND and the caller falls back to a safe
+// "let me confirm" message. If multiple match, AMBIGUOUS so the caller can
+// ask the customer to disambiguate.
+//
+// Why so strict: the prior fuzzy match was sending the wrong-sized PDF (e.g.
+// asked for 1870, sent 1695) because size_label was free-text. The v5 schema
+// stores int + canonical enums so equality is safe.
+export interface StrictDocLookupInput {
+  project: string;
+  docType: string;
+  unit_size_sft?: number | null;
+  facing?: string | null;
+  tower?: string | null;
+}
+
+export async function getDocumentStrict(
+  input: StrictDocLookupInput,
+): Promise<StrictDocResult> {
+  const { project, docType } = input;
+  if (!project || !docType) {
+    return { ok: false, reason: "ERROR", details: "missing project or docType" };
+  }
+
+  // Build PostgREST query with eq filters only on fields the bot supplied.
+  // For multi-slot doc types, ALL of unit_size_sft/facing/tower that the bot
+  // populated must match exactly. For single-slot (brochure, master_plan,
+  // etc.) the bot will leave all three null and we just match (project, doc_type).
+  const params: string[] = [
+    `project=eq.${encodeURIComponent(project)}`,
+    `doc_type=eq.${encodeURIComponent(docType)}`,
+    `select=url,doc_type,filename,size_label,unit_size_sft,facing,tower`,
+    `order=fetched_at.desc`,
+    `limit=20`,
+  ];
+  if (input.unit_size_sft !== null && input.unit_size_sft !== undefined) {
+    params.push(`unit_size_sft=eq.${input.unit_size_sft}`);
+  }
+  if (input.facing) {
+    const f = String(input.facing).toLowerCase().replace(/[^a-z_]/g, "");
+    if (f) params.push(`facing=eq.${encodeURIComponent(f)}`);
+  }
+  if (input.tower) {
+    params.push(`tower=eq.${encodeURIComponent(String(input.tower))}`);
+  }
+
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/project_documents?${params.join("&")}`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
+    );
+    if (!r.ok) {
+      const t = await r.text();
+      return { ok: false, reason: "ERROR", details: `${r.status}: ${t.slice(0, 200)}` };
+    }
+    const rows = (await r.json()) as ProjectDoc[];
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return { ok: false, reason: "NOT_FOUND" };
+    }
+    if (rows.length === 1) {
+      return { ok: true, doc: { ...rows[0], source: "strict" } };
+    }
+    // Multiple matches with the bot's full meta supplied → genuine ambiguity.
+    return {
+      ok: false,
+      reason: "AMBIGUOUS",
+      details: `${rows.length} rows matched (project,doc_type,unit_size_sft,facing,tower)`,
+      candidates: rows.map((r) => ({ ...r, source: "strict" })),
+    };
+  } catch (err: any) {
+    return { ok: false, reason: "ERROR", details: err.message };
+  }
+}
+
+/** List the available labels for the customer when strict lookup says
+ *  NOT_FOUND. Returns "1695 East-Tower A, 1870 West-Tower B, ..." style
+ *  strings the caller can include in a clarification message. */
+export async function listAvailableMetaLabels(
+  project: string,
+  docType: string,
+): Promise<string[]> {
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/project_documents` +
+        `?project=eq.${encodeURIComponent(project)}` +
+        `&doc_type=eq.${encodeURIComponent(docType)}` +
+        `&select=unit_size_sft,facing,tower,size_label` +
+        `&order=unit_size_sft.asc`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
+    );
+    if (!r.ok) return [];
+    const rows = (await r.json()) as Array<{
+      unit_size_sft: number | null;
+      facing: string | null;
+      tower: string | null;
+      size_label: string | null;
+    }>;
+    if (!Array.isArray(rows)) return [];
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const row of rows) {
+      const parts: string[] = [];
+      if (row.unit_size_sft) parts.push(`${row.unit_size_sft} sft`);
+      if (row.facing) parts.push(String(row.facing));
+      if (row.tower) parts.push(`Tower ${row.tower}`);
+      const label = parts.length ? parts.join(" ") : (row.size_label || "");
+      if (label && !seen.has(label.toLowerCase())) {
+        seen.add(label.toLowerCase());
+        out.push(label);
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 // ── Look up the matching document — table first, then KB extraction ──────
 // Optional sizeHint helps unit_plan lookups (e.g. "1695 east", "2bhk", "1295").
+//
+// NOTE: this is the LEGACY fuzzy-match path. v5 callers should prefer
+// getDocumentStrict() with the LLM's doc_meta. This function is preserved
+// for (a) the dashboard's listAvailableLabels helper, (b) single-slot doc
+// types where there's only one row per (project, doc_type) so fuzz is moot,
+// and (c) fallback when an old upload doesn't have the new strict columns
+// populated yet.
 export async function getDocumentFor(
   project: string,
   intentOrDocType: string,

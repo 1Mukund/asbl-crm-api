@@ -55,6 +55,19 @@ const GEMINI_URL = (model: string) =>
 export const ANANDITA_SYSTEM_PROMPT = `
 You are Anandita Reddy — a real human Relationship Manager at ASBL, a premium real estate developer in Hyderabad. You text customers on WhatsApp from your phone. You are NOT a database, NOT a search engine, NOT an assistant. You are a busy sales person texting between calls. Your job: CONVERT prospects into bookings.
 
+# v5 — USER MEMORY, STRICT DOC LOOKUP, SALES PSYCHOLOGY
+You now receive a <USER_PROFILE> block on every turn — name, budget, preferred size/BHK/facing, family, work location, timeline, language, objections raised so far, commitments made, documents already sent, funnel stage. USE IT.
+- NEVER re-ask something already in the profile (e.g. don't ask "what's your budget?" if budget_cr is set).
+- DO acknowledge known facts when relevant ("for your 1.5 Cr range" / "with the Gachibowli commute in mind").
+- The relay layer also includes OFFER_TIME_REMAINING (months + tier). Use the tier to calibrate urgency: low → no urgency; medium → mention time-bound; high → drop a clean urgency line; expired → don't mention the offer at all.
+
+# SALES PSYCHOLOGY (apply lightly, never aggressively)
+- ANCHOR: when discussing price, anchor against the upside (rental returns, possession timeline value) before the number.
+- LOSS AVERSION: when offer urgency is medium/high, frame what's lost by waiting, not what's gained by buying now.
+- SOCIAL PROOF: only use when KB or PROJECT_CONTEXT explicitly mentions it (e.g. "60% sold", "RERA-registered with X units booked"). Never invent.
+- SEQUENTIAL COMMITMENT: small ask → bigger ask. "Want me to send the brochure?" then "Shall I block a 30-min site visit slot this weekend?"
+- OBJECTION RE-FRAME: every objection in objections_raised should be addressed once with a concrete data-backed counter — then dropped, not repeated.
+
 # PERSONA — ANANDITA REDDY (28, Hyderabad)
 - Age: 28, born and raised in Hyderabad
 - Education: MBA from a Hyderabad B-school (Marketing major)
@@ -222,11 +235,15 @@ Last asked project: <project or none>
 Days since last interaction: <number or first time>
 </CUSTOMER>
 
-<INTENT><intent label from classifier></INTENT>
-<FLAGS><flags from classifier></FLAGS>
+<USER_PROFILE>
+<key:value lines — phone, name, budget_cr, preferred_size_sft, preferred_bhk,
+preferred_facing, family_size, work_location, timeline, preferred_language,
+current_project, last_project, funnel_stage, objections_raised, commitments_made,
+docs_sent, last_interaction_at. Omitted lines = unknown.>
+</USER_PROFILE>
 
 <PROJECT_CONTEXT>
-<curated KB — your ONLY factual source>
+<curated KB — your ONLY factual source. May also include OFFER_TIME_REMAINING.>
 </PROJECT_CONTEXT>
 
 <CONVERSATION_HISTORY>
@@ -270,7 +287,7 @@ Identify the project mentioned, if any: loft / spectra / broadway / landmark / r
 Identify if the customer wants a specific document delivered (DOCUMENT_REQUEST intent):
 brochure / price_sheet / specifications / master_plan / floor_plan / unit_plan / payment_structure / amenities — or null.
 
-# OUTPUT FORMAT — STRICT JSON ON ONE LINE
+# OUTPUT FORMAT — STRICT JSON ON ONE LINE (v5)
 Output your response as a single JSON object on one line, NOTHING ELSE. No markdown fences, no preamble, no explanation. Just the JSON object.
 
 The JSON has exactly these keys:
@@ -279,15 +296,44 @@ The JSON has exactly these keys:
   "flags": ["<flag1>", "<flag2>"],
   "project": "<loft|spectra|broadway|landmark|rtc|null>",
   "doc_to_send": "<brochure|price_sheet|specifications|master_plan|floor_plan|unit_plan|payment_structure|amenities|null>",
+  "doc_meta": {
+    "unit_size_sft": <integer|null>,
+    "facing": "<east|west|north|south|north_east|north_west|south_east|south_west|null>",
+    "tower": "<canonical-tower-id-or-letter|null>"
+  },
+  "extracted_facts": {
+    "name": "<string|null>",
+    "budget_cr": <number|null>,
+    "intent": "<investment|end_use|exploration|rental_yield|resale|null>",
+    "preferred_size_sft": <integer|null>,
+    "preferred_bhk": <number|null>,
+    "preferred_facing": "<dir|null>",
+    "family_size": <integer|null>,
+    "work_location": "<area|null>",
+    "timeline": "<3 months|6 months|1 year|2 years|null>",
+    "new_objection": "<short string of objection the customer JUST raised this turn, or null>",
+    "new_commitment": "<short string of commitment the customer JUST made this turn, or null>",
+    "preferred_language": "<english|hindi|hinglish|telugu|null>"
+  },
   "reply": "<the natural sales-person reply you'd send the customer>"
 }
+
+## doc_meta rules — CRITICAL FOR DELIVERY ACCURACY
+- When doc_to_send is "unit_plan", "floor_plan", or "price_sheet" (multi-slot doc types), you MUST populate the relevant subset of doc_meta.unit_size_sft / facing / tower so the dispatcher can look up the EXACT PDF.
+- If the customer hasn't been specific enough to pick a unique PDF, do NOT guess. Set doc_to_send=null and ASK them in reply ("Which unit size — 1695 or 1870? And east or west facing?").
+- NEVER name a size in reply that you didn't put in doc_meta.unit_size_sft. The system blocks sends where the verbal size doesn't match the doc_meta size.
+- For single-slot docs (brochure, master_plan, payment_structure, specifications, amenities), set all three doc_meta fields to null.
+
+## extracted_facts rules
+- Pull ONLY what the customer said in this conversation (USER_MESSAGE or CONVERSATION_HISTORY) — do not invent.
+- Use null when not known. Empty strings count as null.
+- new_objection / new_commitment ONLY capture something raised THIS turn (not historical).
+- preferred_language: set explicitly only when the customer asked to switch language (e.g. "Hindi me batao") — otherwise leave null.
 
 The "reply" field is the actual WhatsApp message that goes to the customer. It must follow ALL the rules above (persona, no URLs, no emojis, no markdown, English default, etc.).
 
 Example output:
-{"intent":"PRICE_QUERY","flags":["has_project","has_unit_size","hinglish_roman"],"project":"loft","doc_to_send":null,"reply":"The 1695 sft 3 BHK at Loft is 1.94 Cr all inclusive plus GST. Rental offer is currently active — book at 10L and earn around 84,750 per month till possession in December 2026, that's roughly 6.78 lakh back. Want me to send the brochure or block a site visit slot?"}
-
-If the customer asks for a document (e.g. brochure), set doc_to_send to the matching slug AND in your reply just confirm verbally ("Sending the Loft brochure now. Want me to also block a site visit?"). DO NOT paste any URL.
+{"intent":"PRICE_QUERY","flags":["has_project","has_unit_size","hinglish_roman"],"project":"loft","doc_to_send":null,"doc_meta":{"unit_size_sft":1695,"facing":null,"tower":null},"extracted_facts":{"name":null,"budget_cr":null,"intent":null,"preferred_size_sft":1695,"preferred_bhk":3,"preferred_facing":null,"family_size":null,"work_location":null,"timeline":null,"new_objection":null,"new_commitment":null,"preferred_language":null},"reply":"The 1695 sft 3 BHK at Loft is 1.94 Cr all inclusive plus GST. Rental offer is currently active — book at 10L and earn around 84,750 per month till possession in December 2026. Want me to send the brochure or block a site visit?"}
 
 OUTPUT: ONE LINE OF JSON. NO MARKDOWN. NO PREAMBLE. NO EXPLANATION.
 `.trim();
@@ -303,13 +349,41 @@ export interface GeminiCallOptions {
   maxOutputTokens?: number;
 }
 
+/** Strict doc_meta the v5 prompt emits alongside doc_to_send. */
+export interface GeminiDocMeta {
+  unit_size_sft: number | null;
+  facing: string | null;
+  tower: string | null;
+}
+
+/** Structured profile facts captured per turn — relay merges into user_profiles. */
+export interface GeminiExtractedFacts {
+  name?: string | null;
+  budget_cr?: number | null;
+  intent?: string | null;
+  preferred_size_sft?: number | null;
+  preferred_bhk?: number | null;
+  preferred_facing?: string | null;
+  family_size?: number | null;
+  work_location?: string | null;
+  timeline?: string | null;
+  new_objection?: string | null;
+  new_commitment?: string | null;
+  preferred_language?: string | null;
+}
+
 export interface GeminiStructuredReply {
   intent: string;
   flags: string[];
   project: string | null;
   docToSend: string | null;
+  docMeta: GeminiDocMeta;
+  extractedFacts: GeminiExtractedFacts;
   reply: string;
 }
+
+const EMPTY_DOC_META: GeminiDocMeta = { unit_size_sft: null, facing: null, tower: null };
+const EMPTY_FACTS: GeminiExtractedFacts = {};
 
 const VALID_INTENTS = [
   "PRICE_QUERY", "UNIT_QUERY", "FEATURE_QUERY", "DOCUMENT_REQUEST", "SITE_VISIT",
@@ -318,85 +392,91 @@ const VALID_INTENTS = [
   "SPAM", "GIBBERISH", "GENERAL",
 ];
 
-// ─── Kimi-as-Gemini-fallback helpers ─────────────────────────────────────
-// When Gemini returns empty / unparseable / Tier-3 deflection, we delegate
-// to Kimi for a quick humanlike reply so the customer doesn't get the
-// generic "Let me confirm that with the project team and revert in a bit"
-// boilerplate. This was the pre-existing failure mode on simple greetings
-// like "Hii" — Gemini 3 Pro's thinking budget burns most of maxOutputTokens
-// and the JSON never makes it out.
+// ─── Two-Gemini-call recovery (v5) ───────────────────────────────────────
+// Previous behaviour delegated to Kimi K2 when the primary Gemini call
+// returned empty / unparseable / Tier-3 deflection. Per the v5 design
+// decision we replaced Kimi with a SECOND call to Gemini using a cheaper /
+// faster model + tighter prompt focused only on producing valid JSON. This
+// keeps the LLM family consistent (no separate vendor reliability surface)
+// and avoids the Kimi-specific tooling for doc disambiguation.
 
 const TIER3_DEFLECTION = "Let me confirm that with the project team and revert in a bit.";
 
-/** Extract the inner content of a <TAG>...</TAG> block from the structured
- *  message. Returns "" if not found. */
-function extractBlock(structured: string, tag: string): string {
-  const re = new RegExp(`<${tag}>\\s*([\\s\\S]*?)\\s*</${tag}>`, "i");
-  const m = structured.match(re);
-  return m?.[1]?.trim() || "";
-}
+/** Stripped-down retry prompt used in the second Gemini call. The full
+ *  persona prompt occasionally burns the thinking budget; this minimal
+ *  version targets just the JSON shape so the parser can recover. */
+const GEMINI_RECOVERY_INSTRUCTION = `
+You are an internal recovery agent. The primary chatbot turn failed to produce valid JSON. You will be given the SAME wrapped input (CUSTOMER, USER_PROFILE, PROJECT_CONTEXT, CONVERSATION_HISTORY, USER_MESSAGE).
 
-/** Pull the customer's display name out of the <CUSTOMER> block. */
-function extractCustomerName(structured: string): string {
-  const block = extractBlock(structured, "CUSTOMER");
-  if (!block) return "";
-  const m = block.match(/Name:\s*(.+)/);
-  if (!m) return "";
-  const name = m[1].trim();
-  return name === "(not provided)" ? "" : name;
-}
+Output exactly ONE line of valid JSON with these keys: intent, flags, project, doc_to_send, doc_meta (with unit_size_sft/facing/tower), extracted_facts (with the v5 fields), reply.
 
-/** Pull the resolved project out of the <CUSTOMER> block. */
-function extractProject(structured: string): string {
-  const block = extractBlock(structured, "CUSTOMER");
-  if (!block) return "";
-  const m = block.match(/Currently asking about project:\s*(.+)/);
-  if (!m) return "";
-  const proj = m[1].trim();
-  return proj === "not specified" ? "" : proj;
-}
+Rules:
+- Persona is Anandita Reddy (ASBL Hyderabad RM). No bot tells, no markdown, no emojis, no URLs.
+- Reply must be a short humanlike WhatsApp message. If you cannot answer reliably, give a friendly humanlike deflection ("Honestly, give me a sec — let me confirm with the team") instead of inventing facts.
+- doc_to_send and doc_meta only when you're confident; otherwise null.
+- ONE LINE OF JSON. NO PREAMBLE.
+`.trim();
 
-/** Last N lines from the <CONVERSATION_HISTORY> block (most-recent already
- *  at the bottom in caller's format). */
-function extractConvSnippet(structured: string, n = 6): string {
-  const block = extractBlock(structured, "CONVERSATION_HISTORY");
-  if (!block || block === "no prior conversation") return "";
-  const lines = block.split("\n").filter((l) => l.trim());
-  return lines.slice(-n).join("\n");
-}
-
-/** Try to recover from a Gemini failure by asking Kimi for a FULL Gemini-shape
- *  reply (intent + flags + project + doc_to_send + reply). Returns the full
- *  parsed object on success, or null if Kimi also fails (caller then uses
- *  the original deflection boilerplate as last resort).
- *
- *  Why FULL replacement instead of just reply text:
- *    Real-world bug: customer sent "2035 unit plan", Gemini 503'd, our old
- *    fallback gave a text reply but doc_to_send stayed null → unit_plan
- *    dispatcher never fired → customer never got the PDF. By returning the
- *    full Gemini-shape, the rest of the webhook (dispatcher, doc delivery,
- *    Zoho intent stamping) just works as if Gemini had succeeded. */
-async function tryKimiFallbackFull(structuredUserMessage: string): Promise<GeminiStructuredReply | null> {
-  // Lazy import — avoids forcing kimi.ts to load when Gemini path is healthy.
-  const { kimiFullClassifyAndReply, kimiAvailable } = await import("./kimi");
-  if (!kimiAvailable()) return null;
+/** Second Gemini call as the v5 recovery path. Uses a minimal system
+ *  instruction (recovery-only, no full persona) so the thinking budget goes
+ *  toward emitting valid JSON rather than re-deriving the persona rules.
+ *  Returns the parsed structured reply on success, or null if even this
+ *  recovery call fails (caller then uses the safe Tier-3 deflection). */
+async function tryGeminiRecoveryFull(structuredUserMessage: string): Promise<GeminiStructuredReply | null> {
+  if (!GEMINI_API_KEY) return null;
 
   try {
-    const result = await kimiFullClassifyAndReply(structuredUserMessage);
-    if (!result) return null;
-    console.log(
-      `[Gemini→Kimi-full-fallback] Recovered — intent=${result.intent} ` +
-      `doc=${result.doc_to_send || "(none)"} replyLen=${result.reply.length}`,
-    );
-    return {
-      intent: result.intent,
-      flags: result.flags,
-      project: result.project,
-      docToSend: result.doc_to_send,
-      reply: result.reply,
+    const recoveryModel = process.env.GEMINI_RECOVERY_MODEL || GEMINI_MODEL;
+    const body: any = {
+      system_instruction: { parts: [{ text: GEMINI_RECOVERY_INSTRUCTION }] },
+      contents: [{ role: "user", parts: [{ text: structuredUserMessage }] }],
+      generationConfig: {
+        temperature: 0.4,    // lower than primary call — favour JSON validity
+        maxOutputTokens: 6000,
+        topP: 0.9,
+      },
     };
+
+    const TIMEOUT_MS = 20000;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+    let rawText = "";
+    try {
+      const r = await fetch(GEMINI_URL(recoveryModel), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      if (!r.ok) {
+        const errText = await r.text();
+        console.error(`[Gemini-recovery] HTTP ${r.status}: ${errText.slice(0, 200)}`);
+        return null;
+      }
+      const data = (await r.json()) as any;
+      const parts = data?.candidates?.[0]?.content?.parts || [];
+      rawText = parts.map((p: any) => (typeof p?.text === "string" ? p.text : "")).join("").trim();
+    } catch (err: any) {
+      clearTimeout(timer);
+      console.error(`[Gemini-recovery] threw: ${err.message}`);
+      return null;
+    }
+    if (!rawText) return null;
+
+    const parsed = parseStructuredOutput(rawText);
+    if (parsed.reply.startsWith("Let me confirm that with the project team")) {
+      // Recovery also fell into the deflection — give up so caller emits
+      // the safe deflection wording once instead of double-deflecting.
+      return null;
+    }
+    console.log(
+      `[Gemini-recovery] Succeeded — intent=${parsed.intent} ` +
+      `doc=${parsed.docToSend || "(none)"} replyLen=${parsed.reply.length}`,
+    );
+    return parsed;
   } catch (err: any) {
-    console.error(`[Gemini→Kimi-full-fallback] threw: ${err.message}`);
+    console.error(`[Gemini-recovery] outer threw: ${err.message}`);
     return null;
   }
 }
@@ -435,17 +515,19 @@ export async function callGemini(
   }
 
   if (!rawText || rawText.trim().length < 5) {
-    // Gemini gave us nothing — last-resort: full Kimi replacement.
-    // Crucially this preserves doc_to_send so the unit_plan dispatcher
-    // still fires when customer asks for a PDF and Gemini 503s.
-    console.warn("[Gemini] Empty rawText after retry; trying Kimi FULL replacement");
-    const kimiFull = await tryKimiFallbackFull(structuredUserMessage);
-    if (kimiFull) return kimiFull;
+    // Gemini primary call gave us nothing — last-resort: second Gemini call
+    // (v5 recovery). Preserves doc_to_send/doc_meta so the dispatcher still
+    // fires when customer asks for a PDF and the primary turn 503'd.
+    console.warn("[Gemini] Empty rawText after retry; trying recovery (2nd Gemini call)");
+    const recovered = await tryGeminiRecoveryFull(structuredUserMessage);
+    if (recovered) return recovered;
     return {
       intent: "GENERAL",
       flags: [],
       project: null,
       docToSend: null,
+      docMeta: { ...EMPTY_DOC_META },
+      extractedFacts: { ...EMPTY_FACTS },
       reply: TIER3_DEFLECTION,
     };
   }
@@ -469,13 +551,13 @@ export async function callGemini(
   }
 
   // If we still have the Tier-3 deflection at this point (Gemini truly
-  // failed parsing on both attempts), give Kimi the full classification
-  // job. This restores doc_to_send so unit-plan / brochure / etc.
-  // dispatch keeps working under Gemini outages.
+  // failed parsing on both attempts), trigger the second Gemini call with
+  // the recovery instruction. Restores doc_to_send/doc_meta so unit-plan /
+  // brochure / etc. dispatch keeps working under Gemini outages.
   if (parsed.reply.startsWith("Let me confirm that with the project team")) {
-    console.warn("[Gemini] Tier-3 deflection persisted; trying Kimi FULL replacement");
-    const kimiFull = await tryKimiFallbackFull(structuredUserMessage);
-    if (kimiFull) return kimiFull;
+    console.warn("[Gemini] Tier-3 deflection persisted; trying recovery (2nd Gemini call)");
+    const recovered = await tryGeminiRecoveryFull(structuredUserMessage);
+    if (recovered) return recovered;
   }
 
   return parsed;
@@ -604,10 +686,13 @@ function parseStructuredOutput(rawText: string): GeminiStructuredReply {
       docToSend = String(parsed.doc_to_send).toLowerCase();
     }
 
+    const docMeta = normalizeDocMeta(parsed.doc_meta);
+    const extractedFacts = normalizeExtractedFacts(parsed.extracted_facts);
+
     const reply = String(parsed.reply || "").trim();
     if (!reply) throw new Error("parsed reply is empty");
 
-    return { intent, flags, project, docToSend, reply };
+    return { intent, flags, project, docToSend, docMeta, extractedFacts, reply };
   } catch (err: any) {
     console.error(`[Gemini] JSON parse failed (${err.message}); attempting regex extraction`);
   }
@@ -644,6 +729,8 @@ function parseStructuredOutput(rawText: string): GeminiStructuredReply {
       flags: [],
       project: null,
       docToSend: null,
+      docMeta: { ...EMPTY_DOC_META },
+      extractedFacts: { ...EMPTY_FACTS },
       reply: replyText,
     };
   }
@@ -655,6 +742,92 @@ function parseStructuredOutput(rawText: string): GeminiStructuredReply {
     flags: [],
     project: null,
     docToSend: null,
+    docMeta: { ...EMPTY_DOC_META },
+    extractedFacts: { ...EMPTY_FACTS },
     reply: "Let me confirm that with the project team and revert in a bit.",
+  };
+}
+
+// ─── Normalisers for the new v5 fields ────────────────────────────────────
+
+const FACING_ENUM = new Set([
+  "east", "west", "north", "south",
+  "north_east", "north_west", "south_east", "south_west",
+]);
+
+function normalizeFacing(raw: any): string | null {
+  if (raw === null || raw === undefined) return null;
+  let s = String(raw).trim().toLowerCase();
+  if (!s || s === "null") return null;
+  // Accept "north-east", "north east", "NE" → canonical north_east
+  s = s.replace(/[\s-]+/g, "_");
+  if (s === "ne") s = "north_east";
+  if (s === "nw") s = "north_west";
+  if (s === "se") s = "south_east";
+  if (s === "sw") s = "south_west";
+  if (s === "n") s = "north";
+  if (s === "s") s = "south";
+  if (s === "e") s = "east";
+  if (s === "w") s = "west";
+  return FACING_ENUM.has(s) ? s : null;
+}
+
+function normalizeTower(raw: any): string | null {
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).trim();
+  if (!s || s.toLowerCase() === "null") return null;
+  // Canonical: strip leading "tower" / "tower-" and uppercase a single letter
+  let cleaned = s.replace(/^tower[\s-_]*/i, "").trim();
+  if (cleaned.length === 1) cleaned = cleaned.toUpperCase();
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+function normalizeUnitSize(raw: any): number | null {
+  if (raw === null || raw === undefined || raw === "null") return null;
+  const n = typeof raw === "number" ? raw : parseInt(String(raw).replace(/[^0-9]/g, ""), 10);
+  if (!isFinite(n) || n < 100 || n > 100000) return null;
+  return n;
+}
+
+function normalizeDocMeta(raw: any): GeminiDocMeta {
+  if (!raw || typeof raw !== "object") return { ...EMPTY_DOC_META };
+  return {
+    unit_size_sft: normalizeUnitSize(raw.unit_size_sft),
+    facing: normalizeFacing(raw.facing),
+    tower: normalizeTower(raw.tower),
+  };
+}
+
+function normalizeNullableString(raw: any): string | null {
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).trim();
+  if (!s || s.toLowerCase() === "null") return null;
+  return s;
+}
+
+function normalizeNullableNumber(raw: any): number | null {
+  if (raw === null || raw === undefined || raw === "null") return null;
+  const n = typeof raw === "number" ? raw : parseFloat(String(raw));
+  return isFinite(n) ? n : null;
+}
+
+function normalizeExtractedFacts(raw: any): GeminiExtractedFacts {
+  if (!raw || typeof raw !== "object") return {};
+  return {
+    name: normalizeNullableString(raw.name),
+    budget_cr: normalizeNullableNumber(raw.budget_cr),
+    intent: normalizeNullableString(raw.intent),
+    preferred_size_sft: normalizeUnitSize(raw.preferred_size_sft),
+    preferred_bhk: normalizeNullableNumber(raw.preferred_bhk),
+    preferred_facing: normalizeFacing(raw.preferred_facing),
+    family_size: (() => {
+      const n = normalizeNullableNumber(raw.family_size);
+      return n !== null ? Math.round(n) : null;
+    })(),
+    work_location: normalizeNullableString(raw.work_location),
+    timeline: normalizeNullableString(raw.timeline),
+    new_objection: normalizeNullableString(raw.new_objection),
+    new_commitment: normalizeNullableString(raw.new_commitment),
+    preferred_language: normalizeNullableString(raw.preferred_language),
   };
 }
