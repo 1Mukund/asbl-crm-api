@@ -1498,6 +1498,129 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── PRD v1.0 — migrate legacy leads to PRD_Stage / PRD_Status ──────────
+  // POST ?action=prd-migrate-legacy&secret=<INHOUSE_POSTHOOK_SECRET>&max=200&page=1
+  //   Reads each lead's original Lead_Status field and maps to PRD's
+  //   4-stage / 5-status model per user-confirmed mapping table.
+  //   Skips: Booked + Virtual Tour (no slot in new PRD).
+  //   Idempotent: leads already on PRD_Stage are skipped.
+  if (req.method === "POST" && req.query.action === "prd-migrate-legacy") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+      const max = Math.min(Number(req.query.max) || 200, 1000);
+      const startPage = Math.max(1, Number(req.query.page) || 1);
+
+      // Mapping per user-confirmed table (Q5 + Q6 clarifications).
+      // Returns null = skip (Booked / Virtual Tour / unknown).
+      const mapLegacy = (s: string | null | undefined): { stage: string; status: string | null; reason?: string } | null => {
+        const v = (s || "").trim();
+        if (!v) return { stage: "New Lead", status: "NA" };
+        const lower = v.toLowerCase();
+        if (["fresh", "na", "not called", "new"].includes(lower)) return { stage: "New Lead", status: "NA" };
+        if (lower === "cf") return { stage: "New Lead", status: "CF" };
+        if (lower === "sf") return { stage: "New Lead", status: "SF" };
+        if (["cb1", "callback", "customer requested"].includes(lower)) return { stage: "Lead Initiated", status: "CS" };
+        if (["cb2", "auto callback", "system scheduled"].includes(lower)) return { stage: "Lead Initiated", status: "SS" };
+        if (lower === "pre site") return { stage: "Pre Site Visit", status: "NA" };
+        if (lower === "lead initiated") return { stage: "New Lead", status: "SS" };
+        if (lower === "connected") return { stage: "New Lead", status: "SS" };
+        if (lower === "not interested") return { stage: "Not Interested", status: null, reason: "Not Interested" };
+        if (["closed", "unreachable", "no response"].includes(lower)) return { stage: "Not Interested", status: null, reason: "User Not Responding" };
+        if (["booked", "virtual tour"].includes(lower)) return null;  // SKIP
+        return null;  // unknown → skip
+      };
+
+      const errors: any[] = [];
+      let scanned = 0;
+      let migrated = 0;
+      let skippedAlreadyOnPrd = 0;
+      let skippedNoMapping = 0;
+      let skippedTerminal = 0;
+      let failed = 0;
+
+      let page = startPage;
+      while (scanned < max) {
+        const r = await fetch(
+          `${ZOHO_API_BASE}/Leads?` +
+          `fields=id,Lead_Status,PRD_Stage,PRD_Status&` +
+          `per_page=100&page=${page}&sort_by=Modified_Time&sort_order=desc`,
+          { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
+        );
+        if (r.status === 204) break;
+        if (!r.ok) {
+          errors.push({ page, status: r.status, error: (await r.text()).slice(0, 300) });
+          break;
+        }
+        const rawText = await r.text();
+        if (!rawText.trim()) break;
+        let data: any = null;
+        try { data = JSON.parse(rawText); } catch { break; }
+        const rows = (data?.data || []) as any[];
+        if (!rows.length) break;
+
+        for (const lead of rows) {
+          if (scanned >= max) break;
+          scanned++;
+          if (lead.PRD_Stage) { skippedAlreadyOnPrd++; continue; }
+          const mapped = mapLegacy(lead.Lead_Status);
+          if (!mapped) { skippedNoMapping++; continue; }
+
+          const now = new Date().toISOString().replace(/\.\d{3}Z$/, "+00:00");
+          const updateBody: any = {
+            id: lead.id,
+            PRD_Stage: mapped.stage,
+            PRD_Status: mapped.status,
+            PRD_Last_Action: "Manual",
+            PRD_Last_Action_Time: now,
+          };
+          if (mapped.reason) updateBody.Not_Interested_Reason = mapped.reason;
+
+          try {
+            const ur = await fetch(`${ZOHO_API_BASE}/Leads`, {
+              method: "PATCH",
+              headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+              body: JSON.stringify({ data: [updateBody] }),
+            });
+            if (!ur.ok) {
+              failed++;
+              errors.push({ lead_id: lead.id, status: ur.status, error: (await ur.text()).slice(0, 200) });
+            } else {
+              migrated++;
+              if (mapped.stage === "Not Interested") skippedTerminal++;
+            }
+          } catch (err: any) {
+            failed++;
+            errors.push({ lead_id: lead.id, error: err.message });
+          }
+        }
+
+        if (data?.info?.more_records !== true) break;
+        page++;
+      }
+
+      return res.status(200).json({
+        page_start: startPage,
+        page_end: page,
+        scanned,
+        migrated,
+        skipped_already_on_prd: skippedAlreadyOnPrd,
+        skipped_no_mapping: skippedNoMapping,
+        migrated_to_terminal: skippedTerminal,
+        failed,
+        errors: errors.slice(0, 10),
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── PRD v1.0 — overwrite Stage / Status picklist values ────────────────
   // GET ?action=prd-fix-stage-status&secret=<INHOUSE_POSTHOOK_SECRET>&dry=1
   //   Stage and Status existed pre-yesterday with old picklist values.

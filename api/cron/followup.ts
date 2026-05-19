@@ -180,12 +180,164 @@ async function sendMessage(phone: string, sender: string, message: string): Prom
 }
 
 
+// ─── PRD v1.0 cadence processor (runs every 15 min) ─────────────────────
+// Scans for leads where chatbot follow-up timer or SS call timer is due,
+// then routes through prd_orchestrator. Honours channel exhaustion per
+// user Option Y (both must exhaust before Not Interested).
+async function runPrdCadenceProcessor(): Promise<{
+  ms: number;
+  scanned: number;
+  chatbot_ticks: number;
+  ss_call_ticks: number;
+  no_reply_transitions: number;
+  exhaustion_closes: number;
+  errors: any[];
+}> {
+  const start = Date.now();
+  const errors: any[] = [];
+  let scanned = 0;
+  let chatbotTicks = 0;
+  let ssCallTicks = 0;
+  let noReplyTransitions = 0;
+  let exhaustionCloses = 0;
+
+  try {
+    const { getAccessToken } = await import("../_utils/zoho");
+    const {
+      handleChatbotFollowupTick,
+      handleSsCallTick,
+      handleChatbotNoReplyTimer,
+    } = await import("../_utils/prd_orchestrator");
+    const {
+      CFG,
+      bothChannelsExhausted,
+      chatbotExhausted,
+      ssCallExhausted,
+    } = await import("../_utils/prd_cadence");
+    const { onSsTreeExhausted } = await import("../_utils/prd_state_machine");
+
+    const token = await getAccessToken();
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString().replace(/\.\d{3}Z$/, "+00:00");
+
+    // Pull leads where PRD_Stage is non-terminal AND last action was over
+    // a window ago. Conservative: fetch most-recently-modified 100 leads
+    // with PRD_Stage set; filter in-memory. (Zoho search has limited
+    // negation support, so client-side filter is reliable.)
+    const r = await fetch(
+      `https://www.zohoapis.in/crm/v3/Leads?` +
+      `fields=id,First_Name,Last_Name,Mobile,Phone,ASBL_Project,` +
+      `PRD_Stage,PRD_Status,PRD_Last_Action_Time,PRD_Last_Action,` +
+      `Chatbot_Attempt_Count,Chatbot_Follow_up_Count,SS_Call_Attempt_Count,` +
+      `Site_Visit_Date,Last_Customer_Response,Intent_Captured,` +
+      `Last_Resubmission_At` +
+      `&per_page=100&sort_by=Modified_Time&sort_order=desc`,
+      { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
+    );
+    if (r.status === 204) {
+      return { ms: Date.now() - start, scanned: 0, chatbot_ticks: 0, ss_call_ticks: 0, no_reply_transitions: 0, exhaustion_closes: 0, errors: [] };
+    }
+    if (!r.ok) {
+      throw new Error(`Zoho list failed ${r.status}: ${(await r.text()).slice(0, 300)}`);
+    }
+    const text = await r.text();
+    let data: any = null;
+    if (text.trim()) { try { data = JSON.parse(text); } catch {} }
+    const leads = (data?.data || []) as any[];
+
+    for (const lead of leads) {
+      if (!lead.PRD_Stage) continue;            // not on PRD flow yet
+      if (lead.PRD_Stage === "Not Interested") continue;
+      if (lead.PRD_Stage === "Pre Site Visit") continue;  // reminder cron is separate concern
+
+      scanned++;
+      try {
+        const phone = String(lead.Phone || lead.Mobile || "").replace(/\D/g, "");
+        if (!phone) continue;
+        const fullName = [lead.First_Name, lead.Last_Name].filter(Boolean).join(" ").trim() || "Sir";
+
+        const lastActionTime = lead.PRD_Last_Action_Time
+          ? new Date(lead.PRD_Last_Action_Time).getTime()
+          : 0;
+
+        // 1. NA → SF transition: no reply for X hours, status still NA
+        if (lead.PRD_Status === "NA" && lastActionTime > 0 &&
+            now - lastActionTime >= CFG.CHATBOT_NO_REPLY_WINDOW_MS) {
+          await handleChatbotNoReplyTimer({ zoho_lead_id: lead.id, lead });
+          noReplyTransitions++;
+          continue;
+        }
+
+        // 2. Chatbot follow-up tick: SF state, due for next follow-up
+        if (lead.PRD_Status === "SF" && !chatbotExhausted(lead)) {
+          if (lastActionTime > 0 && now - lastActionTime >= CFG.CHATBOT_FOLLOWUP_INTERVAL_MS) {
+            await handleChatbotFollowupTick({
+              zoho_lead_id: lead.id,
+              lead,
+              phone,
+              customer_name: fullName,
+              project: lead.ASBL_Project,
+            });
+            chatbotTicks++;
+          }
+        }
+
+        // 3. SS call tick: SS state, due for next call attempt
+        if (lead.PRD_Status === "SS" && !ssCallExhausted(lead)) {
+          if (lastActionTime > 0 && now - lastActionTime >= CFG.SS_CALL_INTERVAL_MS) {
+            await handleSsCallTick({
+              zoho_lead_id: lead.id,
+              lead,
+              phone,
+              customer_name: fullName,
+              project: lead.ASBL_Project,
+            });
+            ssCallTicks++;
+          }
+        }
+
+        // 4. Both exhausted check (Option Y): close as User Not Responding
+        if (bothChannelsExhausted(lead)) {
+          await onSsTreeExhausted(lead.id, lead);
+          exhaustionCloses++;
+        }
+      } catch (err: any) {
+        errors.push({ lead_id: lead.id, error: err.message });
+      }
+    }
+  } catch (err: any) {
+    errors.push({ stage: "prd_cadence_processor", error: err.message });
+  }
+
+  return {
+    ms: Date.now() - start,
+    scanned,
+    chatbot_ticks: chatbotTicks,
+    ss_call_ticks: ssCallTicks,
+    no_reply_transitions: noReplyTransitions,
+    exhaustion_closes: exhaustionCloses,
+    errors: errors.slice(0, 10),
+  };
+}
+
 // ── Main Handler ──────────────────────────────────────────────────────────────
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // Security: only allow Vercel cron or internal calls
   const authHeader = req.headers.authorization;
   if (authHeader !== `Bearer ${process.env.CRON_SECRET}` && req.method !== "GET") {
     return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  // ── PRD v1.0 cadence processor (every 15 min) ────────────────────────────
+  if (req.query.task === "prd-cadence") {
+    try {
+      const result = await runPrdCadenceProcessor();
+      await logCronRun("prd-cadence", result.ms, result, result.errors.length ? `${result.errors.length} errors` : null);
+      return res.status(200).json({ task: "prd-cadence", ...result });
+    } catch (err: any) {
+      console.error("[PRD Cadence Cron] Fatal:", err.message);
+      return res.status(500).json({ error: err.message });
+    }
   }
 
   // ── Meta lead backfill safety-net (runs every 15 min) ────────────────────

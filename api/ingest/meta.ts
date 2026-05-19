@@ -165,6 +165,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             }
 
             const result = await ingestLead(lead);
+
+            // PRD v1.0: T=0 fanout — fire chatbot + AI call simultaneously
+            // only for fresh creates (not resubmissions; resubmission has
+            // its own outreach cooldown via api/_utils/resubmission.ts).
+            if (result.action === "created") {
+              try {
+                const { handleLeadCreated } = await import("../_utils/prd_orchestrator");
+                handleLeadCreated({
+                  zoho_lead_id: result.zoho_lead_id,
+                  phone: lead.mobile,
+                  customer_name: `${lead.first_name} ${lead.last_name}`.replace(/\s+\.$/, "").trim() || "there",
+                  project: lead.project,
+                  is_resubmission: false,
+                  last_page_visited: lead.last_page_visited,
+                  budget: lead.budget,
+                  size_preference: lead.size_preference,
+                }).catch((err) => console.error(`[Meta→PRD] handleLeadCreated failed: ${err.message}`));
+              } catch (err: any) {
+                console.error(`[Meta→PRD] orchestrator import failed: ${err.message}`);
+              }
+            }
+
             results.push({ leadgen_id: leadgenId, form_id: formId, ...result });
           } catch (err: any) {
             console.error(`Error processing leadgen_id ${leadgenId}:`, err.message);

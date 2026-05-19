@@ -249,6 +249,38 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       );
     }
 
+    // ── 3b. PRD v1.0 state machine — route to handleCallPosthook ────────
+    // Map Call_Status → PRD outcome (CRITICAL: call answer NEVER → CF
+    // status per PRD section 8.3 + section 12 guardrail).
+    try {
+      const { handleCallPosthook } = await import("../_utils/prd_orchestrator");
+      const prdOutcome =
+        callStatus === "Connected"           ? "answered_intent_no_time" :  // default for connected w/o other signal
+        callStatus === "Pre Site"            ? "answered_wants_site_visit" :
+        callStatus === "Virtual Tour"        ? "answered_wants_site_visit" :
+        callStatus === "Not Interested"      ? "answered_not_interested" :
+        "not_answered";
+      // Override if voice-bot's extracted slots tell us a clearer outcome
+      const extracted = (body.extracted_slots || {}) as any;
+      let finalOutcome = prdOutcome;
+      const details: any = {};
+      if (extracted.preferred_callback_time) {
+        finalOutcome = "answered_gave_time";
+        details.preferredTime = extracted.preferred_callback_time;
+      } else if (extracted.site_visit_requested?.date) {
+        finalOutcome = "answered_wants_site_visit";
+        details.visitDate = extracted.site_visit_requested.date;
+      }
+      handleCallPosthook({
+        zoho_lead_id: lead.id,
+        lead,
+        outcome: finalOutcome as any,
+        details,
+      }).catch((err) => console.error(`[InHouse Posthook → PRD] failed: ${err.message}`));
+    } catch (err: any) {
+      console.error(`[InHouse Posthook → PRD] orchestrator import failed: ${err.message}`);
+    }
+
     // ── 4. Call log + Note ────────────────────────────────────────────────
     // IMPORTANT: must AWAIT in Vercel serverless — fire-and-forget kills the
     // outbound HTTP requests when the handler returns. (Earlier version had

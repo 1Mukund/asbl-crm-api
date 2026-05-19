@@ -760,6 +760,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const zohoToken = zohoResult.token;
     const leadDetails: LeadDetails | null = zohoResult.lead;
 
+    // PRD v1.0: every customer reply moves status to CF + global override
+    // detection (site visit / not interested). Fire-and-forget so the
+    // chatbot reply pipeline below is never blocked by state update.
+    if (leadDetails) {
+      try {
+        const { handleChatbotReply } = await import("../_utils/prd_orchestrator");
+        handleChatbotReply({
+          zoho_lead_id: leadDetails.id,
+          lead: leadDetails,
+          customer_message: message,
+        }).catch((err) => console.error(`[PRD] handleChatbotReply failed: ${err.message}`));
+      } catch (err: any) {
+        console.error(`[PRD] orchestrator import failed: ${err.message}`);
+      }
+    }
+
     // 3. Resolve project (regex on message > Zoho field > last asked).
     //    Gemini may also identify the project itself from its output;
     //    we'll override below if Gemini's project hint is more specific.
