@@ -1708,6 +1708,83 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   // ─── ASBL Loft spec — create ALL custom fields per Section 9 ──────────
+  // ─── PRD v1.0 cleanup: delete all old "ASBL Loft Spec —" fields ─────────
+  // GET ?action=prd-cleanup-old-fields&secret=<INHOUSE_POSTHOOK_SECRET>&dry=1
+  //   Lists or deletes every Leads-module custom field whose label starts
+  //   with "ASBL Loft Spec —" (created by yesterday's spec implementation).
+  //   PRD v1.0 replaces all of those with a simpler 13-field schema.
+  //   dry=1  → list only (preview)
+  //   no dry → actually delete (irreversible — all data on those fields lost)
+  if (req.method === "GET" && req.query.action === "prd-cleanup-old-fields") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    const dryRun = String(req.query.dry || "") === "1";
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+
+      const fr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+        headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      });
+      if (!fr.ok) {
+        return res.status(fr.status).json({ error: "field-list failed", body: (await fr.text()).slice(0, 500) });
+      }
+      const fj = (await fr.json()) as any;
+      const allFields = (fj?.fields || []) as any[];
+
+      // Match by label prefix — that's how we created them yesterday
+      const toDelete = allFields.filter((f) =>
+        typeof f.field_label === "string" && f.field_label.startsWith("ASBL Loft Spec —"),
+      );
+
+      if (dryRun) {
+        return res.status(200).json({
+          dry_run: true,
+          would_delete_count: toDelete.length,
+          would_delete: toDelete.map((f) => ({ id: f.id, api_name: f.api_name, label: f.field_label, data_type: f.data_type })),
+        });
+      }
+
+      // Actually delete — one by one for clean per-field error reporting.
+      const results: any[] = [];
+      for (const f of toDelete) {
+        try {
+          const dr = await fetch(`${ZOHO_API_BASE}/settings/fields/${f.id}?module=Leads`, {
+            method: "DELETE",
+            headers: { Authorization: `Zoho-oauthtoken ${token}` },
+          });
+          const j = await dr.json().catch(() => ({}));
+          results.push({
+            id: f.id,
+            api_name: f.api_name,
+            http_status: dr.status,
+            success: dr.status >= 200 && dr.status < 300,
+            response: dr.status >= 200 && dr.status < 300 ? "deleted" : j,
+          });
+        } catch (err: any) {
+          results.push({ id: f.id, api_name: f.api_name, success: false, response: { error: err.message } });
+        }
+      }
+
+      const deleted = results.filter((r) => r.success).map((r) => r.api_name);
+      const failed = results.filter((r) => !r.success);
+
+      return res.status(200).json({
+        total_matched: toDelete.length,
+        deleted_count: deleted.length,
+        failed_count: failed.length,
+        deleted,
+        failed,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // GET ?action=asbl-spec-create-fields&secret=<INHOUSE_POSTHOOK_SECRET>
   //   One-shot creation of every custom field the spec requires that
   //   doesn't yet exist on Zoho Leads. Idempotent — skips existing
