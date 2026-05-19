@@ -1564,7 +1564,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const newPicks = t.new_values.map((v) => ({ display_value: v, actual_value: v }));
         const body = { fields: [{ pick_list_values: newPicks }] };
         const ur = await fetch(`${ZOHO_API_BASE}/settings/fields/${t.field.id}?module=Leads`, {
-          method: "PUT",
+          method: "PATCH",
           headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
