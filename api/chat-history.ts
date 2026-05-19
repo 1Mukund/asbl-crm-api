@@ -229,7 +229,7 @@ async function renderDashboard(): Promise<string> {
     sb(`whatsapp_messages?created_at=gte.${since24h}&select=phone,direction,message,project,intent,sender,created_at&order=created_at.desc&limit=300`),
     sb(`whatsapp_messages?created_at=gte.${since24h}&direction=eq.inbound&intent=not.is.null&select=intent,project`),
     sb(`cron_log?select=task,ran_at,duration_ms,result,error&order=ran_at.desc&limit=20`),
-    sb(`project_documents?select=id,project,doc_type,size_label,filename,url,fetched_at&order=fetched_at.desc&limit=200`),
+    sb(`project_documents?select=id,project,doc_type,size_label,unit_size_sft,facing,tower,filename,url,fetched_at&order=fetched_at.desc&limit=200`),
     getAllInventoryRows().catch((err: any) => {
       console.error("[Dashboard] Inventory fetch failed:", err.message);
       return { rows: [], fetchedAt: 0 };
@@ -487,26 +487,57 @@ async function renderDashboard(): Promise<string> {
       docType === "floor_plan"  ? "Tower" :
       docType === "price_sheet" ? "Config" :
       "Size";
-    const list = items.map((p) => `<tr>
-      <td>${esc(p.size_label || "—")}</td>
-      <td><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.filename || "open")}</a></td>
-      <td>
-        <form method="POST" action="?action=delete-doc&id=${esc(p.id)}" style="display:inline" onsubmit="return confirm('Delete ${esc(title)} ${esc(p.size_label || '')} for ${esc(project)}?')">
-          <button type="submit" class="btn-delete">delete</button>
-        </form>
-      </td>
-    </tr>`).join("");
+    // Render the strict columns alongside the legacy size_label so the
+    // operator can see at a glance whether a row will be findable via the
+    // v5 strict lookup. A "—" in any strict column means the bot won't
+    // match it; the row needs editing or backfill.
+    const list = items.map((p) => {
+      const strictParts: string[] = [];
+      if (p.unit_size_sft) strictParts.push(`${p.unit_size_sft} sft`);
+      if (p.facing) strictParts.push(String(p.facing));
+      if (p.tower) strictParts.push(`Tower ${p.tower}`);
+      const strictTag = strictParts.length
+        ? `<span style="color:#1a7f37">${esc(strictParts.join(" · "))}</span>`
+        : `<span style="color:#a00">— missing —</span>`;
+      return `<tr>
+        <td>${esc(p.size_label || "—")}</td>
+        <td>${strictTag}</td>
+        <td><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.filename || "open")}</a></td>
+        <td>
+          <form method="POST" action="?action=delete-doc&id=${esc(p.id)}" style="display:inline" onsubmit="return confirm('Delete ${esc(title)} ${esc(p.size_label || '')} for ${esc(project)}?')">
+            <button type="submit" class="btn-delete">delete</button>
+          </form>
+        </td>
+      </tr>`;
+    }).join("");
+
+    // v5 strict inputs — these are what the bot's doc_meta matches against.
+    // For unit_plan: all three matter. For floor_plan: usually just tower
+    // (and optionally size + facing if you keep per-unit floor plans). For
+    // price_sheet: config is freeform so the strict columns are optional.
+    const wantsSize   = docType === "unit_plan";
+    const wantsFacing = docType === "unit_plan";
+    const wantsTower  = docType === "unit_plan" || docType === "floor_plan";
+
+    const facingOptions = [
+      "", "east", "west", "north", "south",
+      "north_east", "north_west", "south_east", "south_west",
+    ].map((v) => `<option value="${esc(v)}">${v ? esc(v) : "— facing —"}</option>`).join("");
 
     return `<div class="unit-plans">
       <div class="doc-slot-label">${esc(title)} <span class="${items.length ? "ok" : "missing"}">${items.length ? "●" : "○"}</span> <span style="color:#888;font-weight:normal">(${items.length})</span></div>
       ${items.length ? `<table class="unit-table">
-        <tr><th>${esc(labelHeader)} label</th><th>File</th><th></th></tr>
+        <tr><th>${esc(labelHeader)} label (legacy)</th><th>Strict lookup keys</th><th>File</th><th></th></tr>
         ${list}
       </table>` : `<div class="empty-inline">no ${esc(title.toLowerCase())} uploaded yet</div>`}
-      <div class="add-unit-row">
-        <input type="text" id="multi-${esc(project)}-${esc(docType)}" placeholder="${esc(placeholder)}" class="size-input" />
+      <div class="add-unit-row" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:8px">
+        <input type="text" id="multi-${esc(project)}-${esc(docType)}" placeholder="${esc(placeholder)}" class="size-input" style="min-width:180px" />
+        ${wantsSize ? `<input type="number" id="multi-${esc(project)}-${esc(docType)}-size" placeholder="size sft (e.g. 1695)" min="100" max="100000" class="size-input" style="width:160px" />` : ""}
+        ${wantsFacing ? `<select id="multi-${esc(project)}-${esc(docType)}-facing" class="size-input" style="width:140px">${facingOptions}</select>` : ""}
+        ${wantsTower ? `<input type="text" id="multi-${esc(project)}-${esc(docType)}-tower" placeholder="tower (e.g. A)" class="size-input" style="width:100px" />` : ""}
         <button type="button" class="btn-upload" onclick="pickMulti('${esc(project)}', '${esc(docType)}', '${esc(title)}')">+ Add ${esc(title.toLowerCase().slice(0, -1))} PDF</button>
       </div>
+      ${(wantsSize || wantsFacing || wantsTower) ? `<div class="proj-help" style="font-size:11px;margin-top:4px">Strict fields are what the v5 bot matches on. The legacy label is kept for the storage filename.</div>` : ""}
     </div>`;
   };
 
@@ -668,7 +699,11 @@ ${SHARED_STYLE}
     </div>
     <div style="font-size:13px;color:var(--text-soft);line-height:1.5">
       <strong>Backfill existing PDFs</strong> — if you uploaded PDFs before this feature existed, they don't have text extracts yet. Run the backfill once to extract all of them:
-      <pre style="background:var(--surface-muted);padding:10px;border-radius:6px;font-size:12px;overflow:auto;margin-top:8px">curl -X POST "https://asbl-crm-api.vercel.app/api/chat-history?action=backfill-pdf-extracts&secret=&lt;INHOUSE_POSTHOOK_SECRET&gt;"</pre>
+      <pre style="background:var(--surface-muted);padding:10px;border-radius:6px;font-size:12px;overflow:auto;margin-top:8px">curl -X POST "https://asbl-crm-api.vercel.app/api/chat-history?action=backfill-pdf-extracts&secret=&lt;INHOUSE_POSTHOOK_SECRET&gt;"
+
+# v5 strict-meta backfill — parses existing size_label to fill unit_size_sft/facing/tower
+# Preview (no writes): &dry=1   |   Filter: &doc_type=unit_plan  &project=LOFT
+curl "https://asbl-crm-api.vercel.app/api/chat-history?action=backfill-doc-meta&secret=&lt;INHOUSE_POSTHOOK_SECRET&gt;&dry=1"</pre>
     </div>
   </div>
 
@@ -698,12 +733,40 @@ function pickFile(project, docType, sizeLabel, label) {
 function pickMulti(project, docType, title) {
   const input = document.getElementById('multi-' + project + '-' + docType);
   const sizeLabel = (input?.value || '').trim();
+  // v5 strict fields (optional; null if the input doesn't exist for this doc_type)
+  const sizeEl = document.getElementById('multi-' + project + '-' + docType + '-size');
+  const facingEl = document.getElementById('multi-' + project + '-' + docType + '-facing');
+  const towerEl = document.getElementById('multi-' + project + '-' + docType + '-tower');
+  const unitSizeSft = sizeEl ? parseInt(sizeEl.value, 10) : NaN;
+  const facing = facingEl ? facingEl.value.trim() : '';
+  const tower = towerEl ? towerEl.value.trim() : '';
+
+  // unit_plan REQUIRES the strict fields so the bot can match doc_meta exactly.
+  if (docType === 'unit_plan') {
+    if (!isFinite(unitSizeSft) || unitSizeSft < 100) {
+      alert('Unit Plan: enter "size sft" (integer, e.g. 1695)');
+      sizeEl?.focus();
+      return;
+    }
+    if (!facing) {
+      alert('Unit Plan: pick a facing (east, west, etc.)');
+      facingEl?.focus();
+      return;
+    }
+  }
   if (!sizeLabel) {
     alert('Enter a label first (e.g. "Tower A" for floor plans, "1695 East" for unit plans)');
     input?.focus();
     return;
   }
-  _ctx = { kind: 'multi', project, docType, sizeLabel, label: title + ' ' + sizeLabel };
+
+  _ctx = {
+    kind: 'multi', project, docType, sizeLabel,
+    label: title + ' ' + sizeLabel,
+    unit_size_sft: isFinite(unitSizeSft) ? unitSizeSft : null,
+    facing: facing || null,
+    tower: tower || null,
+  };
   _fileInput.accept = '.pdf,application/pdf';
   _fileInput.value = '';
   _fileInput.click();
@@ -723,6 +786,9 @@ async function uploadFile(ctx, file, btn) {
     if (!isKb) {
       signReq.doc_type = ctx.docType;
       if (ctx.sizeLabel) signReq.size_label = ctx.sizeLabel;
+      if (ctx.unit_size_sft !== undefined) signReq.unit_size_sft = ctx.unit_size_sft;
+      if (ctx.facing !== undefined) signReq.facing = ctx.facing;
+      if (ctx.tower !== undefined) signReq.tower = ctx.tower;
     }
     const signRes = await fetch('?action=upload-sign', {
       method: 'POST',
@@ -753,6 +819,9 @@ async function uploadFile(ctx, file, btn) {
     if (!isKb) {
       finReq.doc_type = ctx.docType;
       if (ctx.sizeLabel) finReq.size_label = ctx.sizeLabel;
+      if (ctx.unit_size_sft !== undefined) finReq.unit_size_sft = ctx.unit_size_sft;
+      if (ctx.facing !== undefined) finReq.facing = ctx.facing;
+      if (ctx.tower !== undefined) finReq.tower = ctx.tower;
     }
     const finRes = await fetch('?action=upload-finalize', {
       method: 'POST',
@@ -3579,6 +3648,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const filename = String(body.filename || "upload");
       const sizeLabel = body.size_label ? String(body.size_label) : null;
 
+      // v5 strict-meta fields — validate shape so the upload-finalize step
+      // can persist them without re-doing validation.
+      const unitSizeSftRaw = body.unit_size_sft;
+      const facingRaw = body.facing ? String(body.facing).toLowerCase() : null;
+      const towerRaw = body.tower ? String(body.tower).trim() : null;
+
       if (!KNOWN_PROJECTS.includes(project as any)) {
         return res.status(400).json({ error: `Unknown project: ${project}` });
       }
@@ -3588,6 +3663,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         // Multi-slot doc types need a label so the bot can pick the right one
         if ((docType === "unit_plan" || docType === "floor_plan") && !sizeLabel) {
           return res.status(400).json({ error: `size_label required for ${docType} (e.g. "Tower A" / "1695 East")` });
+        }
+        // unit_plan also requires strict size_sft + facing so v5 doc_meta matches
+        if (docType === "unit_plan") {
+          const n = typeof unitSizeSftRaw === "number" ? unitSizeSftRaw : parseInt(String(unitSizeSftRaw), 10);
+          if (!isFinite(n) || n < 100 || n > 100000) {
+            return res.status(400).json({ error: `unit_plan: unit_size_sft (integer 100-100000) required for v5 strict lookup` });
+          }
+          const VALID_FACING = ["east", "west", "north", "south", "north_east", "north_west", "south_east", "south_west"];
+          if (!facingRaw || !VALID_FACING.includes(facingRaw)) {
+            return res.status(400).json({ error: `unit_plan: facing required (${VALID_FACING.join(", ")})` });
+          }
         }
       }
 
@@ -3657,8 +3743,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         console.warn(`[upload-finalize] PDF text extract failed: ${err.message}`);
       }
 
+      // v5 strict-meta — persist whatever the form supplied. Validation
+      // already happened in upload-sign so we just coerce types here.
+      const unitSizeSftRaw = body.unit_size_sft;
+      const unitSizeSft =
+        typeof unitSizeSftRaw === "number"
+          ? unitSizeSftRaw
+          : (unitSizeSftRaw != null && unitSizeSftRaw !== ""
+              ? parseInt(String(unitSizeSftRaw), 10)
+              : null);
+      const facingRaw = body.facing ? String(body.facing).toLowerCase().trim() : null;
+      const towerRaw = body.tower ? String(body.tower).trim() : null;
+
       const insertBody: any = { project, doc_type: docType, filename, url: publicUrl };
       if (sizeLabel) insertBody.size_label = sizeLabel;
+      if (unitSizeSft != null && isFinite(unitSizeSft) && unitSizeSft >= 100) {
+        insertBody.unit_size_sft = unitSizeSft;
+      }
+      if (facingRaw) insertBody.facing = facingRaw;
+      if (towerRaw) insertBody.tower = towerRaw;
       if (textExtract) {
         // Cap each PDF's extract at 8000 chars so even 8 doc types per project
         // stay under Gemini's effective input budget when bundled into context.
@@ -3790,6 +3893,166 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
       }
       return res.status(200).json({ processed: results.length, results });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── Backfill v5 strict columns from existing size_label text ──────────
+  // GET/POST ?action=backfill-doc-meta&secret=<INHOUSE_POSTHOOK_SECRET>[&dry=1][&doc_type=unit_plan][&project=LOFT]
+  //
+  // For every project_documents row where (unit_size_sft / facing / tower)
+  // are NULL but size_label contains parseable hints (e.g. "1695 East",
+  // "Tower A 3BHK", "1870 west facing"), populate the strict cols. The v5
+  // bot's doc_meta lookup is equality-only, so without this older rows
+  // become invisible to it.
+  //
+  // Pass &dry=1 to preview without writing. The response includes per-row
+  // outcome so you can audit which rows still need manual cleanup.
+  if (req.query.action === "backfill-doc-meta") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    const dry = req.query.dry === "1" || req.query.dry === "true";
+    const docTypeFilter = String(req.query.doc_type || "").toLowerCase();
+    const projectFilter = String(req.query.project || "").toUpperCase();
+
+    try {
+      // Pull rows that are CANDIDATES for backfill:
+      //   - at least one of (unit_size_sft, facing, tower) is null
+      //   - size_label is not empty
+      // Postgrest doesn't have an OR-of-is.null elegantly, so we just fetch
+      // size_label-bearing rows and filter in-app — volume is manageable
+      // (a few hundred rows max in production).
+      const params: string[] = [
+        `size_label=not.is.null`,
+        `select=id,project,doc_type,size_label,unit_size_sft,facing,tower,filename`,
+        `order=fetched_at.desc`,
+        `limit=2000`,
+      ];
+      if (docTypeFilter) params.push(`doc_type=eq.${encodeURIComponent(docTypeFilter)}`);
+      if (projectFilter) params.push(`project=eq.${encodeURIComponent(projectFilter)}`);
+
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/project_documents?${params.join("&")}`,
+        { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+      );
+      if (!r.ok) {
+        const t = await r.text();
+        return res.status(500).json({ error: `fetch failed ${r.status}: ${t.slice(0, 200)}` });
+      }
+      const rows = (await r.json()) as Array<any>;
+
+      const VALID_FACING = new Set([
+        "east", "west", "north", "south",
+        "north_east", "north_west", "south_east", "south_west",
+      ]);
+
+      // ── Parsers ────────────────────────────────────────────────────────
+      const parseUnitSize = (text: string): number | null => {
+        const m = text.match(/\b(\d{3,5})\s*(?:sft|sqft|sq\.?\s*ft)?\b/i);
+        if (!m) return null;
+        const n = parseInt(m[1], 10);
+        return n >= 300 && n <= 10000 ? n : null;
+      };
+      const parseFacing = (text: string): string | null => {
+        const t = text.toLowerCase();
+        // Compound first to avoid double-matches
+        if (/\b(north[\s_-]?east|ne[\s\b])/i.test(t)) return "north_east";
+        if (/\b(north[\s_-]?west|nw[\s\b])/i.test(t)) return "north_west";
+        if (/\b(south[\s_-]?east|se[\s\b])/i.test(t)) return "south_east";
+        if (/\b(south[\s_-]?west|sw[\s\b])/i.test(t)) return "south_west";
+        if (/\beast\b/i.test(t)) return "east";
+        if (/\bwest\b/i.test(t)) return "west";
+        if (/\bnorth\b/i.test(t)) return "north";
+        if (/\bsouth\b/i.test(t)) return "south";
+        return null;
+      };
+      const parseTower = (text: string): string | null => {
+        // "Tower A" / "Tower-B" / "Tower 1" / standalone "A" only if size_label is JUST a single token like "Tower A"
+        const m = text.match(/\btower[\s_-]*([A-Za-z0-9]+)\b/i);
+        if (m) return m[1].length === 1 ? m[1].toUpperCase() : m[1];
+        return null;
+      };
+
+      const results: any[] = [];
+      let updated = 0;
+      let skipped = 0;
+      let alreadyOk = 0;
+
+      for (const row of rows) {
+        const haystack = String(row.size_label || "") + " " + String(row.filename || "");
+        const parsedSize = row.unit_size_sft ?? parseUnitSize(haystack);
+        const parsedFacingRaw = row.facing ?? parseFacing(haystack);
+        const parsedFacing = parsedFacingRaw && VALID_FACING.has(String(parsedFacingRaw).toLowerCase())
+          ? String(parsedFacingRaw).toLowerCase()
+          : null;
+        const parsedTower = row.tower ?? parseTower(haystack);
+
+        const delta: any = {};
+        if (!row.unit_size_sft && parsedSize) delta.unit_size_sft = parsedSize;
+        if (!row.facing && parsedFacing) delta.facing = parsedFacing;
+        if (!row.tower && parsedTower) delta.tower = parsedTower;
+
+        if (Object.keys(delta).length === 0) {
+          if (row.unit_size_sft || row.facing || row.tower) {
+            alreadyOk++;
+            continue;
+          }
+          skipped++;
+          results.push({
+            id: row.id, project: row.project, doc_type: row.doc_type,
+            size_label: row.size_label, skipped: "no parseable hints",
+          });
+          continue;
+        }
+
+        if (dry) {
+          results.push({
+            id: row.id, project: row.project, doc_type: row.doc_type,
+            size_label: row.size_label, would_update: delta,
+          });
+          updated++;
+          continue;
+        }
+
+        try {
+          const upd = await fetch(`${SUPABASE_URL}/rest/v1/project_documents?id=eq.${row.id}`, {
+            method: "PATCH",
+            headers: {
+              apikey: SUPABASE_KEY,
+              Authorization: `Bearer ${SUPABASE_KEY}`,
+              "Content-Type": "application/json",
+              Prefer: "return=minimal",
+            },
+            body: JSON.stringify(delta),
+          });
+          if (upd.ok) {
+            updated++;
+            results.push({ id: row.id, project: row.project, doc_type: row.doc_type, updated: delta });
+          } else {
+            results.push({ id: row.id, error: `PATCH ${upd.status}: ${(await upd.text()).slice(0, 200)}` });
+          }
+        } catch (err: any) {
+          results.push({ id: row.id, error: err.message });
+        }
+      }
+
+      return res.status(200).json({
+        dry,
+        scanned: rows.length,
+        already_ok: alreadyOk,
+        updated,
+        skipped,
+        filter: {
+          doc_type: docTypeFilter || "(all)",
+          project: projectFilter || "(all)",
+        },
+        results: results.slice(0, 200),  // cap response size
+        truncated_to: results.length > 200 ? 200 : null,
+      });
     } catch (err: any) {
       return res.status(500).json({ error: err.message });
     }
