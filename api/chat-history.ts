@@ -1498,9 +1498,124 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── PRD v1.0 — create the 13 required Zoho fields ──────────────────────
+  // GET ?action=prd-create-fields&secret=<INHOUSE_POSTHOOK_SECRET>
+  //   Creates the 13 custom fields per PRD section 11. Each field has a
+  //   primary label (matching PRD exactly) and a "PRD <X>" fallback label
+  //   used when the primary clashes with existing Zoho fields (e.g. plain
+  //   "Status" is reserved). Idempotent — skips if api_name already exists.
+  if (req.method === "GET" && req.query.action === "prd-create-fields") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+
+      const fr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+        headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      });
+      if (!fr.ok) {
+        return res.status(fr.status).json({ error: "field-list failed", body: (await fr.text()).slice(0, 500) });
+      }
+      const fj = (await fr.json()) as any;
+      const existing = (fj?.fields || []) as any[];
+      const existingApis = new Set(existing.map((f) => f.api_name));
+      const existingLabels = new Set(existing.map((f) => f.field_label));
+
+      const pickList = (values: string[]) =>
+        values.map((v) => ({ display_value: v, actual_value: v }));
+
+      const desired = [
+        { primary_api: "Stage",                    fallback_api: "PRD_Stage",                    primary_label: "Stage",                   fallback_label: "PRD Stage",                   spec_base: { data_type: "picklist", pick_list_values: pickList(["New Lead", "Lead Initiated", "Pre Site Visit", "Not Interested"]) } },
+        { primary_api: "Status",                   fallback_api: "PRD_Status",                   primary_label: "Status",                  fallback_label: "PRD Status",                  spec_base: { data_type: "picklist", pick_list_values: pickList(["NA", "CF", "SF", "CS", "SS"]) } },
+        { primary_api: "Preferred_Call_Time",      fallback_api: "PRD_Preferred_Call_Time",      primary_label: "Preferred Call Time",     fallback_label: "PRD Preferred Call Time",     spec_base: { data_type: "datetime" } },
+        { primary_api: "System_Call_Time",         fallback_api: "PRD_System_Call_Time",         primary_label: "System Call Time",        fallback_label: "PRD System Call Time",        spec_base: { data_type: "datetime" } },
+        { primary_api: "Chatbot_Attempt_Count",    fallback_api: "PRD_Chatbot_Attempt_Count",    primary_label: "Chatbot Attempt Count",   fallback_label: "PRD Chatbot Attempt Count",   spec_base: { data_type: "integer" } },
+        { primary_api: "Chatbot_Follow_up_Count",  fallback_api: "PRD_Chatbot_Follow_up_Count",  primary_label: "Chatbot Follow-up Count", fallback_label: "PRD Chatbot Follow-up Count", spec_base: { data_type: "integer" } },
+        { primary_api: "SS_Call_Attempt_Count",    fallback_api: "PRD_SS_Call_Attempt_Count",    primary_label: "SS Call Attempt Count",   fallback_label: "PRD SS Call Attempt Count",   spec_base: { data_type: "integer" } },
+        { primary_api: "Last_Action",              fallback_api: "PRD_Last_Action",              primary_label: "Last Action",             fallback_label: "PRD Last Action",             spec_base: { data_type: "picklist", pick_list_values: pickList(["Chatbot", "AI Call", "Manual"]) } },
+        { primary_api: "Last_Action_Time",         fallback_api: "PRD_Last_Action_Time",         primary_label: "Last Action Time",        fallback_label: "PRD Last Action Time",        spec_base: { data_type: "datetime" } },
+        { primary_api: "Last_Customer_Response",   fallback_api: "PRD_Last_Customer_Response",   primary_label: "Last Customer Response",  fallback_label: "PRD Last Customer Response",  spec_base: { data_type: "textarea", length: 2000 } },
+        { primary_api: "Intent_Captured",          fallback_api: "PRD_Intent_Captured",          primary_label: "Intent Captured",         fallback_label: "PRD Intent Captured",         spec_base: { data_type: "boolean" } },
+        { primary_api: "Site_Visit_Date",          fallback_api: "PRD_Site_Visit_Date",          primary_label: "Site Visit Date",         fallback_label: "PRD Site Visit Date",         spec_base: { data_type: "datetime" } },
+        { primary_api: "Not_Interested_Reason",    fallback_api: "PRD_Not_Interested_Reason",    primary_label: "Not Interested Reason",   fallback_label: "PRD Not Interested Reason",   spec_base: { data_type: "picklist", pick_list_values: pickList(["Not Interested", "User Not Responding", "Budget Issue", "Visit Confirmation Failed", "Other"]) } },
+      ];
+
+      const results: any[] = [];
+      for (const d of desired) {
+        if (existingApis.has(d.primary_api)) {
+          results.push({ api: d.primary_api, status: "already_exists", which: "primary" });
+          continue;
+        }
+        if (existingApis.has(d.fallback_api)) {
+          results.push({ api: d.fallback_api, status: "already_exists", which: "fallback" });
+          continue;
+        }
+        let useLabel = d.primary_label;
+        if (existingLabels.has(d.primary_label)) {
+          useLabel = d.fallback_label;
+        }
+        const body = { fields: [{ field_label: useLabel, ...d.spec_base }] };
+        const cr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+          method: "POST",
+          headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const j = await cr.json().catch(() => ({}));
+        const success = cr.status >= 200 && cr.status < 300;
+        // Retry with fallback label if primary attempt failed on duplicate
+        if (!success && useLabel === d.primary_label) {
+          const errMsg = JSON.stringify(j).toLowerCase();
+          if (errMsg.includes("duplicate") || errMsg.includes("already exists") || errMsg.includes("system keyword")) {
+            const retryBody = { fields: [{ field_label: d.fallback_label, ...d.spec_base }] };
+            const cr2 = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+              method: "POST",
+              headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+              body: JSON.stringify(retryBody),
+            });
+            const j2 = await cr2.json().catch(() => ({}));
+            const ok2 = cr2.status >= 200 && cr2.status < 300;
+            results.push({
+              api_intended: d.primary_api,
+              label_tried: [d.primary_label, d.fallback_label],
+              status: ok2 ? "created_fallback" : "failed",
+              http_status: cr2.status,
+              response: ok2 ? "ok" : j2,
+            });
+            continue;
+          }
+        }
+        results.push({
+          api_intended: d.primary_api,
+          label_tried: [useLabel],
+          status: success ? "created" : "failed",
+          http_status: cr.status,
+          response: success ? "ok" : j,
+        });
+      }
+
+      const created = results.filter((r) => r.status === "created" || r.status === "created_fallback");
+      const skipped = results.filter((r) => r.status === "already_exists");
+      const failed = results.filter((r) => r.status === "failed");
+
+      return res.status(200).json({
+        status: failed.length === 0 ? "ok" : "partial",
+        totals: { spec_fields_total: desired.length, created: created.length, already_existed: skipped.length, failed: failed.length },
+        results,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── PRD v1.0 cleanup: delete all old "ASBL " labeled fields ──────────
   // GET ?action=prd-cleanup-old-fields&secret=<INHOUSE_POSTHOOK_SECRET>&dry=1
   //   Lists or deletes every Leads-module custom field whose label starts
-  //   with "ASBL Loft Spec —" (created by yesterday's spec implementation).
+  //   with "ASBL " (created by yesterday's spec implementation).
   //   PRD v1.0 replaces all of those with a simpler 13-field schema.
   //   dry=1  → list only (preview)
   //   no dry → actually delete (irreversible — all data on those fields lost)
