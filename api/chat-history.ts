@@ -1736,9 +1736,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const fj = (await fr.json()) as any;
       const allFields = (fj?.fields || []) as any[];
 
-      // Match by label prefix — that's how we created them yesterday
+      // Match by label prefix "ASBL " (Zoho truncated my longer "ASBL Loft
+      // Spec — " prefix to just "ASBL " when creating yesterday's fields).
+      // EXCLUDE protected fields that pre-date yesterday's spec and are
+      // production-critical (ASBL_Project is the main project picklist —
+      // used by every ingest, webhook, and lead view; deleting would break
+      // half the codebase).
+      const PROTECTED_API_NAMES = new Set([
+        "ASBL_Project",
+      ]);
       const toDelete = allFields.filter((f) =>
-        typeof f.field_label === "string" && f.field_label.startsWith("ASBL Loft Spec —"),
+        typeof f.field_label === "string" &&
+        f.field_label.startsWith("ASBL ") &&
+        !PROTECTED_API_NAMES.has(f.api_name),
       );
 
       if (dryRun) {
