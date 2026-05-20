@@ -15,8 +15,7 @@
  * doc_send_log so we can audit later via Supabase queries.
  */
 
-const SUPABASE_URL = process.env.SUPABASE_URL || "";
-const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || "";
+import { getCollection, COL } from "./mongo";
 
 export interface DocMeta {
   unit_size_sft?: number | null;
@@ -171,7 +170,8 @@ export interface DocSendLogRow {
 }
 
 export async function logDocSend(row: DocSendLogRow): Promise<void> {
-  const body = {
+  const doc = {
+    created_at: new Date().toISOString(),
     phone: row.phone,
     project: row.project,
     doc_type: row.doc_type,
@@ -185,20 +185,8 @@ export async function logDocSend(row: DocSendLogRow): Promise<void> {
   };
 
   try {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/doc_send_log`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-        Prefer: "return=minimal",
-      },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) {
-      const t = await r.text();
-      console.error(`[DocValidator] log insert failed ${r.status}: ${t.slice(0, 200)}`);
-    }
+    const col = await getCollection(COL.DOC_SEND_LOG);
+    await col.insertOne(doc as any);
   } catch (err: any) {
     console.error(`[DocValidator] log insert threw: ${err.message}`);
   }

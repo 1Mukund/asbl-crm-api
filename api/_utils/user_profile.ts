@@ -1,6 +1,14 @@
 /**
  * user_profiles — per-phone structured memory for the WhatsApp bot.
  *
+ * MIGRATED FROM SUPABASE → MongoDB (Phase 2 of the Mongo migration).
+ * Collection: "user_profiles" inside the "Zoho_Database" Mongo db.
+ *
+ * Schema (per document):
+ *   _id is the customer's digits-only phone string (functions as PK).
+ *   Other fields mirror the v5 spec exactly — see SQL_TO_RUN.md for the
+ *   original column list.
+ *
  * Each inbound message:
  *   1. fetch the existing profile (or lazy-create with funnel_stage="new")
  *   2. render a <USER_PROFILE> block into the Gemini prompt
@@ -12,11 +20,11 @@
  *   5. bump funnel_stage if a stage-advancing signal fired
  *   6. (when a PDF actually gets sent) append doc_meta to docs_sent
  *
- * The full table schema lives in SQL_TO_RUN.md (v5 chatbot upgrade section).
+ * Backfill from Supabase:
+ *   POST /api/chat-history?action=mongo-backfill&collection=user_profiles&secret=<...>
  */
 
-const SUPABASE_URL = process.env.SUPABASE_URL || "";
-const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || "";
+import { getCollection, COL } from "./mongo";
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -69,6 +77,11 @@ export interface UserProfile {
   updated_at: string | null;
 }
 
+/** Mongo document shape — same as UserProfile but with _id PK = phone. */
+interface UserProfileDoc extends UserProfile {
+  _id: string;  // phone digits
+}
+
 /** Shape Gemini returns under the `extracted_facts` key in its JSON output.
  *  All scalars are nullable; we only merge non-null values. */
 export interface ExtractedFacts {
@@ -101,18 +114,17 @@ const SCALAR_FIELDS: (keyof UserProfile & keyof ExtractedFacts)[] = [
 
 // ─── Read ─────────────────────────────────────────────────────────────────
 
+function cleanPhone(p: string): string {
+  return String(p || "").replace(/\D/g, "");
+}
+
 export async function getProfile(phone: string): Promise<UserProfile | null> {
-  const clean = String(phone).replace(/\D/g, "");
+  const clean = cleanPhone(phone);
   if (!clean) return null;
   try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/user_profiles?phone=eq.${clean}&select=*`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
-    );
-    if (!r.ok) return null;
-    const rows = (await r.json()) as UserProfile[];
-    if (!Array.isArray(rows) || !rows.length) return null;
-    return normalizeProfileFromDb(rows[0]);
+    const col = await getCollection<UserProfileDoc>(COL.USER_PROFILES);
+    const doc = await col.findOne({ _id: clean });
+    return doc ? normalizeProfileFromDb(doc) : null;
   } catch (err: any) {
     console.error(`[UserProfile] getProfile failed: ${err.message}`);
     return null;
@@ -121,36 +133,14 @@ export async function getProfile(phone: string): Promise<UserProfile | null> {
 
 /** Get-or-create. New rows start as funnel_stage="new" with no facts. */
 export async function getOrCreateProfile(phone: string): Promise<UserProfile> {
-  const existing = await getProfile(phone);
+  const clean = cleanPhone(phone);
+  const existing = await getProfile(clean);
   if (existing) return existing;
 
-  const clean = String(phone).replace(/\D/g, "");
-  const blank: Partial<UserProfile> = {
+  const now = new Date().toISOString();
+  const blank: UserProfileDoc = {
+    _id: clean,
     phone: clean,
-    funnel_stage: "new",
-  };
-
-  try {
-    await fetch(`${SUPABASE_URL}/rest/v1/user_profiles`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-        Prefer: "resolution=merge-duplicates,return=minimal",
-      },
-      body: JSON.stringify(blank),
-    });
-  } catch (err: any) {
-    console.error(`[UserProfile] lazy-create failed: ${err.message}`);
-  }
-
-  return emptyProfile(clean);
-}
-
-function emptyProfile(phone: string): UserProfile {
-  return {
-    phone,
     name: null,
     budget_cr: null,
     intent: null,
@@ -168,16 +158,32 @@ function emptyProfile(phone: string): UserProfile {
     last_project: null,
     last_interaction_at: null,
     funnel_stage: "new",
-    created_at: null,
-    updated_at: null,
+    created_at: now,
+    updated_at: now,
   };
+
+  try {
+    const col = await getCollection<UserProfileDoc>(COL.USER_PROFILES);
+    // upsert with $setOnInsert so we don't trample an existing row in
+    // a race between two concurrent webhook invocations.
+    await col.updateOne(
+      { _id: clean },
+      { $setOnInsert: blank },
+      { upsert: true },
+    );
+    // Re-read to get whatever version actually persisted (in the race,
+    // ours may have been replaced by the other invocation's blank doc).
+    const final = await col.findOne({ _id: clean });
+    return final ? normalizeProfileFromDb(final) : normalizeProfileFromDb(blank as any);
+  } catch (err: any) {
+    console.error(`[UserProfile] lazy-create failed: ${err.message}`);
+    return normalizeProfileFromDb(blank as any);
+  }
 }
 
-/** Postgres returns arrays as actual arrays via PostgREST, but defensively
- *  coerce to ensure callers always get [] not null. */
 function normalizeProfileFromDb(row: any): UserProfile {
   return {
-    phone: String(row.phone),
+    phone: String(row.phone || row._id || ""),
     name: row.name ?? null,
     budget_cr: row.budget_cr === null || row.budget_cr === undefined ? null : Number(row.budget_cr),
     intent: row.intent ?? null,
@@ -215,10 +221,8 @@ export function diffExtractedFacts(
   for (const f of SCALAR_FIELDS) {
     const incoming = (facts as any)[f];
     if (incoming === null || incoming === undefined || incoming === "") continue;
-    // Normalise empty-string-ish "null" sentinels Gemini occasionally emits
     if (typeof incoming === "string" && incoming.trim().toLowerCase() === "null") continue;
     const current = (existing as any)[f];
-    // Only write when actually different (avoid no-op PATCHes)
     if (typeof incoming === "number" && typeof current === "number") {
       if (incoming !== current) (delta as any)[f] = incoming;
     } else if (String(incoming).trim() !== String(current ?? "").trim()) {
@@ -226,7 +230,6 @@ export function diffExtractedFacts(
     }
   }
 
-  // Arrays — append+dedupe
   const newObj = sanitizeListItem(facts.new_objection);
   if (newObj && !containsCi(existing.objections_raised, newObj)) {
     delta.objections_raised = [...existing.objections_raised, newObj];
@@ -243,7 +246,6 @@ function sanitizeListItem(s: string | null | undefined): string {
   if (!s) return "";
   const t = String(s).trim();
   if (!t || t.toLowerCase() === "null") return "";
-  // Cap at 200 chars to keep arrays from ballooning on a runaway Gemini
   return t.length > 200 ? t.slice(0, 200) : t;
 }
 
@@ -254,15 +256,12 @@ function containsCi(arr: string[], item: string): boolean {
 
 // ─── Write ────────────────────────────────────────────────────────────────
 
-/** Apply a delta to the row (PATCH). Returns the merged in-memory profile so
- *  callers can keep operating on a current copy. Bumps last_interaction_at
- *  + updated_at unconditionally. */
 export async function mergeProfile(
   phone: string,
   existing: UserProfile,
   delta: Partial<UserProfile>,
 ): Promise<UserProfile> {
-  const clean = String(phone).replace(/\D/g, "");
+  const clean = cleanPhone(phone);
   const now = new Date().toISOString();
   const fullDelta: Partial<UserProfile> = {
     ...delta,
@@ -271,23 +270,11 @@ export async function mergeProfile(
   };
 
   try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/user_profiles?phone=eq.${clean}`,
-      {
-        method: "PATCH",
-        headers: {
-          "Content-Type": "application/json",
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-          Prefer: "return=minimal",
-        },
-        body: JSON.stringify(fullDelta),
-      },
+    const col = await getCollection<UserProfileDoc>(COL.USER_PROFILES);
+    await col.updateOne(
+      { _id: clean },
+      { $set: fullDelta as any },
     );
-    if (!r.ok) {
-      const t = await r.text();
-      console.error(`[UserProfile] PATCH failed ${r.status}: ${t.slice(0, 200)}`);
-    }
   } catch (err: any) {
     console.error(`[UserProfile] mergeProfile threw: ${err.message}`);
   }
@@ -298,8 +285,8 @@ export async function mergeProfile(
 // ─── Funnel stage progression ─────────────────────────────────────────────
 
 export type FunnelSignal =
-  | "INBOUND_MSG"        // Any inbound bumps "new" → "engaged"
-  | "FACTS_CAPTURED"     // budget OR (size + timeline) captured → "qualified"
+  | "INBOUND_MSG"
+  | "FACTS_CAPTURED"
   | "DOC_BROCHURE_SENT"
   | "DOC_PRICE_SHEET_SENT"
   | "SITE_VISIT_SCHEDULED"
@@ -308,14 +295,11 @@ export type FunnelSignal =
   | "BOOKED"
   | "LOST";
 
-/** Compute the new funnel stage given the current one + an incoming signal.
- *  Monotonic — never moves BACKWARDS (except to "lost", which is one-way). */
 export function nextFunnelStage(
   current: FunnelStage,
   signal: FunnelSignal,
 ): FunnelStage {
-  if (current === "booked" || current === "lost") return current; // terminal
-
+  if (current === "booked" || current === "lost") return current;
   if (signal === "LOST") return "lost";
 
   const target: FunnelStage =
@@ -331,12 +315,9 @@ export function nextFunnelStage(
 
   const curIdx = STAGE_ORDER.indexOf(current);
   const tgtIdx = STAGE_ORDER.indexOf(target);
-  // Only advance forwards
   return tgtIdx > curIdx ? target : current;
 }
 
-/** Convenience: derive a FACTS_CAPTURED signal if the merged profile now has
- *  enough info to be "qualified". Returns null otherwise. */
 export function inferQualifiedSignal(merged: UserProfile): FunnelSignal | null {
   const hasBudget = merged.budget_cr !== null;
   const hasSizeAndTimeline = merged.preferred_size_sft !== null && !!merged.timeline;
@@ -344,8 +325,6 @@ export function inferQualifiedSignal(merged: UserProfile): FunnelSignal | null {
   return null;
 }
 
-/** Apply a funnel signal — writes new stage if it advances. Returns the
- *  resulting stage (whether it changed or not). */
 export async function advanceFunnel(
   phone: string,
   current: FunnelStage,
@@ -354,30 +333,14 @@ export async function advanceFunnel(
   const target = nextFunnelStage(current, signal);
   if (target === current) return current;
 
-  const clean = String(phone).replace(/\D/g, "");
+  const clean = cleanPhone(phone);
   try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/user_profiles?phone=eq.${clean}`,
-      {
-        method: "PATCH",
-        headers: {
-          "Content-Type": "application/json",
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-          Prefer: "return=minimal",
-        },
-        body: JSON.stringify({
-          funnel_stage: target,
-          updated_at: new Date().toISOString(),
-        }),
-      },
+    const col = await getCollection<UserProfileDoc>(COL.USER_PROFILES);
+    await col.updateOne(
+      { _id: clean },
+      { $set: { funnel_stage: target, updated_at: new Date().toISOString() } },
     );
-    if (!r.ok) {
-      const t = await r.text();
-      console.error(`[UserProfile] advanceFunnel PATCH failed: ${t.slice(0, 200)}`);
-    } else {
-      console.log(`[UserProfile] funnel ${current} → ${target} (signal=${signal}) phone=${clean}`);
-    }
+    console.log(`[UserProfile] funnel ${current} → ${target} (signal=${signal}) phone=${clean}`);
   } catch (err: any) {
     console.error(`[UserProfile] advanceFunnel threw: ${err.message}`);
   }
@@ -386,8 +349,6 @@ export async function advanceFunnel(
 
 // ─── Doc tracking ─────────────────────────────────────────────────────────
 
-/** Append a successfully-sent doc to docs_sent. Format: "doc_type:meta"
- *  (e.g. "unit_plan:1695-east-A") so we can later tell what's been sent. */
 export async function appendDocSent(
   phone: string,
   docType: string,
@@ -398,21 +359,17 @@ export async function appendDocSent(
   if (containsCi(existingDocsSent, tag)) return existingDocsSent;
 
   const next = [...existingDocsSent, tag];
-  const clean = String(phone).replace(/\D/g, "");
+  const clean = cleanPhone(phone);
   try {
-    await fetch(`${SUPABASE_URL}/rest/v1/user_profiles?phone=eq.${clean}`, {
-      method: "PATCH",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-        Prefer: "return=minimal",
+    const col = await getCollection<UserProfileDoc>(COL.USER_PROFILES);
+    // $addToSet keeps the array deduped if there's a race with another invocation
+    await col.updateOne(
+      { _id: clean },
+      {
+        $addToSet: { docs_sent: tag } as any,
+        $set: { updated_at: new Date().toISOString() },
       },
-      body: JSON.stringify({
-        docs_sent: next,
-        updated_at: new Date().toISOString(),
-      }),
-    });
+    );
   } catch (err: any) {
     console.error(`[UserProfile] appendDocSent threw: ${err.message}`);
   }
@@ -431,8 +388,6 @@ function formatDocTag(
   return parts.length ? `${docType}:${parts.join("-")}` : docType;
 }
 
-/** Persist current_project / last_project updates separately from facts merge.
- *  Called from the webhook AFTER project resolution decides the active one. */
 export async function setActiveProject(
   phone: string,
   existing: UserProfile,
@@ -441,33 +396,23 @@ export async function setActiveProject(
   if (!resolved) return existing;
   if (existing.current_project === resolved) return existing;
 
-  const clean = String(phone).replace(/\D/g, "");
+  const clean = cleanPhone(phone);
   const delta: Partial<UserProfile> = {
     current_project: resolved,
     last_project: existing.current_project || existing.last_project,
     updated_at: new Date().toISOString(),
   };
   try {
-    await fetch(`${SUPABASE_URL}/rest/v1/user_profiles?phone=eq.${clean}`, {
-      method: "PATCH",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-        Prefer: "return=minimal",
-      },
-      body: JSON.stringify(delta),
-    });
+    const col = await getCollection<UserProfileDoc>(COL.USER_PROFILES);
+    await col.updateOne({ _id: clean }, { $set: delta as any });
   } catch (err: any) {
     console.error(`[UserProfile] setActiveProject threw: ${err.message}`);
   }
   return { ...existing, ...delta } as UserProfile;
 }
 
-// ─── <USER_PROFILE> block renderer ────────────────────────────────────────
+// ─── <USER_PROFILE> block renderer (unchanged from Supabase version) ─────
 
-/** Render the profile as a compact block for the Gemini prompt. Empty fields
- *  are omitted so the model isn't distracted by "name: null" noise. */
 export function renderUserProfileBlock(p: UserProfile): string {
   const lines: string[] = [];
   const push = (k: string, v: any) => {

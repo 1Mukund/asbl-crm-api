@@ -3979,9 +3979,94 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         });
       }
 
+      // ── user_profiles ───────────────────────────────────────────────────
+      if (collection === "user_profiles") {
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/user_profiles?select=*&limit=10000`,
+          { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
+        );
+        if (!r.ok) {
+          return res.status(500).json({ error: `Supabase fetch failed ${r.status}: ${(await r.text()).slice(0, 200)}` });
+        }
+        const rows = (await r.json()) as Array<any>;
+        const col = await getCollection(COL.USER_PROFILES);
+        let upserted = 0;
+        for (const row of rows) {
+          const phone = String(row.phone || "").replace(/\D/g, "");
+          if (!phone) continue;
+          const doc = {
+            _id: phone,
+            phone,
+            name: row.name ?? null,
+            budget_cr: row.budget_cr === null || row.budget_cr === undefined ? null : Number(row.budget_cr),
+            intent: row.intent ?? null,
+            preferred_size_sft: row.preferred_size_sft ?? null,
+            preferred_bhk: row.preferred_bhk === null || row.preferred_bhk === undefined ? null : Number(row.preferred_bhk),
+            preferred_facing: row.preferred_facing ?? null,
+            family_size: row.family_size ?? null,
+            work_location: row.work_location ?? null,
+            timeline: row.timeline ?? null,
+            objections_raised: Array.isArray(row.objections_raised) ? row.objections_raised : [],
+            commitments_made: Array.isArray(row.commitments_made) ? row.commitments_made : [],
+            docs_sent: Array.isArray(row.docs_sent) ? row.docs_sent : [],
+            preferred_language: row.preferred_language ?? null,
+            current_project: row.current_project ?? null,
+            last_project: row.last_project ?? null,
+            last_interaction_at: row.last_interaction_at ?? null,
+            funnel_stage: row.funnel_stage || "new",
+            created_at: row.created_at ?? null,
+            updated_at: row.updated_at ?? null,
+          };
+          await col.updateOne({ _id: phone as any }, { $set: doc as any }, { upsert: true });
+          upserted++;
+        }
+        return res.status(200).json({
+          ok: true, collection: "user_profiles", scanned: rows.length, upserted,
+        });
+      }
+
+      // ── doc_send_log (append-only — no upsert, just insert) ────────────
+      if (collection === "doc_send_log") {
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/doc_send_log?select=*&order=created_at.asc&limit=10000`,
+          { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
+        );
+        if (!r.ok) {
+          return res.status(500).json({ error: `Supabase fetch failed ${r.status}: ${(await r.text()).slice(0, 200)}` });
+        }
+        const rows = (await r.json()) as Array<any>;
+        const col = await getCollection(COL.DOC_SEND_LOG);
+        // Dedupe by Supabase id so re-running doesn't double-insert. Use the
+        // original id as _id (number → string).
+        let upserted = 0;
+        for (const row of rows) {
+          const _id = row.id ? `sb_${row.id}` : undefined;
+          if (!_id) continue;
+          const doc = {
+            _id,
+            created_at: row.created_at,
+            phone: row.phone,
+            project: row.project,
+            doc_type: row.doc_type,
+            doc_meta: row.doc_meta,
+            matched_url: row.matched_url,
+            matched_file: row.matched_file,
+            reply_text: row.reply_text,
+            outcome: row.outcome,
+            block_reason: row.block_reason,
+            sizes_in_reply: row.sizes_in_reply || [],
+          };
+          await col.updateOne({ _id: _id as any }, { $set: doc as any }, { upsert: true });
+          upserted++;
+        }
+        return res.status(200).json({
+          ok: true, collection: "doc_send_log", scanned: rows.length, upserted,
+        });
+      }
+
       return res.status(400).json({
         error: `Unknown collection: ${collection}`,
-        supported: ["bot_settings"],
+        supported: ["bot_settings", "user_profiles", "doc_send_log"],
         note: "More collections added as each Phase ships.",
       });
     } catch (err: any) {
