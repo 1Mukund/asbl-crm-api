@@ -27,8 +27,11 @@ import { MongoClient, Db, Collection, MongoClientOptions } from "mongodb";
 
 const MONGO_URI = process.env.MONGO_URI || "";
 
-/** Database name — fixed to user-specified "Zoho Database" (with space). */
-export const DB_NAME = "Zoho Database";
+/** Database name. User asked for "Zoho Database" (with space) but the
+ *  MongoDB Node driver rejects spaces in database names — we use the
+ *  closest alternative with an underscore. Compass / mongosh both show
+ *  this as "Zoho_Database". */
+export const DB_NAME = "Zoho_Database";
 
 /** Canonical collection names. Anything new being migrated to Mongo
  *  must register its name here so we have a single index of what lives
