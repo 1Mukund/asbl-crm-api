@@ -1,22 +1,40 @@
 /**
- * Tiny key-value store for bot-level settings, persisted in Supabase.
+ * Tiny key-value store for bot-level settings.
  *
- * Currently used for the user-editable Gemini system prompt.
- * Fall through to a hardcoded default when the DB has no override.
+ * MIGRATED FROM SUPABASE → MongoDB (Phase 1 of the Mongo migration).
+ * Collection: "bot_settings" inside the "Zoho Database" Mongo db.
+ *
+ * Schema (per document):
+ *   { _id: <key string>, value: string, updated_at: ISO string }
+ *
+ * The `_id` is the setting key (e.g. "system_prompt", "zoho_access_token_v1",
+ * "use_pdf_extracts"). Mongo enforces uniqueness on _id for free, so this
+ * mirrors the old (key TEXT PRIMARY KEY) Postgres constraint exactly.
+ *
+ * Backfill from Supabase is handled by
+ *   POST /api/chat-history?action=mongo-backfill&collection=bot_settings
+ * — that route reads the old Supabase rows once and writes them to Mongo
+ * so we don't have to re-run anything by hand.
  */
-const SUPABASE_URL = process.env.SUPABASE_URL || "";
-const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || "";
 
-/** Get a single setting; returns null if not set. */
-export async function getBotSetting(key: string): Promise<{ value: string; updated_at: string } | null> {
+import { getCollection, COL } from "./mongo";
+
+interface BotSettingDoc {
+  _id: string;          // setting key
+  value: string;
+  updated_at: string;   // ISO string
+}
+
+/** Get a single setting; returns null if not set. Shape kept compatible
+ *  with the old Supabase-backed function so call sites need no changes. */
+export async function getBotSetting(
+  key: string,
+): Promise<{ value: string; updated_at: string } | null> {
   try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/bot_settings?key=eq.${encodeURIComponent(key)}&select=value,updated_at`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
-    if (!r.ok) return null;
-    const rows = await r.json();
-    return rows?.[0] || null;
+    const col = await getCollection<BotSettingDoc>(COL.BOT_SETTINGS);
+    const doc = await col.findOne({ _id: key });
+    if (!doc) return null;
+    return { value: doc.value, updated_at: doc.updated_at };
   } catch (err: any) {
     console.error(`[bot_settings] read failed: ${err.message}`);
     return null;
@@ -24,23 +42,21 @@ export async function getBotSetting(key: string): Promise<{ value: string; updat
 }
 
 /** Upsert a setting. */
-export async function setBotSetting(key: string, value: string): Promise<{ ok: boolean; error?: string }> {
+export async function setBotSetting(
+  key: string,
+  value: string,
+): Promise<{ ok: boolean; error?: string }> {
   try {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/bot_settings`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-        Prefer: "resolution=merge-duplicates,return=minimal",
-      },
-      body: JSON.stringify({ key, value, updated_at: new Date().toISOString() }),
-    });
-    if (!r.ok) {
-      return { ok: false, error: `${r.status}: ${(await r.text()).slice(0, 200)}` };
-    }
+    const col = await getCollection<BotSettingDoc>(COL.BOT_SETTINGS);
+    const now = new Date().toISOString();
+    await col.updateOne(
+      { _id: key },
+      { $set: { value, updated_at: now }, $setOnInsert: { _id: key } },
+      { upsert: true },
+    );
     return { ok: true };
   } catch (err: any) {
+    console.error(`[bot_settings] write failed: ${err.message}`);
     return { ok: false, error: err.message };
   }
 }

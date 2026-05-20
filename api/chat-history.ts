@@ -3898,6 +3898,98 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── MongoDB health probe ──────────────────────────────────────────────
+  // GET /api/chat-history?action=mongo-diag&secret=<INHOUSE_POSTHOOK_SECRET>
+  // Pings the Mongo cluster and lists collections in "Zoho Database".
+  // Use this after adding MONGO_URI to Vercel env to confirm connectivity.
+  if (req.query.action === "mongo-diag") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    try {
+      const { ping, getCollection, COL } = await import("./_utils/mongo");
+      const probe = await ping();
+      // Also report per-collection counts so we can verify backfills landed
+      const counts: Record<string, number> = {};
+      if (probe.ok) {
+        for (const cname of Object.values(COL)) {
+          try {
+            const c = await getCollection(cname);
+            counts[cname] = await c.estimatedDocumentCount();
+          } catch (err: any) {
+            counts[cname] = -1;
+          }
+        }
+      }
+      return res.status(200).json({ ...probe, counts });
+    } catch (err: any) {
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  }
+
+  // ─── Mongo backfill from Supabase (one-shot per collection) ────────────
+  // POST /api/chat-history?action=mongo-backfill&collection=<name>&secret=<...>
+  // Copies rows from the named Supabase table to its Mongo equivalent.
+  // Idempotent — uses upsert keyed on the natural primary key per collection
+  // so re-runs just refresh, never duplicate.
+  if (req.method === "POST" && req.query.action === "mongo-backfill") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    const collection = String(req.query.collection || "").toLowerCase();
+    if (!collection) {
+      return res.status(400).json({ error: "?collection=<name> required" });
+    }
+    try {
+      const { getCollection, COL } = await import("./_utils/mongo");
+
+      // ── bot_settings ────────────────────────────────────────────────────
+      if (collection === "bot_settings") {
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/bot_settings?select=key,value,updated_at&limit=500`,
+          { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
+        );
+        if (!r.ok) {
+          return res.status(500).json({ error: `Supabase fetch failed ${r.status}: ${(await r.text()).slice(0, 200)}` });
+        }
+        const rows = (await r.json()) as Array<{ key: string; value: string; updated_at: string }>;
+        const col = await getCollection(COL.BOT_SETTINGS);
+        let upserted = 0;
+        for (const row of rows) {
+          await col.updateOne(
+            { _id: row.key } as any,
+            {
+              $set: { value: row.value, updated_at: row.updated_at || new Date().toISOString() },
+              $setOnInsert: { _id: row.key as any },
+            },
+            { upsert: true },
+          );
+          upserted++;
+        }
+        return res.status(200).json({
+          ok: true,
+          collection: "bot_settings",
+          scanned: rows.length,
+          upserted,
+          keys: rows.map((r) => r.key),
+        });
+      }
+
+      return res.status(400).json({
+        error: `Unknown collection: ${collection}`,
+        supported: ["bot_settings"],
+        note: "More collections added as each Phase ships.",
+      });
+    } catch (err: any) {
+      console.error(`[mongo-backfill ${collection}] failed: ${err.message}`);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── Backfill v5 strict columns from existing size_label text ──────────
   // GET/POST ?action=backfill-doc-meta&secret=<INHOUSE_POSTHOOK_SECRET>[&dry=1][&doc_type=unit_plan][&project=LOFT]
   //
