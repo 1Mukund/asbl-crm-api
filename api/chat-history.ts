@@ -3913,6 +3913,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     try {
       const { getAccessToken } = await import("./_utils/zoho");
       const token = await getAccessToken();
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
       const fields = "id,First_Name,Last_Name,Mobile,Phone,Lead_Status,ASBL_Project,Modified_Time";
 
       const callable: Array<{
