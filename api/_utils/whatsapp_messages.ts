@@ -269,7 +269,7 @@ export async function getInboundIntentStats(
         const key = `${m.project || ""}|${m.intent}`;
         const cur = counts.get(key);
         if (cur) cur.count++;
-        else counts.set(key, { project: m.project, intent: m.intent, count: 1 });
+        else counts.set(key, { project: m.project ?? null, intent: m.intent as string, count: 1 });
       }
     }
     return Array.from(counts.values());
