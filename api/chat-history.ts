@@ -3898,6 +3898,99 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── Bulk-call: list all Indian-phone leads from Zoho ──────────────────
+  // GET /api/chat-history?action=list-indian-leads&secret=<INHOUSE_POSTHOOK_SECRET>
+  // Read-only. Pages through ALL Zoho leads (no status filter — per user
+  // 2026-05-21 "sabko call karo no matter not interested"), filters to
+  // Indian phones (Mobile or Phone starts with 91 / +91), and returns
+  // a compact list the caller iterates through to fire /api/relay/inhouse-call.
+  if (req.query.action === "list-indian-leads") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const token = await getAccessToken();
+      const fields = "id,First_Name,Last_Name,Mobile,Phone,Lead_Status,ASBL_Project,Modified_Time";
+
+      const callable: Array<{
+        id: string;
+        first_name: string;
+        last_name: string;
+        phone: string;
+        status: string;
+        project: string;
+        modified: string;
+      }> = [];
+      let pagesFetched = 0;
+      let totalScanned = 0;
+      let skippedNoPhone = 0;
+      let skippedNonIndian = 0;
+
+      // Zoho /Leads returns max 200/page. Page until empty.
+      // Cap at 10 pages (2000 leads) to stay under Vercel 10s budget.
+      const MAX_PAGES = 10;
+      for (let page = 1; page <= MAX_PAGES; page++) {
+        const r = await fetch(
+          `${ZOHO_API_BASE}/Leads?fields=${fields}` +
+            `&per_page=200&page=${page}&sort_by=Created_Time&sort_order=desc`,
+          { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
+        );
+        if (r.status === 204) break;
+        if (!r.ok) {
+          return res.status(500).json({
+            error: `Zoho fetch failed page ${page}: ${r.status} ${(await r.text()).slice(0, 200)}`,
+          });
+        }
+        const data = await r.json() as any;
+        const rows = (data?.data || []) as any[];
+        pagesFetched++;
+        totalScanned += rows.length;
+
+        for (const lead of rows) {
+          // Prefer Mobile; fall back to Phone
+          const rawPhone = String(lead.Mobile || lead.Phone || "").trim();
+          if (!rawPhone) { skippedNoPhone++; continue; }
+          const digits = rawPhone.replace(/\D/g, "");
+          // Indian: 91 prefix (with +91 or just 91) + 10 digits = 12 digits total,
+          // OR plain 10 digits (we treat as Indian by default per Zoho convention)
+          const isIndian = digits.startsWith("91") && digits.length === 12;
+          const isBare10 = digits.length === 10;
+          if (!isIndian && !isBare10) { skippedNonIndian++; continue; }
+          const normalised = isIndian ? `+${digits}` : `+91${digits}`;
+
+          callable.push({
+            id: String(lead.id),
+            first_name: lead.First_Name || "",
+            last_name: lead.Last_Name || "",
+            phone: normalised,
+            status: lead.Lead_Status || "",
+            project: lead.ASBL_Project || "",
+            modified: lead.Modified_Time || "",
+          });
+        }
+
+        // Stop early if Zoho told us this was the last page
+        if (!data?.info?.more_records) break;
+      }
+
+      return res.status(200).json({
+        ok: true,
+        total_scanned: totalScanned,
+        pages_fetched: pagesFetched,
+        skipped_no_phone: skippedNoPhone,
+        skipped_non_indian: skippedNonIndian,
+        callable_count: callable.length,
+        leads: callable,
+      });
+    } catch (err: any) {
+      console.error(`[list-indian-leads] failed: ${err.message}`);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── MongoDB health probe ──────────────────────────────────────────────
   // GET /api/chat-history?action=mongo-diag&secret=<INHOUSE_POSTHOOK_SECRET>
   // Pings the Mongo cluster and lists collections in "Zoho Database".
