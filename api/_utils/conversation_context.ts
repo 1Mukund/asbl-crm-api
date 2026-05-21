@@ -1,11 +1,14 @@
 /**
  * Conversation context — fetches last 30 days of WhatsApp messages
- * for a phone number from Supabase whatsapp_messages table.
+ * for a phone number from Mongo whatsapp_messages collection.
  * Returns formatted string for system prompt injection.
+ *
+ * MIGRATED FROM SUPABASE → MongoDB (Phase 4). Behaviour identical to
+ * the original Supabase implementation: ASC order, 80-msg cap, same
+ * truncation rules, same "no prior conversation" fallback string.
  */
 
-const SUPABASE_URL = process.env.SUPABASE_URL || "";
-const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || "";
+import { getMessagesForPhone } from "./whatsapp_messages";
 
 const HISTORY_DAYS = 30;
 const MAX_MESSAGES = 80; // safety cap on context size
@@ -21,24 +24,9 @@ export async function getConversationContext(phone: string): Promise<Conversatio
   const cutoff = new Date(Date.now() - HISTORY_DAYS * 24 * 60 * 60 * 1000).toISOString();
 
   try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/whatsapp_messages` +
-        `?phone=eq.${phone}` +
-        `&created_at=gte.${cutoff}` +
-        `&order=created_at.asc` +
-        `&limit=${MAX_MESSAGES}` +
-        `&select=direction,message,project,created_at`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
+    const rows = await getMessagesForPhone(phone, { sinceISO: cutoff, limit: MAX_MESSAGES });
 
-    const rows = (await r.json()) as Array<{
-      direction: "inbound" | "outbound";
-      message: string;
-      project: string | null;
-      created_at: string;
-    }>;
-
-    if (!Array.isArray(rows) || rows.length === 0) {
+    if (!rows.length) {
       return {
         formatted: "no prior conversation",
         totalMessages: 0,
@@ -53,8 +41,9 @@ export async function getConversationContext(phone: string): Promise<Conversatio
       const date = dt.toISOString().slice(0, 10);
       const time = dt.toISOString().slice(11, 16);
       const role = row.direction === "inbound" ? "customer" : "you";
-      // Truncate very long messages to keep context budget reasonable
-      const msg = row.message.length > 400 ? row.message.slice(0, 400) + "..." : row.message;
+      const msg = (row.message || "").length > 400
+        ? (row.message || "").slice(0, 400) + "..."
+        : (row.message || "");
       return `[${date} ${time}] ${role}: ${msg}`;
     });
 
@@ -62,11 +51,10 @@ export async function getConversationContext(phone: string): Promise<Conversatio
     const lastTimeMs = new Date(last.created_at).getTime();
     const daysSinceLast = Math.floor((Date.now() - lastTimeMs) / (24 * 60 * 60 * 1000));
 
-    // Find most recent project (walk from end)
     let lastProject: string | null = null;
     for (let i = rows.length - 1; i >= 0; i--) {
       if (rows[i].project) {
-        lastProject = rows[i].project;
+        lastProject = rows[i].project ?? null;
         break;
       }
     }

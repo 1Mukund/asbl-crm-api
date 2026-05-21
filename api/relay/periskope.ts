@@ -11,6 +11,7 @@
  * Body: { phone, first_name, project, budget, size_preference, lead_source }
  */
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+import { insertMessage as mongoInsertMessage } from "../_utils/whatsapp_messages";
 
 const PERISKOPE_API_KEY  = process.env.PERISKOPE_API_KEY  || "";
 const PERISKOPE_API_URL  = "https://api.periskope.app/v1/messages/send";
@@ -82,17 +83,13 @@ function generateMessage(
   );
 }
 
-// ── Save message to Supabase ──────────────────────────────────────────────────
+// ── Save message to Mongo (Phase 4: migrated from Supabase) ──────────────────
 async function saveMessage(phone: string, direction: "inbound" | "outbound", message: string, sender: string): Promise<void> {
   try {
-    await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_messages`, {
-      method: "POST",
-      headers: {
-        "Content-Type":  "application/json",
-        "apikey":        SUPABASE_KEY,
-        "Authorization": `Bearer ${SUPABASE_KEY}`,
-      },
-      body: JSON.stringify({ phone, direction, message, sender }),
+    await mongoInsertMessage({
+      phone, direction, message, sender,
+      project: null, intent: null,
+      created_at: new Date().toISOString(),
     });
   } catch (err) {
     console.error("[Periskope] Failed to save message:", err);

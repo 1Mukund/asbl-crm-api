@@ -224,10 +224,12 @@ function nextCronRun(schedule: string): string {
 async function renderDashboard(): Promise<string> {
   const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
-  const [factsRows, msgs24h, intentRows, cronRows, docRows, inventory] = await Promise.all([
+  // whatsapp_messages: Mongo (Phase 4). Other tables: still Supabase pending migration.
+  const { getRecentActivity, getInboundIntentStats } = await import("./_utils/whatsapp_messages");
+  const [factsRows, msgs24h, intentAgg, cronRows, docRows, inventory] = await Promise.all([
     listAllProjectFacts(),
-    sb(`whatsapp_messages?created_at=gte.${since24h}&select=phone,direction,message,project,intent,sender,created_at&order=created_at.desc&limit=300`),
-    sb(`whatsapp_messages?created_at=gte.${since24h}&direction=eq.inbound&intent=not.is.null&select=intent,project`),
+    getRecentActivity(since24h, 300),
+    getInboundIntentStats(since24h),
     sb(`cron_log?select=task,ran_at,duration_ms,result,error&order=ran_at.desc&limit=20`),
     sb(`project_documents?select=id,project,doc_type,size_label,unit_size_sft,facing,tower,filename,url,fetched_at&order=fetched_at.desc&limit=200`),
     getAllInventoryRows().catch((err: any) => {
@@ -235,6 +237,8 @@ async function renderDashboard(): Promise<string> {
       return { rows: [], fetchedAt: 0 };
     }),
   ]);
+  // Convert aggregated intent stats to the row-shape the rest of the dashboard expects
+  const intentRows = intentAgg.flatMap((r: any) => Array(r.count).fill({ intent: r.intent, project: r.project }));
 
   // Pad facts list with empty rows for any missing known project
   const factsByProject = new Map<string, { project: string; facts_text: string; updated_at: string | null }>();
@@ -345,7 +349,7 @@ async function renderDashboard(): Promise<string> {
   for (const m of msgs24h) {
     const key = m.phone;
     if (!phoneMap.has(key)) {
-      phoneMap.set(key, { phone: key, lastMsg: m.message, project: m.project, intent: m.intent, count: 1, lastTime: m.created_at });
+      phoneMap.set(key, { phone: key, lastMsg: m.message, project: m.project ?? null, intent: m.intent ?? null, count: 1, lastTime: m.created_at });
     } else {
       const cur = phoneMap.get(key)!;
       cur.count++;
@@ -1192,15 +1196,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         });
       }
 
-      // Pull last 5 WhatsApp messages to summarise prior intent
+      // Pull last 5 WhatsApp messages to summarise prior intent (Phase 4: Mongo)
       let lastWaIntent: string | null = null;
       let lastWaMessage: string | null = null;
       try {
-        const r = await fetch(
-          `${SUPABASE_URL}/rest/v1/whatsapp_messages?phone=eq.${phone}&order=created_at.desc&limit=5&select=message,intent,direction,created_at`,
-          { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-        );
-        const rows = (await r.json()) as any[];
+        const { getLastMessagesWithIntent } = await import("./_utils/whatsapp_messages");
+        const rows = await getLastMessagesWithIntent(phone, 5);
         const last = rows?.[0];
         lastWaMessage = last?.message?.slice(0, 200) || null;
         lastWaIntent = last?.intent || null;
@@ -4158,10 +4159,65 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         });
       }
 
+      // ── whatsapp_messages (paginated — table can be 100K+ rows) ─────────
+      if (collection === "whatsapp_messages") {
+        // Paginate by id in 1000-row chunks to avoid Supabase 1000-row default cap
+        // AND to keep the Vercel function under its 10s budget. Caller can pass
+        // ?since=YYYY-MM-DD to limit to recent N days (default: last 60 days —
+        // the bot only ever reads the last 30, so 60 is more than enough).
+        const sinceParam = (req.query.since as string) || "";
+        const sinceISO = sinceParam
+          ? new Date(sinceParam).toISOString()
+          : new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString();
+        const offset = parseInt(String(req.query.offset || "0"), 10);
+        const PAGE = 1000;
+
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/whatsapp_messages` +
+            `?created_at=gte.${encodeURIComponent(sinceISO)}` +
+            `&select=id,phone,direction,message,sender,project,intent,created_at` +
+            `&order=created_at.asc&limit=${PAGE}&offset=${offset}`,
+          { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
+        );
+        if (!r.ok) {
+          return res.status(500).json({ error: `Supabase fetch failed ${r.status}: ${(await r.text()).slice(0, 200)}` });
+        }
+        const rows = (await r.json()) as Array<any>;
+        const col = await getCollection(COL.WHATSAPP_MESSAGES);
+        let upserted = 0;
+        for (const row of rows) {
+          // Use Supabase id as Mongo _id (prefixed) so re-running is idempotent
+          const _id = `sb_${row.id}`;
+          const doc = {
+            _id,
+            phone: String(row.phone || "").replace(/\D/g, ""),
+            direction: row.direction,
+            message: row.message || "",
+            sender: row.sender ?? null,
+            project: row.project ?? null,
+            intent: row.intent ?? null,
+            created_at: row.created_at,
+          };
+          await col.updateOne({ _id: _id as any }, { $set: doc as any }, { upsert: true });
+          upserted++;
+        }
+        return res.status(200).json({
+          ok: true,
+          collection: "whatsapp_messages",
+          since: sinceISO,
+          offset,
+          page_size: PAGE,
+          scanned: rows.length,
+          upserted,
+          next_offset: rows.length === PAGE ? offset + PAGE : null,
+          done: rows.length < PAGE,
+        });
+      }
+
       return res.status(400).json({
         error: `Unknown collection: ${collection}`,
-        supported: ["bot_settings", "user_profiles", "doc_send_log"],
-        note: "More collections added as each Phase ships.",
+        supported: ["bot_settings", "user_profiles", "doc_send_log", "whatsapp_messages"],
+        note: "More collections added as each Phase ships. whatsapp_messages is paginated — re-call with ?offset=<next_offset> until done:true.",
       });
     } catch (err: any) {
       console.error(`[mongo-backfill ${collection}] failed: ${err.message}`);
@@ -4367,17 +4423,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const phone = req.query.phone as string;
     if (!phone) return res.status(400).json({ error: "phone required" });
 
-    // source=supabase → fetch from Supabase whatsapp_messages table
-    if (req.query.source === "supabase") {
+    // source=supabase (legacy name kept for URL compat) OR source=mongo
+    //   → fetch from Mongo whatsapp_messages collection (Phase 4 migration)
+    if (req.query.source === "supabase" || req.query.source === "mongo") {
       const rawPhone = phone.replace(/\D/g, "");
       if (rawPhone.length < 10) return res.status(400).json({ error: "invalid phone" });
       try {
-        const r = await fetch(
-          `${SUPABASE_URL}/rest/v1/whatsapp_messages?phone=eq.${rawPhone}&order=created_at.asc&limit=200`,
-          { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-        );
-        if (!r.ok) throw new Error(`Supabase error ${r.status}: ${await r.text()}`);
-        const messages = await r.json();
+        const { getMessagesForPhone } = await import("./_utils/whatsapp_messages");
+        const messages = await getMessagesForPhone(rawPhone, { limit: 200 });
         return res.status(200).json({ phone: rawPhone, messages });
       } catch (err: any) {
         return res.status(500).json({ error: err.message });

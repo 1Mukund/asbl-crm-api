@@ -104,15 +104,13 @@ async function fireChatbotMessage(phone: string, message: string, project?: stri
       return { ok: false, error: txt };
     }
     // Save to whatsapp_messages so it shows in dashboard + LLM history
+    // (Phase 4: migrated from Supabase to Mongo.)
     try {
-      await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_messages`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-        },
-        body: JSON.stringify({ phone, direction: "outbound", message, sender, project: project || null }),
+      const { insertMessage } = await import("./whatsapp_messages");
+      await insertMessage({
+        phone, direction: "outbound", message, sender,
+        project: project || null, intent: null,
+        created_at: new Date().toISOString(),
       });
       await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_sender_map`, {
         method: "POST",

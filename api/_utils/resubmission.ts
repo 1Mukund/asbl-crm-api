@@ -190,18 +190,16 @@ function buildWhatsAppMessage(lead: NormalizedLead, count: number): string {
   );
 }
 
-/** Save outbound WhatsApp message to Supabase chat history (so the LLM can
- *  see this in context when the lead replies). Best-effort — never throws. */
+/** Save outbound WhatsApp message to Mongo chat history (so the LLM can
+ *  see this in context when the lead replies). Best-effort — never throws.
+ *  (Phase 4: migrated from Supabase to Mongo.) */
 async function saveWhatsAppMessage(phone: string, message: string, sender: string): Promise<void> {
   try {
-    await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_messages`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-      },
-      body: JSON.stringify({ phone, direction: "outbound", message, sender }),
+    const { insertMessage } = await import("./whatsapp_messages");
+    await insertMessage({
+      phone, direction: "outbound", message, sender,
+      project: null, intent: null,
+      created_at: new Date().toISOString(),
     });
   } catch {}
 }

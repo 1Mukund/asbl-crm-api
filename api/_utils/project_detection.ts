@@ -5,12 +5,11 @@
  *   1. Explicit keyword in message (LOFT/SPECTRA/BROADWAY/LANDMARK)
  *   2. LEGACY trigger keywords (rtc x roads, upcoming, pre-rera)
  *   3. Zoho lead's ASBL_Project field
- *   4. Last asked project for this phone (Supabase whatsapp_messages.project)
+ *   4. Last asked project for this phone (Mongo whatsapp_messages.project)
  *   5. null (no project resolved)
  */
 
-const SUPABASE_URL = process.env.SUPABASE_URL || "";
-const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || "";
+import { getRecentProjectMessages } from "./whatsapp_messages";
 
 export type Project = "LOFT" | "SPECTRA" | "BROADWAY" | "LANDMARK" | "LEGACY";
 
@@ -43,20 +42,16 @@ export function detectFromMessage(message: string): Project | null {
   return null;
 }
 
-// ── Get last asked project for phone from Supabase ───────────────────────────
+// ── Get last asked project for phone (from Mongo whatsapp_messages) ─────────
 // Looks at last 5 turns from EITHER direction (so a project the bot just
 // answered about counts even if the customer's follow-up doesn't repeat the name).
 export async function getLastAskedProject(phone: string): Promise<Project | null> {
   try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/whatsapp_messages?phone=eq.${phone}&project=not.is.null&order=created_at.desc&limit=5&select=project,direction,created_at`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
-    const rows = await r.json();
-    if (!Array.isArray(rows) || !rows.length) return null;
+    const rows = await getRecentProjectMessages(phone, 5);
+    if (!rows.length) return null;
     // Take the very latest project tag — project context locks to it
     const proj = rows[0]?.project;
-    if (proj && [...KNOWN_PROJECTS, "LEGACY"].includes(proj)) return proj as Project;
+    if (proj && [...KNOWN_PROJECTS, "LEGACY"].includes(proj as any)) return proj as Project;
     return null;
   } catch (err: any) {
     console.error(`[ProjectDetect] last-asked lookup failed: ${err.message}`);

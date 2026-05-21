@@ -442,9 +442,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
     // 1. Get all unique phones that got outbound messages
-    const outbound = await supabaseGet(
-      `whatsapp_messages?direction=eq.outbound&order=created_at.asc&limit=2000`
-    );
+    //    (Phase 4: migrated from Supabase to Mongo whatsapp_messages collection)
+    const { getAllByDirection } = await import("../_utils/whatsapp_messages");
+    const outbound = await getAllByDirection("outbound", 5000);
 
     // earliest outbound per phone
     const firstOutbound = new Map<string, number>(); // phone → timestamp
@@ -455,9 +455,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // 2. Get all phones that have replied (inbound)
-    const inbound = await supabaseGet(
-      `whatsapp_messages?direction=eq.inbound&limit=2000`
-    );
+    const inbound = await getAllByDirection("inbound", 5000);
     const repliedPhones = new Set(inbound.map((r: any) => r.phone));
 
     // 3. Get follow-up log
@@ -503,12 +501,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           sender,
         });
 
-        // Save to whatsapp_messages
-        await supabasePost("whatsapp_messages", {
-          phone,
-          direction: "outbound",
-          message,
-          sender,
+        // Save to whatsapp_messages (Phase 4: Mongo)
+        const { insertMessage } = await import("../_utils/whatsapp_messages");
+        await insertMessage({
+          phone, direction: "outbound", message, sender,
+          project: null, intent: null,
+          created_at: new Date().toISOString(),
         });
 
         console.log(`[Followup] ✅ ${phone} → Day ${nextFollowupDay}`);

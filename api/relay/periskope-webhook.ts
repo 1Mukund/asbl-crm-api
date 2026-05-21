@@ -53,6 +53,7 @@ import {
   computeOfferTimeRemaining,
   renderOfferUrgencyBlock,
 } from "../_utils/offer_time";
+import { insertMessage as mongoInsertMessage } from "../_utils/whatsapp_messages";
 
 const PERISKOPE_API_KEY = process.env.PERISKOPE_API_KEY || "";
 const PERISKOPE_API_URL = "https://api.periskope.app/v1/messages/send";
@@ -339,17 +340,14 @@ async function saveMessage(
   intent: string | null = null,
 ): Promise<void> {
   try {
-    const body: any = { phone, direction, message, sender };
-    if (project) body.project = project;
-    if (intent)  body.intent  = intent;
-    await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_messages`, {
-      method: "POST",
-      headers: {
-        "Content-Type":  "application/json",
-        apikey:          SUPABASE_KEY,
-        Authorization:   `Bearer ${SUPABASE_KEY}`,
-      },
-      body: JSON.stringify(body),
+    await mongoInsertMessage({
+      phone,
+      direction,
+      message,
+      sender,
+      project: project ?? null,
+      intent: intent ?? null,
+      created_at: new Date().toISOString(),
     });
   } catch (err) {
     console.error("[Periskope Webhook] Failed to save message:", err);
