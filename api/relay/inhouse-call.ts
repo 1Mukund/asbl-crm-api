@@ -2,7 +2,10 @@
  * Outbound call trigger — country-routes the lead:
  *
  *   +91 (India) → in-house ASBL Voice Bot (Anandita) at
- *                 https://asbl-voice-bot.onrender.com/api/trigger-call
+ *                 https://voice.asbl.in/api/trigger-call
+ *                 (previously https://asbl-voice-bot.onrender.com — Render
+ *                  service was suspended on 2026-05-21, replaced with the
+ *                  self-hosted nginx behind voice.asbl.in).
  *   ANY other   → Arrowhead campaign (international leads — US, UK,
  *                 UAE, Canada, AUS, etc.)
  *
@@ -18,8 +21,14 @@
 import { VercelRequest, VercelResponse } from "@vercel/node";
 import { triggerBlueprintTransition, updateLead } from "../_utils/zoho";
 
+// Voice-bot base URL. If the env var still points at the suspended Render
+// host we override it to the new self-hosted voice.asbl.in domain — saves
+// a round-trip through the user updating Vercel env vars.
+const RAW_VOICEBOT_URL = process.env.ASBL_VOICEBOT_URL || "";
 const VOICEBOT_URL =
-  process.env.ASBL_VOICEBOT_URL || "https://asbl-voice-bot.onrender.com";
+  RAW_VOICEBOT_URL && !RAW_VOICEBOT_URL.includes("onrender.com")
+    ? RAW_VOICEBOT_URL
+    : "https://voice.asbl.in";
 const VOICEBOT_API_KEY = process.env.ASBL_VOICEBOT_API_KEY || "";
 
 const ARROWHEAD_BEARER_TOKEN = process.env.ARROWHEAD_BEARER_TOKEN || "";
@@ -55,15 +64,14 @@ function detectRegion(e164: string): "IN" | "INTL" {
 
 /** Trigger the in-house ASBL voice bot (India calls).
  *
- *  Uses /api/schedule-call (richer than /api/trigger-call) so we can pass:
- *    - customer_name → bot greets by name instead of "Hello sir"
- *    - external_schedule_id → posthook correlates without our extra field
- *    - external_customer_id → MLID for cross-call identity
- *    - metadata → project / plid / mlid / size_pref / budget that the bot's
- *      LLM session can use as conversation context
+ *  Per user 2026-05-21: target /api/trigger-call directly on voice.asbl.in.
+ *  The rich payload (customer_name, external_schedule_id, external_customer_id,
+ *  metadata) is sent — the new self-hosted bot exposes the same surface
+ *  as the old Render deployment and ignores fields it doesn't understand.
  *
- *  Falls back to /api/trigger-call automatically on 404 (in case schedule-call
- *  was unavailable on the bot's deployment).
+ *  Returns ok=true only when the bot replies with success:true. Earlier
+ *  500/403/503 responses were due to the suspended Render service — now
+ *  routed through voice.asbl.in those should resolve.
  */
 async function triggerInHouseBot(
   phone: string,
@@ -74,37 +82,22 @@ async function triggerInHouseBot(
     metadata?: Record<string, any>;
   },
 ): Promise<{ ok: boolean; status: number; data: any }> {
-  const schedulePayload: any = { to: phone };
-  if (ctx.customer_name)        schedulePayload.customer_name = ctx.customer_name;
-  if (ctx.external_schedule_id) schedulePayload.external_schedule_id = ctx.external_schedule_id;
-  if (ctx.external_customer_id) schedulePayload.external_customer_id = ctx.external_customer_id;
+  const payload: any = { to: phone };
+  if (ctx.customer_name)        payload.customer_name = ctx.customer_name;
+  if (ctx.external_schedule_id) payload.external_schedule_id = ctx.external_schedule_id;
+  if (ctx.external_customer_id) payload.external_customer_id = ctx.external_customer_id;
   if (ctx.metadata && Object.keys(ctx.metadata).length) {
-    schedulePayload.metadata = ctx.metadata;
+    payload.metadata = ctx.metadata;
   }
 
-  // Try /api/schedule-call first (richer)
-  let r = await fetch(`${VOICEBOT_URL}/api/schedule-call`, {
+  const r = await fetch(`${VOICEBOT_URL}/api/trigger-call`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${VOICEBOT_API_KEY}`,
     },
-    body: JSON.stringify(schedulePayload),
+    body: JSON.stringify(payload),
   });
-
-  // Fallback to /api/trigger-call if schedule-call isn't deployed
-  if (r.status === 404) {
-    console.warn("[InHouse Call IN] /api/schedule-call returned 404 — falling back to /api/trigger-call");
-    r = await fetch(`${VOICEBOT_URL}/api/trigger-call`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${VOICEBOT_API_KEY}`,
-      },
-      body: JSON.stringify({ to: phone }),
-    });
-  }
-
   const data = await r.json().catch(() => ({}));
   return { ok: r.ok && (data as any)?.success === true, status: r.status, data };
 }
