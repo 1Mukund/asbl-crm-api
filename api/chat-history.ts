@@ -4161,16 +4161,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       // ── whatsapp_messages (paginated — table can be 100K+ rows) ─────────
       if (collection === "whatsapp_messages") {
-        // Paginate by id in 1000-row chunks to avoid Supabase 1000-row default cap
-        // AND to keep the Vercel function under its 10s budget. Caller can pass
-        // ?since=YYYY-MM-DD to limit to recent N days (default: last 60 days —
-        // the bot only ever reads the last 30, so 60 is more than enough).
+        // Schema v2 (2026-05-21): phone-grouped + IST date-bucketed.
+        // One Mongo doc per phone with by_date[<IST date>][inbound|outbound]
+        // arrays. We re-use insertMessage() so the exact same write path the
+        // live bot uses is exercised — guarantees backfill matches live shape.
+        //
+        // Paginate Supabase reads in 1000-row chunks. Caller passes
+        // ?since=YYYY-MM-DD (default: last 60 days, since bot only reads 30d).
         const sinceParam = (req.query.since as string) || "";
         const sinceISO = sinceParam
           ? new Date(sinceParam).toISOString()
           : new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString();
         const offset = parseInt(String(req.query.offset || "0"), 10);
         const PAGE = 1000;
+        const RESET = req.query.reset === "1";
+
+        // Optional reset on first page — wipes the Mongo collection so a
+        // re-run doesn't $push duplicate messages into the date arrays.
+        // Caller should ONLY pass reset=1 on the first page (offset=0).
+        if (RESET && offset === 0) {
+          const c = await getCollection(COL.WHATSAPP_MESSAGES);
+          await c.deleteMany({});
+        }
 
         const r = await fetch(
           `${SUPABASE_URL}/rest/v1/whatsapp_messages` +
@@ -4183,34 +4195,36 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           return res.status(500).json({ error: `Supabase fetch failed ${r.status}: ${(await r.text()).slice(0, 200)}` });
         }
         const rows = (await r.json()) as Array<any>;
-        const col = await getCollection(COL.WHATSAPP_MESSAGES);
-        let upserted = 0;
+        const { insertMessage } = await import("./_utils/whatsapp_messages");
+        let pushed = 0;
+        let skipped = 0;
         for (const row of rows) {
-          // Use Supabase id as Mongo _id (prefixed) so re-running is idempotent
-          const _id = `sb_${row.id}`;
-          const doc = {
-            _id,
-            phone: String(row.phone || "").replace(/\D/g, ""),
+          const phone = String(row.phone || "").replace(/\D/g, "");
+          if (!phone || !row.created_at) { skipped++; continue; }
+          await insertMessage({
+            phone,
             direction: row.direction,
             message: row.message || "",
             sender: row.sender ?? null,
             project: row.project ?? null,
             intent: row.intent ?? null,
             created_at: row.created_at,
-          };
-          await col.updateOne({ _id: _id as any }, { $set: doc as any }, { upsert: true });
-          upserted++;
+          });
+          pushed++;
         }
         return res.status(200).json({
           ok: true,
           collection: "whatsapp_messages",
+          schema: "phone_grouped_date_bucketed_v2",
           since: sinceISO,
           offset,
           page_size: PAGE,
           scanned: rows.length,
-          upserted,
+          pushed,
+          skipped,
           next_offset: rows.length === PAGE ? offset + PAGE : null,
           done: rows.length < PAGE,
+          reset_applied: RESET && offset === 0,
         });
       }
 
