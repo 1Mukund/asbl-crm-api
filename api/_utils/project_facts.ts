@@ -1,14 +1,30 @@
 /**
- * Project facts — manually-curated rich Knowledge Base per project,
- * stored in Supabase project_facts table.
+ * Project facts — manually-curated rich Knowledge Base per project.
  *
- * This is the single source of truth for project information that
- * the bot uses as <PROJECT_CONTEXT>. The user maintains it via the
- * dashboard's "Edit KB" form (/api/chat-history?view=edit-facts&project=X).
+ * MIGRATED FROM SUPABASE → MongoDB (Phase 5 of the Mongo migration).
+ * Collection: "project_facts" inside the "Zoho_Database" Mongo db.
+ *
+ * Document schema (per project):
+ *   {
+ *     _id:            "LOFT"           // project name = PK
+ *     project:        "LOFT",
+ *     facts_text:     <curated offer details — manually written>,
+ *     kb_text:        <auto-extracted from uploaded TXT/PDF>,
+ *     kb_pdf_url:     <Supabase Storage public URL of last uploaded KB PDF>,
+ *     offer_end_at:   ISO string or null (powers v5 OFFER_TIME_REMAINING),
+ *     updated_at:     ISO string (touched on every facts_text write),
+ *     kb_updated_at:  ISO string (touched on every kb_text write)
+ *   }
+ *
+ * KB PDFs themselves stay in Supabase Storage per Mukund's directive
+ * (PDFs ko mongo pe mat dalna). Only the extracted TEXT + the public
+ * download URL live here.
+ *
+ * Backfill from Supabase:
+ *   POST /api/chat-history?action=mongo-backfill&collection=project_facts&secret=<...>
  */
 
-const SUPABASE_URL = process.env.SUPABASE_URL || "";
-const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || "";
+import { getCollection, COL } from "./mongo";
 
 export const KNOWN_PROJECTS = ["LOFT", "SPECTRA", "BROADWAY", "LANDMARK", "LEGACY"] as const;
 export type ProjectName = typeof KNOWN_PROJECTS[number];
@@ -20,21 +36,35 @@ export interface ProjectFacts {
   /** General KB content (auto-extracted from uploaded TXT/PDF). */
   kb_text?: string;
   updated_at: string | null;
-  /** When kb_text was last updated (separate from offer's updated_at). */
   kb_updated_at?: string | null;
   kb_pdf_url?: string | null;
+  /** v5: rental/offer expiry timestamp — feeds OFFER_TIME_REMAINING. */
+  offer_end_at?: string | null;
+}
+
+interface ProjectFactsDoc extends ProjectFacts {
+  _id: string;   // project name
+}
+
+function fromDb(doc: any): ProjectFacts {
+  if (!doc) return null as any;
+  return {
+    project: String(doc.project || doc._id || ""),
+    facts_text: String(doc.facts_text || ""),
+    kb_text: doc.kb_text ?? undefined,
+    updated_at: doc.updated_at ?? null,
+    kb_updated_at: doc.kb_updated_at ?? null,
+    kb_pdf_url: doc.kb_pdf_url ?? null,
+    offer_end_at: doc.offer_end_at ?? null,
+  };
 }
 
 // ── Read ───────────────────────────────────────────────────────────────────
 export async function getProjectFacts(project: string): Promise<ProjectFacts | null> {
   try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/project_facts?project=eq.${project}&select=project,facts_text,kb_text,updated_at,kb_updated_at,kb_pdf_url`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
-    if (!r.ok) return null;
-    const rows = await r.json();
-    return rows?.[0] || null;
+    const col = await getCollection<ProjectFactsDoc>(COL.PROJECT_FACTS);
+    const doc = await col.findOne({ _id: project as any });
+    return doc ? fromDb(doc) : null;
   } catch (err: any) {
     console.error(`[ProjectFacts] read failed: ${err.message}`);
     return null;
@@ -44,12 +74,9 @@ export async function getProjectFacts(project: string): Promise<ProjectFacts | n
 // ── Read all (for dashboard) ──────────────────────────────────────────────
 export async function listAllProjectFacts(): Promise<ProjectFacts[]> {
   try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/project_facts?select=project,facts_text,kb_text,updated_at,kb_updated_at,kb_pdf_url&order=project.asc`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
-    if (!r.ok) return [];
-    return (await r.json()) || [];
+    const col = await getCollection<ProjectFactsDoc>(COL.PROJECT_FACTS);
+    const docs = await col.find({}).sort({ _id: 1 }).toArray();
+    return docs.map(fromDb);
   } catch (err: any) {
     console.error(`[ProjectFacts] list failed: ${err.message}`);
     return [];
@@ -58,30 +85,24 @@ export async function listAllProjectFacts(): Promise<ProjectFacts[]> {
 
 // ── Write (upsert) — ONLY touches facts_text (offer details) ──────────────
 // IMPORTANT: this does NOT touch kb_text. Use saveProjectKb() for KB uploads.
-export async function saveProjectFacts(project: string, factsText: string): Promise<{ ok: boolean; error?: string }> {
+export async function saveProjectFacts(
+  project: string,
+  factsText: string,
+): Promise<{ ok: boolean; error?: string }> {
   if (!KNOWN_PROJECTS.includes(project as any)) {
     return { ok: false, error: `Unknown project: ${project}` };
   }
   try {
-    const body = {
-      project,
-      facts_text: factsText,
-      updated_at: new Date().toISOString(),
-    };
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/project_facts`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-        Prefer: "resolution=merge-duplicates,return=minimal",
+    const col = await getCollection<ProjectFactsDoc>(COL.PROJECT_FACTS);
+    const now = new Date().toISOString();
+    await col.updateOne(
+      { _id: project as any },
+      {
+        $setOnInsert: { _id: project, project },
+        $set: { facts_text: factsText, updated_at: now },
       },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) {
-      const t = await r.text();
-      return { ok: false, error: `${r.status}: ${t}` };
-    }
+      { upsert: true },
+    );
     return { ok: true };
   } catch (err: any) {
     return { ok: false, error: err.message };
@@ -93,61 +114,32 @@ export async function saveProjectFacts(project: string, factsText: string): Prom
 export async function saveProjectKb(
   project: string,
   kbText: string,
-  kbPdfUrl: string | null
+  kbPdfUrl: string | null,
 ): Promise<{ ok: boolean; error?: string }> {
   if (!KNOWN_PROJECTS.includes(project as any)) {
     return { ok: false, error: `Unknown project: ${project}` };
   }
   try {
-    // First check if a row exists. If not, we need to insert with empty facts_text
-    // so the upsert doesn't fail on NOT NULL. If yes, PATCH only kb_text fields.
-    const existing = await getProjectFacts(project);
+    const col = await getCollection<ProjectFactsDoc>(COL.PROJECT_FACTS);
     const now = new Date().toISOString();
-
-    if (existing) {
-      // PATCH only the KB fields — facts_text untouched
-      const r = await fetch(`${SUPABASE_URL}/rest/v1/project_facts?project=eq.${project}`, {
-        method: "PATCH",
-        headers: {
-          "Content-Type": "application/json",
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-          Prefer: "return=minimal",
-        },
-        body: JSON.stringify({
-          kb_text: kbText,
-          kb_updated_at: now,
-          ...(kbPdfUrl ? { kb_pdf_url: kbPdfUrl } : {}),
-        }),
-      });
-      if (!r.ok) {
-        const t = await r.text();
-        return { ok: false, error: `${r.status}: ${t}` };
-      }
-    } else {
-      // No row yet → insert with empty facts_text + kb fields populated
-      const r = await fetch(`${SUPABASE_URL}/rest/v1/project_facts`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-          Prefer: "return=minimal",
-        },
-        body: JSON.stringify({
+    const set: any = {
+      kb_text: kbText,
+      kb_updated_at: now,
+    };
+    if (kbPdfUrl) set.kb_pdf_url = kbPdfUrl;
+    await col.updateOne(
+      { _id: project as any },
+      {
+        $setOnInsert: {
+          _id: project,
           project,
           facts_text: "",
-          kb_text: kbText,
-          kb_updated_at: now,
-          ...(kbPdfUrl ? { kb_pdf_url: kbPdfUrl } : {}),
           updated_at: now,
-        }),
-      });
-      if (!r.ok) {
-        const t = await r.text();
-        return { ok: false, error: `${r.status}: ${t}` };
-      }
-    }
+        },
+        $set: set,
+      },
+      { upsert: true },
+    );
     return { ok: true };
   } catch (err: any) {
     return { ok: false, error: err.message };

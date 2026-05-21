@@ -4228,9 +4228,44 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         });
       }
 
+      // ── project_facts (project name = _id, single page — only 5 projects) ─
+      if (collection === "project_facts") {
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/project_facts?select=project,facts_text,kb_text,kb_pdf_url,updated_at,kb_updated_at,offer_end_at&limit=100`,
+          { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
+        );
+        if (!r.ok) {
+          return res.status(500).json({ error: `Supabase fetch failed ${r.status}: ${(await r.text()).slice(0, 200)}` });
+        }
+        const rows = (await r.json()) as Array<any>;
+        const col = await getCollection(COL.PROJECT_FACTS);
+        let upserted = 0;
+        for (const row of rows) {
+          const project = String(row.project || "").toUpperCase();
+          if (!project) continue;
+          const doc = {
+            _id: project,
+            project,
+            facts_text: row.facts_text || "",
+            kb_text: row.kb_text ?? null,
+            kb_pdf_url: row.kb_pdf_url ?? null,
+            offer_end_at: row.offer_end_at ?? null,
+            updated_at: row.updated_at ?? null,
+            kb_updated_at: row.kb_updated_at ?? null,
+          };
+          await col.updateOne({ _id: project as any }, { $set: doc as any }, { upsert: true });
+          upserted++;
+        }
+        return res.status(200).json({
+          ok: true, collection: "project_facts",
+          scanned: rows.length, upserted,
+          projects: rows.map((r) => r.project),
+        });
+      }
+
       return res.status(400).json({
         error: `Unknown collection: ${collection}`,
-        supported: ["bot_settings", "user_profiles", "doc_send_log", "whatsapp_messages"],
+        supported: ["bot_settings", "user_profiles", "doc_send_log", "whatsapp_messages", "project_facts"],
         note: "More collections added as each Phase ships. whatsapp_messages is paginated — re-call with ?offset=<next_offset> until done:true.",
       });
     } catch (err: any) {
