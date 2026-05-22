@@ -3905,6 +3905,225 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // 2026-05-21 "sabko call karo no matter not interested"), filters to
   // Indian phones (Mobile or Phone starts with 91 / +91), and returns
   // a compact list the caller iterates through to fire /api/relay/inhouse-call.
+
+  // ─── Dedupe Zoho leads — clean up the historical duplicates the race ─
+  // condition (fixed in a4e0d62) created. For each phone with >1 leads:
+  //   1. Pick winner (most-advanced status → most recently modified)
+  //   2. Copy missing fields from losers into winner
+  //   3. Repoint Supabase leads.zoho_lead_id (by PLID) to winner
+  //   4. DELETE losers from Zoho
+  //
+  // ?dry=1     preview only (no writes, no deletes)
+  // ?max=N     cap the number of phone groups processed in one batch
+  //            (Vercel 10s budget — keep N small, default 5; each phone
+  //             takes ~1-2s due to Zoho get + update + delete + Supabase
+  //             repoint).
+  //
+  // Caller usage:
+  //   curl '...?action=zoho-dedup-leads&secret=...&dry=1'   # preview
+  //   curl '...?action=zoho-dedup-leads&secret=...&max=5'   # process 5 groups
+  //   (re-call until done:true)
+  if (req.query.action === "zoho-dedup-leads") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    const dry = req.query.dry === "1" || req.query.dry === "true";
+    const maxGroups = Math.max(1, Math.min(parseInt(String(req.query.max || "5"), 10) || 5, 20));
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const token = await getAccessToken();
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const fields =
+        "id,First_Name,Last_Name,Mobile,Phone,Email,Lead_Status,Lead_Source,ASBL_Project," +
+        "Master_Lead_ID,Project_Lead_ID,Modified_Time,Created_Time," +
+        "Resubmission_Count,Last_Resubmission_At,Lead_Comments";
+
+      // 1. Fetch all leads (cap 10 pages = 2000 rows)
+      const all: any[] = [];
+      for (let page = 1; page <= 10; page++) {
+        const r = await fetch(
+          `${ZOHO_API_BASE}/Leads?fields=${fields}` +
+            `&per_page=200&page=${page}&sort_by=Modified_Time&sort_order=desc`,
+          { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
+        );
+        if (r.status === 204) break;
+        if (!r.ok) {
+          return res.status(500).json({
+            error: `Zoho fetch failed page ${page}: ${r.status} ${(await r.text()).slice(0, 200)}`,
+          });
+        }
+        const data = await r.json() as any;
+        const rows = (data?.data || []) as any[];
+        all.push(...rows);
+        if (!data?.info?.more_records) break;
+      }
+
+      // 2. Group by normalised Mobile (digits-only 12-digit form)
+      const groups = new Map<string, any[]>();
+      for (const lead of all) {
+        const raw = String(lead.Mobile || lead.Phone || "").trim();
+        if (!raw) continue;
+        const digits = raw.replace(/\D/g, "");
+        const norm = digits.length === 10 ? `91${digits}` : digits;
+        if (!norm || norm.length !== 12) continue;
+        if (!groups.has(norm)) groups.set(norm, []);
+        groups.get(norm)!.push(lead);
+      }
+
+      // 3. Filter to dupe-only groups
+      const dupeGroups = Array.from(groups.entries()).filter(([_, ls]) => ls.length > 1);
+
+      // 4. Rank statuses — higher index = more advanced (winner)
+      const STATUS_RANK: Record<string, number> = {
+        "":                 0,
+        "Junk":             0,
+        "Not Interested":   1,
+        "Fresh":            2,
+        "First Touch":      3,
+        "Contacted":        4,
+        "Lead Initiated":   5,
+        "Virtual Tour":     6,
+        "Pre Site":         7,
+      };
+      const statusRank = (s: string): number => STATUS_RANK[s] ?? 2;
+
+      const results: any[] = [];
+      let groupsProcessed = 0;
+      let losersDeleted = 0;
+      let winnersUpdated = 0;
+      let supabaseRepoints = 0;
+
+      for (const [phone, leads] of dupeGroups) {
+        if (groupsProcessed >= maxGroups) break;
+        groupsProcessed++;
+
+        // Pick winner: highest status rank, then most recent Modified_Time
+        const sorted = [...leads].sort((a, b) => {
+          const ra = statusRank(a.Lead_Status || "");
+          const rb = statusRank(b.Lead_Status || "");
+          if (ra !== rb) return rb - ra;
+          const ta = new Date(a.Modified_Time || 0).getTime();
+          const tb = new Date(b.Modified_Time || 0).getTime();
+          return tb - ta;
+        });
+        const winner = sorted[0];
+        const losers = sorted.slice(1);
+
+        // Build winner-update delta from losers' fields (fill blanks only)
+        const winnerUpdate: any = {};
+        for (const loser of losers) {
+          if (!winner.Email && loser.Email) winnerUpdate.Email = loser.Email;
+          if (!winner.First_Name && loser.First_Name) winnerUpdate.First_Name = loser.First_Name;
+          if ((!winner.Last_Name || winner.Last_Name === ".") && loser.Last_Name && loser.Last_Name !== ".") {
+            winnerUpdate.Last_Name = loser.Last_Name;
+          }
+          if (!winner.ASBL_Project && loser.ASBL_Project) winnerUpdate.ASBL_Project = loser.ASBL_Project;
+          if (!winner.Lead_Comments && loser.Lead_Comments) winnerUpdate.Lead_Comments = loser.Lead_Comments;
+        }
+
+        const groupResult: any = {
+          phone,
+          winner_id: winner.id,
+          winner_status: winner.Lead_Status,
+          winner_modified: winner.Modified_Time,
+          winner_update_keys: Object.keys(winnerUpdate),
+          loser_ids: losers.map((l) => l.id),
+          loser_summary: losers.map((l) => ({
+            id: l.id, status: l.Lead_Status, modified: l.Modified_Time, plid: l.Project_Lead_ID,
+          })),
+          actions: [] as string[],
+        };
+
+        if (dry) {
+          groupResult.actions.push("DRY — would update winner + delete losers + repoint Supabase plid");
+        } else {
+          // 4a. Patch winner with merged fields (if any)
+          if (Object.keys(winnerUpdate).length) {
+            try {
+              const upd = await fetch(`${ZOHO_API_BASE}/Leads`, {
+                method: "PATCH",
+                headers: {
+                  Authorization: `Zoho-oauthtoken ${token}`,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ data: [{ id: winner.id, ...winnerUpdate }] }),
+              });
+              if (upd.ok) { winnersUpdated++; groupResult.actions.push(`patched winner: ${Object.keys(winnerUpdate).join(",")}`); }
+              else groupResult.actions.push(`WARN patch winner failed: ${upd.status}`);
+            } catch (err: any) {
+              groupResult.actions.push(`ERR patch winner: ${err.message}`);
+            }
+          }
+
+          // 4b. Repoint Supabase leads(plid).zoho_lead_id to winner.id for each loser's plid
+          for (const loser of losers) {
+            const plid = loser.Project_Lead_ID;
+            if (!plid) continue;
+            try {
+              const upd = await fetch(
+                `${SUPABASE_URL}/rest/v1/leads?plid=eq.${encodeURIComponent(plid)}`,
+                {
+                  method: "PATCH",
+                  headers: {
+                    "Content-Type": "application/json",
+                    apikey: SUPABASE_KEY,
+                    Authorization: `Bearer ${SUPABASE_KEY}`,
+                    Prefer: "return=minimal",
+                  },
+                  body: JSON.stringify({ zoho_lead_id: winner.id, updated_at: new Date().toISOString() }),
+                },
+              );
+              if (upd.ok) { supabaseRepoints++; groupResult.actions.push(`supabase repoint ${plid} → ${winner.id}`); }
+              else groupResult.actions.push(`WARN supabase repoint failed ${upd.status}`);
+            } catch (err: any) {
+              groupResult.actions.push(`ERR supabase repoint: ${err.message}`);
+            }
+          }
+
+          // 4c. Delete losers from Zoho
+          for (const loser of losers) {
+            try {
+              const del = await fetch(`${ZOHO_API_BASE}/Leads/${loser.id}`, {
+                method: "DELETE",
+                headers: { Authorization: `Zoho-oauthtoken ${token}` },
+              });
+              if (del.ok || del.status === 204) {
+                losersDeleted++;
+                groupResult.actions.push(`deleted ${loser.id}`);
+              } else {
+                groupResult.actions.push(`WARN delete ${loser.id} failed: ${del.status}`);
+              }
+            } catch (err: any) {
+              groupResult.actions.push(`ERR delete ${loser.id}: ${err.message}`);
+            }
+          }
+        }
+
+        results.push(groupResult);
+      }
+
+      return res.status(200).json({
+        ok: true,
+        dry,
+        max: maxGroups,
+        total_leads_scanned: all.length,
+        total_dupe_phones_found: dupeGroups.length,
+        groups_processed: groupsProcessed,
+        winners_updated: winnersUpdated,
+        losers_deleted: losersDeleted,
+        supabase_repoints: supabaseRepoints,
+        remaining_dupes: Math.max(0, dupeGroups.length - groupsProcessed),
+        done: groupsProcessed >= dupeGroups.length,
+        results,
+      });
+    } catch (err: any) {
+      console.error(`[zoho-dedup-leads] failed: ${err.message}`);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   if (req.query.action === "list-indian-leads") {
     const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
     const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
