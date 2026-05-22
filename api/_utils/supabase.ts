@@ -32,19 +32,32 @@ export async function getOrCreatePLID(
   return String(data);
 }
 
-// ─── Check if lead exists (for dedup) ────────────────────────────────────────
-
+// ─── Lookup existing Zoho lead ID by PLID (the v2 dedupe path) ──────────────
+//
+// PREVIOUS BUG (2026-05-22 fix): this function queried `plid_registry` and
+// selected only the `plid` field — never returned a real `zoho_lead_id`,
+// so the dedupe check in ingestLead always saw null and fell through to
+// the racy Zoho search path. Result: 13 duplicate leads observed in Zoho
+// (3-7 seconds apart on identical phone+project).
+//
+// Now reads from the `leads` table, which stores zoho_lead_id from the
+// previous successful ingest. If a non-null zoho_lead_id comes back, the
+// caller can skip the Zoho search (which has 5-30s indexing lag) and go
+// straight to updateLead with the known ID.
 export async function findLeadByPLID(
   plid: string
-): Promise<{ id: number; zoho_lead_id: string | null } | null> {
+): Promise<{ zoho_lead_id: string | null; updated_at: string | null } | null> {
   const { data, error } = await supabase
-    .from("plid_registry")
-    .select("plid")
+    .from("leads")
+    .select("zoho_lead_id,updated_at")
     .eq("plid", plid)
-    .single();
+    .maybeSingle();
 
   if (error || !data) return null;
-  return data as any;
+  return {
+    zoho_lead_id: data.zoho_lead_id ?? null,
+    updated_at: data.updated_at ?? null,
+  };
 }
 
 // ─── Store lead in Supabase ───────────────────────────────────────────────────

@@ -1,8 +1,9 @@
 import { NormalizedLead } from "./types";
-import { getOrCreateMLID, getOrCreatePLID, upsertLead } from "./supabase";
+import { getOrCreateMLID, getOrCreatePLID, upsertLead, findLeadByPLID } from "./supabase";
 import {
   findLeadByPhoneAndProject,
   findLeadByPhone,
+  getLeadById,
   createLead,
   updateLead,
 } from "./zoho";
@@ -85,12 +86,54 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
     Time_Spent_Minutes: lead.time_spent_minutes ?? 0,
   };
 
-  // ── Step 3: Dedup check in Zoho + Create or Update ───────────────────────
+  // ── Step 3: Dedup — Supabase first (atomic), Zoho search second ──────────
+  //
+  // The Zoho search API has 5-30 seconds of indexing lag after a new lead
+  // is created, so two ingest requests for the same (phone, project) within
+  // that window BOTH see "no existing lead" and BOTH call createLead =>
+  // duplicate rows. (Observed 2026-05-22: 13 phones with 2 dupes each, all
+  // created 3-7 seconds apart, identical MLID/PLID, identical project.)
+  //
+  // Fix: pre-check Supabase `leads` table by PLID. PLID generation already
+  // uses a serialised Postgres function so it's race-safe — the leads row
+  // gets a zoho_lead_id once the FIRST ingest completes its upsertLead
+  // (last step below). Subsequent ingests with the same PLID see the
+  // zoho_lead_id immediately and skip Zoho search entirely, eliminating
+  // the indexing-lag race window.
+  //
+  // Race still possible: two requests both reach this lookup BEFORE the
+  // first one completes its upsertLead. Window is now ~100ms instead of
+  // ~30s — orders of magnitude smaller. Phase 7 will move the leads table
+  // to Mongo where findOneAndUpdate $setOnInsert closes the window
+  // entirely.
   let existingLead: any = null;
-  if (project) {
-    existingLead = await findLeadByPhoneAndProject(mobile, project);
-  } else {
-    existingLead = await findLeadByPhone(mobile);
+  try {
+    const supabaseHit = await findLeadByPLID(plid);
+    if (supabaseHit?.zoho_lead_id) {
+      // Direct GET by ID — no search-index lag. We need the full record
+      // (Resubmission_Count etc.) so recordResubmission can increment the
+      // counter correctly instead of starting back at 1.
+      try {
+        existingLead = await getLeadById(supabaseHit.zoho_lead_id);
+        if (existingLead) {
+          console.log(`[Ingest] dedup hit via Supabase leads (plid=${plid} → ${supabaseHit.zoho_lead_id}) — skipped Zoho search`);
+        } else {
+          console.warn(`[Ingest] Supabase had zoho_lead_id=${supabaseHit.zoho_lead_id} but Zoho GET returned null — falling through to search`);
+        }
+      } catch (err: any) {
+        console.error(`[Ingest] getLeadById(${supabaseHit.zoho_lead_id}) threw: ${err.message} — falling through to search`);
+      }
+    }
+  } catch (err: any) {
+    console.error(`[Ingest] Supabase pre-check failed (${err.message}) — falling through to Zoho search`);
+  }
+
+  if (!existingLead) {
+    if (project) {
+      existingLead = await findLeadByPhoneAndProject(mobile, project);
+    } else {
+      existingLead = await findLeadByPhone(mobile);
+    }
   }
 
   let zohoLeadId: string;

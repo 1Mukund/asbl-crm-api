@@ -103,6 +103,23 @@ const LEAD_LOOKUP_FIELDS =
   "id,First_Name,Last_Name,Mobile,Master_Lead_ID,Project_Lead_ID,ASBL_Project," +
   "Resubmission_Count,Resubmission_History,Last_Resubmission_At,Last_Resubmission_Source";
 
+/** Direct-by-ID lookup — no search index lag. Returns the same fields
+ *  as findLeadByPhone* so callers can use them interchangeably. */
+export async function getLeadById(zohoLeadId: string): Promise<any | null> {
+  const token = await getAccessToken();
+  try {
+    const res = await axios.get(`${ZOHO_API_BASE}/Leads/${zohoLeadId}`, {
+      headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      params: { fields: LEAD_LOOKUP_FIELDS },
+    });
+    return res.data?.data?.[0] ?? null;
+  } catch (err: any) {
+    if (err.response?.status === 204 || err.response?.status === 404) return null;
+    const detail = err.response?.data ?? err.message;
+    throw new Error(`Zoho getLeadById failed: ${JSON.stringify(detail)}`);
+  }
+}
+
 export async function findLeadByPhone(phone: string): Promise<any | null> {
   const token = await getAccessToken();
   try {
