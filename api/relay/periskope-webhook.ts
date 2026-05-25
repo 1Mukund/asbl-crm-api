@@ -805,11 +805,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // When bot_enabled=false we STILL log the inbound message so the chat
     // history stays complete, but skip Gemini + Periskope reply entirely.
     // No funnel updates, no doc dispatch — completely silent.
+    //
+    // Project resolution happens further down in the handler; for the
+    // disabled path we tag the message with current_project from the
+    // user_profile (if known from prior interactions). Good enough — the
+    // bot isn't going to reason about it anyway.
     if (userProfile.bot_enabled === false) {
       console.log(`[Periskope Webhook] Bot disabled for ${phone} — logging inbound only, skipping reply`);
-      // Save inbound for history even though we won't reply
       try {
-        await saveMessage(phone, "inbound", message, sender, project, null);
+        const tagProject = (userProfile.current_project || userProfile.last_project || null) as Project | null;
+        await saveMessage(phone, "inbound", message, sender, tagProject, null);
       } catch (err: any) {
         console.error(`[Periskope Webhook] inbound save failed (bot off): ${err.message}`);
       }
