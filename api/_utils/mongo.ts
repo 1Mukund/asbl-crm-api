@@ -47,8 +47,12 @@ export const COL = {
   MLID_REGISTRY:      "mlid_registry",
   PLID_REGISTRY:      "plid_registry",
   PRD_STATE:          "prd_state",
+  WHATSAPP_SENDER_MAP: "whatsapp_sender_map",
+  FOLLOW_UP_LOG:      "follow_up_log",
+  CRON_LOG:           "cron_log",
   /** Internal: monotonic counters used by getNextSequence() to mimic
-   *  Postgres serial sequences atomically (e.g. for MLID/PLID). */
+   *  Postgres serial sequences atomically (e.g. for MLID/PLID + the
+   *  round-robin sender index). */
   COUNTERS:           "_counters",
 } as const;
 

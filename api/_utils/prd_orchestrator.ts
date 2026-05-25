@@ -54,29 +54,13 @@ const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || "";
 
 async function pickSender(phone: string): Promise<string> {
-  // Try existing sender mapping first (returning customer = same RM)
+  // Phase 8: migrated from Supabase to Mongo (whatsapp_sender_map + _counters.sender_idx).
   try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/whatsapp_sender_map?phone=eq.${encodeURIComponent(phone)}&select=sender&limit=1`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
-    );
-    const rows = (await r.json()) as Array<{ sender: string }>;
-    if (Array.isArray(rows) && rows[0]?.sender) return rows[0].sender;
-  } catch {}
-  // Round-robin via Supabase atomic RPC
-  try {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/get_next_sender_index`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-      },
-      body: JSON.stringify({ num_senders: SENDER_POOL.length }),
-    });
-    const idx = (await r.json()) as number;
-    const safe = (typeof idx === "number" && idx >= 0) ? idx % SENDER_POOL.length : 0;
-    return SENDER_POOL[safe];
+    const { getSenderForPhone, getNextSenderIndex } = await import("./ops_collections");
+    const existing = await getSenderForPhone(phone);
+    if (existing) return existing;
+    const idx = await getNextSenderIndex(SENDER_POOL.length);
+    return SENDER_POOL[idx] || SENDER_POOL[0];
   } catch {
     return SENDER_POOL[Math.floor(Math.random() * SENDER_POOL.length)];
   }
@@ -112,16 +96,9 @@ async function fireChatbotMessage(phone: string, message: string, project?: stri
         project: project || null, intent: null,
         created_at: new Date().toISOString(),
       });
-      await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_sender_map`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-          Prefer: "resolution=merge-duplicates",
-        },
-        body: JSON.stringify({ phone, sender, updated_at: new Date().toISOString() }),
-      });
+      // Phase 8: Mongo
+      const { setSenderForPhone } = await import("./ops_collections");
+      await setSenderForPhone(phone, sender);
     } catch {}
     return { ok: true };
   } catch (err: any) {

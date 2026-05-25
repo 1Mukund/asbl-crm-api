@@ -87,23 +87,12 @@ function nowZohoIso(): string {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "+00:00");
 }
 
-/** Round-robin sender pick — fallback to random if Supabase RPC unavailable. */
+/** Round-robin sender pick (Phase 8: Mongo _counters.sender_idx). */
 async function pickSender(): Promise<string> {
   try {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/get_next_sender_index`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-      },
-      body: JSON.stringify({ num_senders: SENDER_NUMBERS.length }),
-    });
-    const idx = (await r.json()) as number;
-    const safe = (typeof idx === "number" && idx >= 0)
-      ? idx % SENDER_NUMBERS.length
-      : 0;
-    return SENDER_NUMBERS[safe];
+    const { getNextSenderIndex } = await import("./ops_collections");
+    const idx = await getNextSenderIndex(SENDER_NUMBERS.length);
+    return SENDER_NUMBERS[idx] || SENDER_NUMBERS[0];
   } catch {
     return SENDER_NUMBERS[Math.floor(Math.random() * SENDER_NUMBERS.length)];
   }
@@ -208,16 +197,9 @@ async function saveWhatsAppMessage(phone: string, message: string, sender: strin
  *  number — same pattern as api/relay/periskope.ts. */
 async function storeSenderMapping(phone: string, sender: string): Promise<void> {
   try {
-    await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_sender_map`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-        Prefer: "resolution=merge-duplicates",
-      },
-      body: JSON.stringify({ phone, sender, updated_at: new Date().toISOString() }),
-    });
+    // Phase 8: Mongo
+    const { setSenderForPhone } = await import("./ops_collections");
+    await setSenderForPhone(phone, sender);
   } catch {}
 }
 

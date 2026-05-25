@@ -119,31 +119,21 @@ async function logCronRun(
   error: string | null,
 ): Promise<void> {
   try {
-    await fetch(`${SUPABASE_URL}/rest/v1/cron_log`, {
-      method: "POST",
-      headers: {
-        "Content-Type":  "application/json",
-        apikey:          SUPABASE_KEY,
-        Authorization:   `Bearer ${SUPABASE_KEY}`,
-      },
-      body: JSON.stringify({
-        task,
-        duration_ms: durationMs,
-        result,
-        error,
-      }),
-    });
+    const { appendCronLog } = await import("../_utils/ops_collections");
+    await appendCronLog({ task, duration_ms: durationMs, result, error });
   } catch (err: any) {
     console.error(`[CronLog] log failed: ${err.message}`);
   }
 }
 
-// ── Get sender for phone from whatsapp_sender_map ─────────────────────────────
+// ── Get sender for phone (Phase 8: Mongo) ────────────────────────────────────
 async function getSender(phone: string): Promise<string | null> {
-  const rows = await supabaseGet(
-    `whatsapp_sender_map?phone=eq.${phone}&limit=1`
-  );
-  return rows?.[0]?.sender || null;
+  try {
+    const { getSenderForPhone } = await import("../_utils/ops_collections");
+    return await getSenderForPhone(phone);
+  } catch {
+    return null;
+  }
 }
 
 // ── Send via Periskope ────────────────────────────────────────────────────────
@@ -458,8 +448,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const inbound = await getAllByDirection("inbound", 5000);
     const repliedPhones = new Set(inbound.map((r: any) => r.phone));
 
-    // 3. Get follow-up log
-    const followupLog = await supabaseGet(`follow_up_log?limit=2000`);
+    // 3. Get follow-up log (Phase 8: Mongo)
+    const { getAllFollowUpLog } = await import("../_utils/ops_collections");
+    const followupLog = await getAllFollowUpLog(5000);
     const followupCount = new Map<string, number>(); // phone → max day sent
     for (const row of followupLog) {
       const current = followupCount.get(row.phone) || 0;
@@ -494,11 +485,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       try {
         await sendMessage(phone, sender, message);
 
-        // Log to Supabase
-        await supabasePost("follow_up_log", {
-          phone,
-          follow_up_day: nextFollowupDay,
-          sender,
+        // Log to Mongo (Phase 8)
+        const { appendFollowUpLog } = await import("../_utils/ops_collections");
+        await appendFollowUpLog({
+          phone, follow_up_day: nextFollowupDay, sender,
         });
 
         // Save to whatsapp_messages (Phase 4: Mongo)

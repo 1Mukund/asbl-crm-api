@@ -35,23 +35,13 @@ const SENDER_NUMBERS = [
   "917995284040", // Anandita
 ];
 
-// Get next sender via atomic Supabase RPC (true round-robin)
+// Get next sender via atomic Mongo counter (Phase 8: was Supabase RPC).
 async function getNextSender(): Promise<string> {
   try {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/get_next_sender_index`, {
-      method: "POST",
-      headers: {
-        "Content-Type":  "application/json",
-        "apikey":        SUPABASE_KEY,
-        "Authorization": `Bearer ${SUPABASE_KEY}`,
-      },
-      body: JSON.stringify({ num_senders: SENDER_NUMBERS.length }),
-    });
-    const idx = await r.json() as number;
-    const safeIdx = (typeof idx === "number" && idx >= 0) ? idx % SENDER_NUMBERS.length : 0;
-    return SENDER_NUMBERS[safeIdx];
+    const { getNextSenderIndex } = await import("../_utils/ops_collections");
+    const idx = await getNextSenderIndex(SENDER_NUMBERS.length);
+    return SENDER_NUMBERS[idx] || SENDER_NUMBERS[0];
   } catch (err) {
-    // Fallback: random pick if Supabase fails
     console.error("[Periskope] Sender index fetch failed, using random:", err);
     return SENDER_NUMBERS[Math.floor(Math.random() * SENDER_NUMBERS.length)];
   }
@@ -96,19 +86,11 @@ async function saveMessage(phone: string, direction: "inbound" | "outbound", mes
   }
 }
 
-// ── Store sender mapping in Supabase ─────────────────────────────────────────
+// ── Store sender mapping in Mongo (Phase 8: was Supabase) ────────────────────
 async function storeSenderMapping(phone: string, sender: string): Promise<void> {
   try {
-    await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_sender_map`, {
-      method: "POST",
-      headers: {
-        "Content-Type":  "application/json",
-        "apikey":        SUPABASE_KEY,
-        "Authorization": `Bearer ${SUPABASE_KEY}`,
-        "Prefer":        "resolution=merge-duplicates",
-      },
-      body: JSON.stringify({ phone, sender, updated_at: new Date().toISOString() }),
-    });
+    const { setSenderForPhone } = await import("../_utils/ops_collections");
+    await setSenderForPhone(phone, sender);
   } catch (err) {
     console.error("[Periskope] Failed to store sender mapping:", err);
   }

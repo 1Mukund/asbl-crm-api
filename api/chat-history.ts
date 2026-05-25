@@ -225,14 +225,15 @@ function nextCronRun(schedule: string): string {
 async function renderDashboard(): Promise<string> {
   const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
-  // whatsapp_messages: Mongo (Phase 4). Other tables: still Supabase pending migration.
+  // All tables Mongo-backed as of Phase 8.
   const { getRecentActivity, getInboundIntentStats } = await import("./_utils/whatsapp_messages");
   const { listAllProfiles } = await import("./_utils/user_profile");
+  const { getRecentCronRuns } = await import("./_utils/ops_collections");
   const [factsRows, msgs24h, intentAgg, cronRows, docRows, inventory, profiles] = await Promise.all([
     listAllProjectFacts(),
     getRecentActivity(since24h, 300),
     getInboundIntentStats(since24h),
-    sb(`cron_log?select=task,ran_at,duration_ms,result,error&order=ran_at.desc&limit=20`),
+    getRecentCronRuns(20),
     listAllDocs({ limit: 200 }),
     getAllInventoryRows().catch((err: any) => {
       console.error("[Dashboard] Inventory fetch failed:", err.message);
@@ -4661,9 +4662,108 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         });
       }
 
+      // ── whatsapp_sender_map ─────────────────────────────────────────────
+      if (collection === "whatsapp_sender_map") {
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/whatsapp_sender_map?select=phone,sender,updated_at&limit=2000`,
+          { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
+        );
+        if (!r.ok) {
+          return res.status(500).json({ error: `Supabase fetch failed ${r.status}: ${(await r.text()).slice(0, 200)}` });
+        }
+        const rows = (await r.json()) as Array<any>;
+        const col = await getCollection(COL.WHATSAPP_SENDER_MAP);
+        let upserted = 0;
+        for (const row of rows) {
+          const phone = String(row.phone || "").replace(/\D/g, "");
+          if (!phone) continue;
+          await col.updateOne(
+            { _id: phone as any },
+            {
+              $set: {
+                _id: phone, phone,
+                sender: String(row.sender || ""),
+                updated_at: row.updated_at || new Date().toISOString(),
+              } as any,
+            },
+            { upsert: true },
+          );
+          upserted++;
+        }
+        return res.status(200).json({ ok: true, collection: "whatsapp_sender_map", scanned: rows.length, upserted });
+      }
+
+      // ── follow_up_log (append-only) ─────────────────────────────────────
+      if (collection === "follow_up_log") {
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/follow_up_log?select=id,phone,follow_up_day,sender,created_at&order=created_at.asc&limit=5000`,
+          { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
+        );
+        if (!r.ok) {
+          return res.status(500).json({ error: `Supabase fetch failed ${r.status}: ${(await r.text()).slice(0, 200)}` });
+        }
+        const rows = (await r.json()) as Array<any>;
+        const col = await getCollection(COL.FOLLOW_UP_LOG);
+        let upserted = 0;
+        for (const row of rows) {
+          // Use Supabase id as Mongo _id ("sb_<id>") for idempotency
+          const _id = row.id ? `sb_${row.id}` : undefined;
+          if (!_id) continue;
+          await col.updateOne(
+            { _id: _id as any },
+            {
+              $set: {
+                _id,
+                phone: String(row.phone || "").replace(/\D/g, ""),
+                follow_up_day: Number(row.follow_up_day || 0),
+                sender: String(row.sender || ""),
+                created_at: row.created_at,
+              } as any,
+            },
+            { upsert: true },
+          );
+          upserted++;
+        }
+        return res.status(200).json({ ok: true, collection: "follow_up_log", scanned: rows.length, upserted });
+      }
+
+      // ── cron_log (append-only, recent ~1000 most useful) ────────────────
+      if (collection === "cron_log") {
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/cron_log?select=id,task,ran_at,duration_ms,result,error&order=ran_at.desc&limit=1000`,
+          { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
+        );
+        if (!r.ok) {
+          return res.status(500).json({ error: `Supabase fetch failed ${r.status}: ${(await r.text()).slice(0, 200)}` });
+        }
+        const rows = (await r.json()) as Array<any>;
+        const col = await getCollection(COL.CRON_LOG);
+        let upserted = 0;
+        for (const row of rows) {
+          const _id = row.id ? `sb_${row.id}` : undefined;
+          if (!_id) continue;
+          await col.updateOne(
+            { _id: _id as any },
+            {
+              $set: {
+                _id,
+                task: String(row.task || ""),
+                ran_at: row.ran_at,
+                duration_ms: Number(row.duration_ms || 0),
+                result: row.result,
+                error: row.error ?? null,
+              } as any,
+            },
+            { upsert: true },
+          );
+          upserted++;
+        }
+        return res.status(200).json({ ok: true, collection: "cron_log", scanned: rows.length, upserted });
+      }
+
       return res.status(400).json({
         error: `Unknown collection: ${collection}`,
-        supported: ["bot_settings", "user_profiles", "doc_send_log", "whatsapp_messages", "project_facts", "project_documents", "mlid_registry", "plid_registry", "leads"],
+        supported: ["bot_settings", "user_profiles", "doc_send_log", "whatsapp_messages", "project_facts", "project_documents", "mlid_registry", "plid_registry", "leads", "whatsapp_sender_map", "follow_up_log", "cron_log"],
         note: "More collections added as each Phase ships. whatsapp_messages + leads are paginated — re-call with ?offset=<next_offset> until done:true.",
       });
     } catch (err: any) {
