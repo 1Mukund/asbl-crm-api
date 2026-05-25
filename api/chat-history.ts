@@ -4546,10 +4546,125 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         });
       }
 
+      // ── mlid_registry (~ leads count) ───────────────────────────────────
+      if (collection === "mlid_registry") {
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/mlid_registry?select=phone,mlid,created_at&order=mlid.asc&limit=2000`,
+          { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
+        );
+        if (!r.ok) {
+          return res.status(500).json({ error: `Supabase fetch failed ${r.status}: ${(await r.text()).slice(0, 200)}` });
+        }
+        const rows = (await r.json()) as Array<any>;
+        const col = await getCollection(COL.MLID_REGISTRY);
+        let upserted = 0;
+        let maxMlid = 0;
+        for (const row of rows) {
+          const phone = String(row.phone || "").replace(/\D/g, "");
+          if (!phone) continue;
+          const mlid = String(row.mlid);
+          const n = parseInt(mlid, 10);
+          if (isFinite(n) && n > maxMlid) maxMlid = n;
+          await col.updateOne(
+            { _id: phone as any },
+            { $set: { _id: phone, phone, mlid, created_at: row.created_at ?? null } as any },
+            { upsert: true },
+          );
+          upserted++;
+        }
+        // Seed the Mongo counter so future getNextSequence("mlid") doesn't
+        // collide with already-issued MLIDs. Add a +10 buffer for safety.
+        if (maxMlid > 0) {
+          const counters = await getCollection(COL.COUNTERS);
+          await counters.updateOne(
+            { _id: "mlid" as any },
+            { $set: { _id: "mlid", seq: maxMlid + 10 } as any },
+            { upsert: true },
+          );
+        }
+        return res.status(200).json({
+          ok: true, collection: "mlid_registry",
+          scanned: rows.length, upserted, max_mlid_seen: maxMlid,
+          counter_seeded_to: maxMlid > 0 ? maxMlid + 10 : null,
+        });
+      }
+
+      // ── plid_registry ───────────────────────────────────────────────────
+      if (collection === "plid_registry") {
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/plid_registry?select=phone,mlid,project,plid,created_at&limit=4000`,
+          { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
+        );
+        if (!r.ok) {
+          return res.status(500).json({ error: `Supabase fetch failed ${r.status}: ${(await r.text()).slice(0, 200)}` });
+        }
+        const rows = (await r.json()) as Array<any>;
+        const col = await getCollection(COL.PLID_REGISTRY);
+        let upserted = 0;
+        for (const row of rows) {
+          const plid = String(row.plid || "").trim();
+          if (!plid) continue;
+          await col.updateOne(
+            { _id: plid as any },
+            {
+              $set: {
+                _id: plid,
+                plid,
+                phone: String(row.phone || "").replace(/\D/g, ""),
+                mlid: String(row.mlid || ""),
+                project: String(row.project || ""),
+                created_at: row.created_at ?? null,
+              } as any,
+            },
+            { upsert: true },
+          );
+          upserted++;
+        }
+        return res.status(200).json({
+          ok: true, collection: "plid_registry",
+          scanned: rows.length, upserted,
+        });
+      }
+
+      // ── leads (paginated — 1000 per page) ──────────────────────────────
+      if (collection === "leads") {
+        const offset = parseInt(String(req.query.offset || "0"), 10);
+        const PAGE = 500;
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/leads?select=*&order=updated_at.desc&limit=${PAGE}&offset=${offset}`,
+          { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
+        );
+        if (!r.ok) {
+          return res.status(500).json({ error: `Supabase fetch failed ${r.status}: ${(await r.text()).slice(0, 200)}` });
+        }
+        const rows = (await r.json()) as Array<any>;
+        const col = await getCollection(COL.LEADS);
+        let upserted = 0;
+        for (const row of rows) {
+          const plid = String(row.plid || "").trim();
+          if (!plid) continue;
+          const doc: any = { ...row, _id: plid };
+          // drop Supabase's internal id field — _id is plid
+          delete doc.id;
+          await col.updateOne({ _id: plid as any }, { $set: doc }, { upsert: true });
+          upserted++;
+        }
+        return res.status(200).json({
+          ok: true,
+          collection: "leads",
+          offset,
+          page_size: PAGE,
+          scanned: rows.length,
+          upserted,
+          next_offset: rows.length === PAGE ? offset + PAGE : null,
+          done: rows.length < PAGE,
+        });
+      }
+
       return res.status(400).json({
         error: `Unknown collection: ${collection}`,
-        supported: ["bot_settings", "user_profiles", "doc_send_log", "whatsapp_messages", "project_facts", "project_documents"],
-        note: "More collections added as each Phase ships. whatsapp_messages is paginated — re-call with ?offset=<next_offset> until done:true.",
+        supported: ["bot_settings", "user_profiles", "doc_send_log", "whatsapp_messages", "project_facts", "project_documents", "mlid_registry", "plid_registry", "leads"],
+        note: "More collections added as each Phase ships. whatsapp_messages + leads are paginated — re-call with ?offset=<next_offset> until done:true.",
       });
     } catch (err: any) {
       console.error(`[mongo-backfill ${collection}] failed: ${err.message}`);
