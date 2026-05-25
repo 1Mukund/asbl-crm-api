@@ -4662,10 +4662,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         });
       }
 
-      // ── whatsapp_sender_map ─────────────────────────────────────────────
+      // ── whatsapp_sender_map (Supabase column is `created_at`, not updated_at) ─
       if (collection === "whatsapp_sender_map") {
         const r = await fetch(
-          `${SUPABASE_URL}/rest/v1/whatsapp_sender_map?select=phone,sender,updated_at&limit=2000`,
+          `${SUPABASE_URL}/rest/v1/whatsapp_sender_map?select=phone,sender,created_at&limit=2000`,
           { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
         );
         if (!r.ok) {
@@ -4683,7 +4683,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               $set: {
                 _id: phone, phone,
                 sender: String(row.sender || ""),
-                updated_at: row.updated_at || new Date().toISOString(),
+                updated_at: row.created_at || new Date().toISOString(),
               } as any,
             },
             { upsert: true },
@@ -4693,10 +4693,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return res.status(200).json({ ok: true, collection: "whatsapp_sender_map", scanned: rows.length, upserted });
       }
 
-      // ── follow_up_log (append-only) ─────────────────────────────────────
+      // ── follow_up_log (append-only — order by id since created_at isn't a column) ─
       if (collection === "follow_up_log") {
         const r = await fetch(
-          `${SUPABASE_URL}/rest/v1/follow_up_log?select=id,phone,follow_up_day,sender,created_at&order=created_at.asc&limit=5000`,
+          `${SUPABASE_URL}/rest/v1/follow_up_log?select=*&order=id.asc&limit=5000`,
           { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
         );
         if (!r.ok) {
@@ -4706,9 +4706,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const col = await getCollection(COL.FOLLOW_UP_LOG);
         let upserted = 0;
         for (const row of rows) {
-          // Use Supabase id as Mongo _id ("sb_<id>") for idempotency
           const _id = row.id ? `sb_${row.id}` : undefined;
           if (!_id) continue;
+          // Supabase column is `sent_at` (per actual prod schema, not created_at).
+          // We map whatever timestamp field is present to Mongo `created_at`.
+          const ts = row.created_at || row.sent_at || row.inserted_at || null;
           await col.updateOne(
             { _id: _id as any },
             {
@@ -4717,14 +4719,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 phone: String(row.phone || "").replace(/\D/g, ""),
                 follow_up_day: Number(row.follow_up_day || 0),
                 sender: String(row.sender || ""),
-                created_at: row.created_at,
+                created_at: ts,
               } as any,
             },
             { upsert: true },
           );
           upserted++;
         }
-        return res.status(200).json({ ok: true, collection: "follow_up_log", scanned: rows.length, upserted });
+        return res.status(200).json({
+          ok: true, collection: "follow_up_log",
+          scanned: rows.length, upserted,
+          sample_columns: rows[0] ? Object.keys(rows[0]) : [],
+        });
       }
 
       // ── cron_log (append-only, recent ~1000 most useful) ────────────────
