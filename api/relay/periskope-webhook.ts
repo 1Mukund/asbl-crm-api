@@ -454,19 +454,12 @@ async function getProjectContextText(project: Project | null): Promise<string> {
   return combined.length > 24000 ? combined.slice(0, 24000) + "\n... (truncated)" : combined;
 }
 
-// ── Fetch + format PDF extracts for a single project ─────────────────────
+// ── Fetch + format PDF extracts for a single project (Phase 6: Mongo) ─────
 async function fetchPdfExtractsForProject(project: Project): Promise<string> {
   try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/project_documents` +
-        `?project=eq.${project}` +
-        `&text_extract=not.is.null` +
-        `&select=doc_type,size_label,text_extract,filename` +
-        `&order=fetched_at.desc&limit=20`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
-    const rows = (await r.json()) as Array<any>;
-    if (!Array.isArray(rows) || !rows.length) return "";
+    const { findExtractedDocsForProject } = await import("../_utils/project_documents");
+    const rows = await findExtractedDocsForProject(project, 20);
+    if (!rows.length) return "";
 
     // Group by doc_type — only keep latest extract per type (latest already first via order)
     const seen = new Set<string>();

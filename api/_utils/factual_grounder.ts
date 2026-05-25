@@ -75,19 +75,24 @@ async function fetchDocsForGrounding(project: string): Promise<DocSnippet[]> {
   // We pull unit_plan + specifications + brochure + master_plan + amenities
   // — these cover most factual questions. Skip price_sheet (frequently has
   // numeric tables that confuse text-only extraction).
-  const docTypes = "(unit_plan,specifications,brochure,master_plan,amenities,floor_plan)";
-  const r = await fetch(
-    `${SUPABASE_URL}/rest/v1/project_documents` +
-      `?project=eq.${encodeURIComponent(project)}` +
-      `&doc_type=in.${docTypes}` +
-      `&text_extract=not.is.null` +
-      `&select=doc_type,size_label,filename,text_extract` +
-      `&order=fetched_at.desc&limit=8`,
-    { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
-  );
-  if (!r.ok) return [];
-  const rows = (await r.json()) as DocSnippet[];
-  return Array.isArray(rows) ? rows.filter((d) => d.text_extract && d.text_extract.length > 50) : [];
+  // Phase 6: migrated from Supabase to Mongo.
+  try {
+    const wantTypes = new Set(["unit_plan", "specifications", "brochure", "master_plan", "amenities", "floor_plan"]);
+    const { findExtractedDocsForProject } = await import("./project_documents");
+    const all = await findExtractedDocsForProject(project, 50);
+    const rows: DocSnippet[] = all
+      .filter((d) => wantTypes.has(d.doc_type) && d.text_extract && d.text_extract.length > 50)
+      .slice(0, 8)
+      .map((d) => ({
+        doc_type: d.doc_type,
+        size_label: d.size_label ?? null,
+        filename: d.filename,
+        text_extract: d.text_extract ?? "",
+      }));
+    return rows;
+  } catch {
+    return [];
+  }
 }
 
 /** Squash a long text_extract for the prompt — keep dimensions section

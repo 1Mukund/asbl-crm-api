@@ -4,6 +4,7 @@ import { getAllInventoryRows, getInventoryForProject, refreshInventoryCache, INV
 import { uploadToStorage, extractTextFromPDF, decodeBase64Text, decodeBase64Buffer, createSignedUploadUrl, downloadFromStorage } from "./_utils/storage_upload";
 import { callGemini, ANANDITA_SYSTEM_PROMPT } from "./_utils/gemini_chat";
 import { getBotSetting, setBotSetting } from "./_utils/bot_settings";
+import { listAllDocs, insertDoc, updateDocFields, deleteDoc, upsertDocBySupabaseId } from "./_utils/project_documents";
 
 // Bump body-parser limit for base64 PDF uploads (default is 1MB).
 // 50MB binary PDF → ~67MB base64 JSON, so allow 70MB headroom.
@@ -232,7 +233,7 @@ async function renderDashboard(): Promise<string> {
     getRecentActivity(since24h, 300),
     getInboundIntentStats(since24h),
     sb(`cron_log?select=task,ran_at,duration_ms,result,error&order=ran_at.desc&limit=20`),
-    sb(`project_documents?select=id,project,doc_type,size_label,unit_size_sft,facing,tower,filename,url,fetched_at&order=fetched_at.desc&limit=200`),
+    listAllDocs({ limit: 200 }),
     getAllInventoryRows().catch((err: any) => {
       console.error("[Dashboard] Inventory fetch failed:", err.message);
       return { rows: [], fetchedAt: 0 };
@@ -1186,7 +1187,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         sizeLabel,
       });
 
-      // Insert row in project_documents
+      // Insert row in project_documents (Phase 6: Mongo)
       const insertBody: any = {
         project,
         doc_type: docType,
@@ -1195,23 +1196,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       };
       if (sizeLabel) insertBody.size_label = sizeLabel;
 
-      const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/project_documents`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-          Prefer: "return=representation",
-        },
-        body: JSON.stringify(insertBody),
-      });
-
-      if (!insertRes.ok) {
-        const errText = await insertRes.text();
-        return res.status(500).json({ error: `DB insert failed: ${errText.slice(0, 200)}` });
+      let insertedId: string;
+      try {
+        insertedId = await insertDoc(insertBody);
+      } catch (err: any) {
+        return res.status(500).json({ error: `DB insert failed: ${err.message}` });
       }
-
-      const inserted = await insertRes.json();
+      const inserted = { _id: insertedId, ...insertBody };
       return res.status(200).json({
         ok: true,
         project,
@@ -3828,25 +3819,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         insertBody.text_extracted_at = new Date().toISOString();
       }
 
-      const insRes = await fetch(`${SUPABASE_URL}/rest/v1/project_documents`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-          Prefer: "return=representation",
-        },
-        body: JSON.stringify(insertBody),
-      });
-      if (!insRes.ok) {
-        return res.status(500).json({ error: `DB insert failed: ${(await insRes.text()).slice(0, 200)}` });
+      // Phase 6: Mongo insert
+      let insertedId: string;
+      try {
+        insertedId = await insertDoc(insertBody);
+      } catch (err: any) {
+        return res.status(500).json({ error: `DB insert failed: ${err.message}` });
       }
       return res.status(200).json({
         ok: true,
         project, docType, sizeLabel, publicUrl,
         text_extracted: !!textExtract,
         text_extract_chars: textExtract.length,
-        record: await insRes.json(),
+        record: { _id: insertedId, ...insertBody },
       });
     } catch (err: any) {
       console.error(`[upload-finalize] failed: ${err.message}`);
@@ -3891,28 +3876,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
     }
     try {
-      // Find all PDF rows missing text_extract
-      const r = await fetch(
-        `${SUPABASE_URL}/rest/v1/project_documents?text_extract=is.null&select=id,project,doc_type,filename,url&limit=200`,
-        { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-      );
-      const rows = (await r.json()) as Array<any>;
+      // Find all PDF rows missing text_extract (Phase 6: Mongo)
+      const rows = await listAllDocs({ missing_text_extract: true, limit: 200 });
       const results: any[] = [];
-      for (const row of rows) {
+      for (const row of rows as any[]) {
         const url = String(row.url || "");
         const filename = String(row.filename || "");
         const isPdf = filename.toLowerCase().endsWith(".pdf") || url.toLowerCase().includes(".pdf");
         if (!isPdf) {
-          results.push({ id: row.id, skipped: "not a pdf" });
+          results.push({ id: row._id, skipped: "not a pdf" });
           continue;
         }
         try {
-          // Generic public-URL fetch — works for Supabase Storage AND legacy
-          // AWS S3 (leads-test-public.s3.ap-south-1.amazonaws.com) URLs
-          // that were registered before signed-upload flow existed.
           const fetchRes = await fetch(url);
           if (!fetchRes.ok) {
-            results.push({ id: row.id, error: `fetch ${fetchRes.status} for ${url.slice(0, 80)}` });
+            results.push({ id: row._id, error: `fetch ${fetchRes.status} for ${url.slice(0, 80)}` });
             continue;
           }
           const ab = await fetchRes.arrayBuffer();
@@ -3926,28 +3904,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           }
           if (!text) {
             results.push({
-              id: row.id,
+              id: row._id,
               error: `extract returned empty (${extractErr || "no exception thrown"}) for ${url.slice(0, 100)}`,
             });
             continue;
           }
-          await fetch(`${SUPABASE_URL}/rest/v1/project_documents?id=eq.${row.id}`, {
-            method: "PATCH",
-            headers: {
-              apikey: SUPABASE_KEY,
-              Authorization: `Bearer ${SUPABASE_KEY}`,
-              "Content-Type": "application/json",
-              Prefer: "return=minimal",
-            },
-            body: JSON.stringify({
-              text_extract: text.slice(0, 8000),
-              text_extract_chars: text.length,
-              text_extracted_at: new Date().toISOString(),
-            }),
+          await updateDocFields(String(row._id), {
+            text_extract: text.slice(0, 8000),
+            text_extract_chars: text.length,
+            text_extracted_at: new Date().toISOString(),
           });
-          results.push({ id: row.id, project: row.project, doc_type: row.doc_type, chars: text.length, ok: true });
+          results.push({ id: row._id, project: row.project, doc_type: row.doc_type, chars: text.length, ok: true });
         } catch (err: any) {
-          results.push({ id: row.id, error: err.message });
+          results.push({ id: row._id, error: err.message });
         }
       }
       return res.status(200).json({ processed: results.length, results });
@@ -4539,9 +4508,47 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         });
       }
 
+      // ── project_documents (single page — ~50 rows total) ────────────────
+      if (collection === "project_documents") {
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/project_documents` +
+            `?select=id,project,doc_type,filename,url,size_label,unit_size_sft,facing,tower,text_extract,text_extract_chars,text_extracted_at,fetched_at` +
+            `&order=fetched_at.desc&limit=500`,
+          { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
+        );
+        if (!r.ok) {
+          return res.status(500).json({ error: `Supabase fetch failed ${r.status}: ${(await r.text()).slice(0, 200)}` });
+        }
+        const rows = (await r.json()) as Array<any>;
+        let upserted = 0;
+        for (const row of rows) {
+          try {
+            await upsertDocBySupabaseId(row.id, {
+              project: row.project,
+              doc_type: row.doc_type,
+              filename: row.filename,
+              url: row.url,
+              size_label: row.size_label ?? null,
+              unit_size_sft: row.unit_size_sft ?? null,
+              facing: row.facing ?? null,
+              tower: row.tower ?? null,
+              text_extract: row.text_extract ?? null,
+              text_extract_chars: row.text_extract_chars ?? null,
+              text_extracted_at: row.text_extracted_at ?? null,
+              fetched_at: row.fetched_at ?? null,
+            });
+            upserted++;
+          } catch {}
+        }
+        return res.status(200).json({
+          ok: true, collection: "project_documents",
+          scanned: rows.length, upserted,
+        });
+      }
+
       return res.status(400).json({
         error: `Unknown collection: ${collection}`,
-        supported: ["bot_settings", "user_profiles", "doc_send_log", "whatsapp_messages", "project_facts"],
+        supported: ["bot_settings", "user_profiles", "doc_send_log", "whatsapp_messages", "project_facts", "project_documents"],
         note: "More collections added as each Phase ships. whatsapp_messages is paginated — re-call with ?offset=<next_offset> until done:true.",
       });
     } catch (err: any) {
@@ -4579,23 +4586,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // size_label-bearing rows and filter in-app — volume is manageable
       // (a few hundred rows max in production).
       const params: string[] = [
-        `size_label=not.is.null`,
-        `select=id,project,doc_type,size_label,unit_size_sft,facing,tower,filename`,
-        `order=fetched_at.desc`,
-        `limit=2000`,
+        `(unused — Mongo path)`,
       ];
-      if (docTypeFilter) params.push(`doc_type=eq.${encodeURIComponent(docTypeFilter)}`);
-      if (projectFilter) params.push(`project=eq.${encodeURIComponent(projectFilter)}`);
+      void params; // legacy var kept for log compatibility; not used in Mongo path
 
-      const r = await fetch(
-        `${SUPABASE_URL}/rest/v1/project_documents?${params.join("&")}`,
-        { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-      );
-      if (!r.ok) {
-        const t = await r.text();
-        return res.status(500).json({ error: `fetch failed ${r.status}: ${t.slice(0, 200)}` });
-      }
-      const rows = (await r.json()) as Array<any>;
+      // Phase 6: Mongo — pull all rows then filter in-app (volume <2000)
+      let rows = await listAllDocs({
+        project: projectFilter || undefined,
+        doc_type: docTypeFilter || undefined,
+        limit: 2000,
+      }) as any[];
+      // Only keep rows with a size_label (mirrors the prior NOT NULL filter)
+      rows = rows.filter((r) => r.size_label);
 
       const VALID_FACING = new Set([
         "east", "west", "north", "south",
@@ -4634,7 +4636,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       let skipped = 0;
       let alreadyOk = 0;
 
-      for (const row of rows) {
+      for (const row of rows as any[]) {
         const haystack = String(row.size_label || "") + " " + String(row.filename || "");
         const parsedSize = row.unit_size_sft ?? parseUnitSize(haystack);
         const parsedFacingRaw = row.facing ?? parseFacing(haystack);
@@ -4655,7 +4657,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           }
           skipped++;
           results.push({
-            id: row.id, project: row.project, doc_type: row.doc_type,
+            id: row._id, project: row.project, doc_type: row.doc_type,
             size_label: row.size_label, skipped: "no parseable hints",
           });
           continue;
@@ -4663,7 +4665,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         if (dry) {
           results.push({
-            id: row.id, project: row.project, doc_type: row.doc_type,
+            id: row._id, project: row.project, doc_type: row.doc_type,
             size_label: row.size_label, would_update: delta,
           });
           updated++;
@@ -4671,24 +4673,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
 
         try {
-          const upd = await fetch(`${SUPABASE_URL}/rest/v1/project_documents?id=eq.${row.id}`, {
-            method: "PATCH",
-            headers: {
-              apikey: SUPABASE_KEY,
-              Authorization: `Bearer ${SUPABASE_KEY}`,
-              "Content-Type": "application/json",
-              Prefer: "return=minimal",
-            },
-            body: JSON.stringify(delta),
-          });
-          if (upd.ok) {
-            updated++;
-            results.push({ id: row.id, project: row.project, doc_type: row.doc_type, updated: delta });
-          } else {
-            results.push({ id: row.id, error: `PATCH ${upd.status}: ${(await upd.text()).slice(0, 200)}` });
-          }
+          await updateDocFields(String(row._id), delta);
+          updated++;
+          results.push({ id: row._id, project: row.project, doc_type: row.doc_type, updated: delta });
         } catch (err: any) {
-          results.push({ id: row.id, error: err.message });
+          results.push({ id: row._id, error: err.message });
         }
       }
 
@@ -4756,14 +4745,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const id = String(req.query.id || "");
     if (!id) return res.status(400).json({ error: "id required" });
     try {
-      await fetch(`${SUPABASE_URL}/rest/v1/project_documents?id=eq.${id}`, {
-        method: "DELETE",
-        headers: {
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-          Prefer: "return=minimal",
-        },
-      });
+      // Phase 6: Mongo
+      await deleteDoc(id);
       res.setHeader("Location", `?view=dashboard`);
       return res.status(303).end();
     } catch (err: any) {

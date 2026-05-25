@@ -53,22 +53,24 @@ export interface UnitPlanDispatchResult {
   ms: number;
 }
 
-/** Fetch all unit_plan / floor_plan rows for a project, including text_extract. */
+/** Fetch all unit_plan / floor_plan rows for a project, including text_extract.
+ *  Phase 6: migrated from Supabase to Mongo. */
 async function fetchAvailableRows(
   project: string,
   docType: "unit_plan" | "floor_plan" | "price_sheet",
 ): Promise<UnitPlanRow[]> {
-  const r = await fetch(
-    `${SUPABASE_URL}/rest/v1/project_documents` +
-      `?project=eq.${encodeURIComponent(project)}` +
-      `&doc_type=eq.${docType}` +
-      `&select=url,filename,size_label,text_extract` +
-      `&order=fetched_at.desc&limit=30`,
-    { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
-  );
-  if (!r.ok) return [];
-  const rows = (await r.json()) as UnitPlanRow[];
-  return Array.isArray(rows) ? rows : [];
+  try {
+    const { findDocsByType } = await import("./project_documents");
+    const rows = await findDocsByType(project, docType, 30);
+    return rows.map((r: any) => ({
+      url: r.url,
+      filename: r.filename,
+      size_label: r.size_label ?? null,
+      text_extract: r.text_extract ?? null,
+    })) as UnitPlanRow[];
+  } catch {
+    return [];
+  }
 }
 
 /** Trim a text_extract to a manageable size for the Kimi prompt. We keep

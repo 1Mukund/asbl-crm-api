@@ -4,17 +4,21 @@
  * via Periskope when the customer's DOCUMENT_REQUEST intent matches.
  *
  * Lookup chain:
- *   1. project_documents table (manual override, if curated)
+ *   1. project_documents collection in Mongo (Phase 6 migration)
  *   2. KB text (project_facts.facts_text) — auto-extracted via regex
  *
- * The KB-extraction route means whoever maintains a project's KB only
- * needs to keep the URLs in the KB itself — no separate table to update.
+ * The PDFs themselves remain in Supabase Storage — only metadata + the
+ * public download URL live in Mongo. Periskope just forwards the URL.
  */
 import { getProjectFacts } from "./project_facts";
 import { findDocInKB } from "./kb_doc_extractor";
+import {
+  findStrictDocs,
+  findDocsByType,
+  listSizeLabels,
+  listAllDocs,
+} from "./project_documents";
 
-const SUPABASE_URL = process.env.SUPABASE_URL || "";
-const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || "";
 const PERISKOPE_API_KEY = process.env.PERISKOPE_API_KEY || "";
 
 // Intent → doc_type mapping (legacy webhook intents — Gemini classifier
@@ -66,24 +70,7 @@ export async function listAvailableLabels(
 ): Promise<string[]> {
   if (!MULTI_SLOT_DOC_TYPES.has(docType)) return [];
   try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/project_documents` +
-        `?project=eq.${project}` +
-        `&doc_type=eq.${docType}` +
-        `&select=size_label&size_label=not.is.null&order=size_label.asc`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
-    const rows = (await r.json()) as Array<{ size_label: string | null }>;
-    if (!Array.isArray(rows)) return [];
-    const seen = new Set<string>();
-    const labels: string[] = [];
-    for (const row of rows) {
-      if (row?.size_label && !seen.has(row.size_label)) {
-        seen.add(row.size_label);
-        labels.push(row.size_label);
-      }
-    }
-    return labels;
+    return await listSizeLabels(project, docType);
   } catch {
     return [];
   }
@@ -116,45 +103,21 @@ export async function getDocumentStrict(
     return { ok: false, reason: "ERROR", details: "missing project or docType" };
   }
 
-  // Build PostgREST query with eq filters only on fields the bot supplied.
-  // For multi-slot doc types, ALL of unit_size_sft/facing/tower that the bot
-  // populated must match exactly. For single-slot (brochure, master_plan,
-  // etc.) the bot will leave all three null and we just match (project, doc_type).
-  const params: string[] = [
-    `project=eq.${encodeURIComponent(project)}`,
-    `doc_type=eq.${encodeURIComponent(docType)}`,
-    `select=url,doc_type,filename,size_label,unit_size_sft,facing,tower`,
-    `order=fetched_at.desc`,
-    `limit=20`,
-  ];
-  if (input.unit_size_sft !== null && input.unit_size_sft !== undefined) {
-    params.push(`unit_size_sft=eq.${input.unit_size_sft}`);
-  }
-  if (input.facing) {
-    const f = String(input.facing).toLowerCase().replace(/[^a-z_]/g, "");
-    if (f) params.push(`facing=eq.${encodeURIComponent(f)}`);
-  }
-  if (input.tower) {
-    params.push(`tower=eq.${encodeURIComponent(String(input.tower))}`);
-  }
-
   try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/project_documents?${params.join("&")}`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
-    );
-    if (!r.ok) {
-      const t = await r.text();
-      return { ok: false, reason: "ERROR", details: `${r.status}: ${t.slice(0, 200)}` };
-    }
-    const rows = (await r.json()) as ProjectDoc[];
-    if (!Array.isArray(rows) || rows.length === 0) {
+    const rows = await findStrictDocs({
+      project,
+      doc_type: docType,
+      unit_size_sft: input.unit_size_sft,
+      facing: input.facing,
+      tower: input.tower,
+      limit: 20,
+    });
+    if (!rows.length) {
       return { ok: false, reason: "NOT_FOUND" };
     }
     if (rows.length === 1) {
       return { ok: true, doc: { ...rows[0], source: "strict" } };
     }
-    // Multiple matches with the bot's full meta supplied → genuine ambiguity.
     return {
       ok: false,
       reason: "AMBIGUOUS",
@@ -174,24 +137,11 @@ export async function listAvailableMetaLabels(
   docType: string,
 ): Promise<string[]> {
   try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/project_documents` +
-        `?project=eq.${encodeURIComponent(project)}` +
-        `&doc_type=eq.${encodeURIComponent(docType)}` +
-        `&select=unit_size_sft,facing,tower,size_label` +
-        `&order=unit_size_sft.asc`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } },
-    );
-    if (!r.ok) return [];
-    const rows = (await r.json()) as Array<{
-      unit_size_sft: number | null;
-      facing: string | null;
-      tower: string | null;
-      size_label: string | null;
-    }>;
-    if (!Array.isArray(rows)) return [];
+    const rows = await findDocsByType(project, docType, 200);
     const seen = new Set<string>();
     const out: string[] = [];
+    // Sort by unit_size_sft ASC to mirror the prior Postgres order
+    rows.sort((a, b) => (a.unit_size_sft ?? 0) - (b.unit_size_sft ?? 0));
     for (const row of rows) {
       const parts: string[] = [];
       if (row.unit_size_sft) parts.push(`${row.unit_size_sft} sft`);
@@ -227,16 +177,9 @@ export async function getDocumentFor(
   const docType = LEGACY_INTENT_TO_DOC[intentOrDocType] || intentOrDocType;
   if (!docType) return null;
 
-  // 1. Try the curated project_documents table first
+  // 1. Try the curated project_documents collection first
   try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/project_documents` +
-        `?project=eq.${project}` +
-        `&doc_type=eq.${docType}` +
-        `&order=fetched_at.desc&limit=20&select=url,doc_type,filename,size_label`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
-    const rows = (await r.json()) as ProjectDoc[];
+    const rows = (await findDocsByType(project, docType, 20)) as ProjectDoc[];
 
     if (rows?.length) {
       // For multi-slot doc types (unit_plan / floor_plan / price_sheet),
