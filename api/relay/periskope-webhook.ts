@@ -794,10 +794,32 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let userProfile: UserProfile = profileInitial;
     console.log(
       `[Periskope Webhook] Profile loaded — funnel=${userProfile.funnel_stage} ` +
+      `bot_enabled=${userProfile.bot_enabled} ` +
       `current_project=${userProfile.current_project || "(none)"} ` +
       `budget_cr=${userProfile.budget_cr ?? "(unknown)"} ` +
       `docs_sent=${userProfile.docs_sent.length}`,
     );
+
+    // ── PER-PHONE KILL-SWITCH ──────────────────────────────────────────────
+    // Operator can turn off the bot for any phone from the dashboard.
+    // When bot_enabled=false we STILL log the inbound message so the chat
+    // history stays complete, but skip Gemini + Periskope reply entirely.
+    // No funnel updates, no doc dispatch — completely silent.
+    if (userProfile.bot_enabled === false) {
+      console.log(`[Periskope Webhook] Bot disabled for ${phone} — logging inbound only, skipping reply`);
+      // Save inbound for history even though we won't reply
+      try {
+        await saveMessage(phone, "inbound", message, sender, project, null);
+      } catch (err: any) {
+        console.error(`[Periskope Webhook] inbound save failed (bot off): ${err.message}`);
+      }
+      return res.status(200).json({
+        success: true,
+        skipped: true,
+        reason: "bot_disabled_for_phone",
+        phone,
+      });
+    }
 
     // PRD v1.0: every customer reply moves status to CF + global override
     // detection (site visit / not interested). Fire-and-forget so the

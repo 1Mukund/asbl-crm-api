@@ -226,7 +226,8 @@ async function renderDashboard(): Promise<string> {
 
   // whatsapp_messages: Mongo (Phase 4). Other tables: still Supabase pending migration.
   const { getRecentActivity, getInboundIntentStats } = await import("./_utils/whatsapp_messages");
-  const [factsRows, msgs24h, intentAgg, cronRows, docRows, inventory] = await Promise.all([
+  const { listAllProfiles } = await import("./_utils/user_profile");
+  const [factsRows, msgs24h, intentAgg, cronRows, docRows, inventory, profiles] = await Promise.all([
     listAllProjectFacts(),
     getRecentActivity(since24h, 300),
     getInboundIntentStats(since24h),
@@ -236,6 +237,7 @@ async function renderDashboard(): Promise<string> {
       console.error("[Dashboard] Inventory fetch failed:", err.message);
       return { rows: [], fetchedAt: 0 };
     }),
+    listAllProfiles(500),
   ]);
   // Convert aggregated intent stats to the row-shape the rest of the dashboard expects
   const intentRows = intentAgg.flatMap((r: any) => Array(r.count).fill({ intent: r.intent, project: r.project }));
@@ -669,6 +671,61 @@ ${SHARED_STYLE}
       ${cronHtml}
     </table>
   </div>
+
+  ${(() => {
+    // ── Bot Override (per-phone kill-switch) ─────────────────────────────
+    // Lists every phone the bot has a profile for, with last-interaction +
+    // current bot_enabled state + a toggle form. Disabled phones get the
+    // bot silenced — webhook still logs the incoming message, just no reply.
+    const totalProfiles = profiles.length;
+    const disabledCount = profiles.filter((p) => p.bot_enabled === false).length;
+    const rowsHtml = profiles.map((p) => {
+      const lastSeen = p.last_interaction_at
+        ? new Date(p.last_interaction_at).toLocaleString("en-IN")
+        : (p.created_at ? new Date(p.created_at).toLocaleString("en-IN") : "—");
+      const ago = p.last_interaction_at ? timeAgo(p.last_interaction_at) : "—";
+      const stateChip = p.bot_enabled === false
+        ? `<span style="color:#a00;font-weight:600">● OFF</span>`
+        : `<span style="color:#080;font-weight:600">● ON</span>`;
+      const toggleTarget = p.bot_enabled === false ? "1" : "0";
+      const toggleLabel = p.bot_enabled === false ? "Turn ON" : "Turn OFF";
+      const toggleClass = p.bot_enabled === false ? "btn-primary" : "btn-danger";
+      const confirmMsg = p.bot_enabled === false
+        ? `Re-enable bot for ${p.phone}?`
+        : `Turn OFF bot for ${p.phone}? Incoming messages will be logged but the bot will NOT reply.`;
+      const nameStr = [p.name, p.current_project ? `(${p.current_project})` : ""].filter(Boolean).join(" ").trim() || "(no profile yet)";
+      return `<tr>
+        <td><code>${esc(p.phone)}</code></td>
+        <td>${esc(nameStr)}</td>
+        <td>${esc(p.funnel_stage)}</td>
+        <td>${esc(lastSeen)} <span style="color:#888">(${esc(ago)})</span></td>
+        <td>${stateChip}</td>
+        <td>
+          <form method="POST" action="?action=toggle-bot&amp;phone=${encodeURIComponent(p.phone)}&amp;enabled=${toggleTarget}" style="display:inline" onsubmit="return confirm('${esc(confirmMsg)}')">
+            <button type="submit" class="${toggleClass}">${toggleLabel}</button>
+          </form>
+        </td>
+      </tr>`;
+    }).join("");
+    return `<div class="card full" id="bot-override">
+    <h2>4b. Bot Override — Per-Phone Kill Switch (${totalProfiles} phones · ${disabledCount} disabled)</h2>
+    <div class="card-help">
+      Switch the WhatsApp bot ON / OFF for a specific customer's phone. When OFF,
+      incoming messages are still logged (so chat history stays complete) but
+      the bot does NOT call Gemini or send any reply — the conversation
+      goes silent until you flip it back ON. Useful when a human RM takes
+      over a hot lead, or when a customer asks not to be auto-replied.
+      <br><br>
+      Sorted newest-interaction first. Phones we've never received a message
+      from won't appear here — the toggle endpoint will lazy-create the
+      profile if you call it directly with a phone we haven't seen.
+    </div>
+    ${rowsHtml ? `<table>
+      <tr><th>Phone</th><th>Name / Project</th><th>Funnel</th><th>Last interaction</th><th>Bot</th><th>Action</th></tr>
+      ${rowsHtml}
+    </table>` : `<div class="empty">No profiles yet — once the bot has a conversation with any phone, it appears here.</div>`}
+  </div>`;
+  })()}
 
   <div class="card full">
     <h2>5. Project Document Library (KB + PDFs the bot sends on WhatsApp)</h2>
@@ -4665,6 +4722,33 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       res.setHeader("Location", `?view=edit-prompt&msg=${encodeURIComponent("Reset failed: " + err.message)}`);
     }
     return res.status(303).end();
+  }
+
+  // ─── Per-phone bot kill-switch (toggle from dashboard) ────────────────
+  // POST /api/chat-history?action=toggle-bot&phone=<digits>&enabled=0|1
+  // Flips user_profiles.bot_enabled. When false, the WhatsApp webhook
+  // logs inbound messages but skips Gemini + Periskope reply for that phone.
+  if (req.method === "POST" && req.query.action === "toggle-bot") {
+    const phone = String(req.query.phone || "").replace(/\D/g, "");
+    const enabledParam = String(req.query.enabled ?? "1");
+    const enabled = enabledParam === "1" || enabledParam.toLowerCase() === "true";
+    if (!phone || phone.length < 10) {
+      return res.status(400).json({ error: "valid phone (digits) required" });
+    }
+    try {
+      const { setBotEnabled } = await import("./_utils/user_profile");
+      const newState = await setBotEnabled(phone, enabled);
+      // Form post from dashboard → redirect back. JSON callers see the JSON
+      // body when they pass Accept: application/json.
+      const wantsJson = String(req.headers.accept || "").includes("application/json");
+      if (wantsJson) {
+        return res.status(200).json({ ok: true, phone, bot_enabled: newState });
+      }
+      res.setHeader("Location", `?view=dashboard#bot-override`);
+      return res.status(303).end();
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
   }
 
   // ─── Delete a document row by id ────────────────────────────────────────

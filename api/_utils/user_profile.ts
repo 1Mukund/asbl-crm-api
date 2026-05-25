@@ -73,6 +73,11 @@ export interface UserProfile {
   last_project: string | null;
   last_interaction_at: string | null;
   funnel_stage: FunnelStage;
+  /** Per-phone bot kill-switch. When false, the WhatsApp webhook still
+   *  logs incoming messages but does NOT call Gemini / send any reply.
+   *  Defaults to true (bot enabled) on profile creation. Operator can flip
+   *  via dashboard's "Turn off bot" toggle next to each phone. */
+  bot_enabled: boolean;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -158,6 +163,7 @@ export async function getOrCreateProfile(phone: string): Promise<UserProfile> {
     last_project: null,
     last_interaction_at: null,
     funnel_stage: "new",
+    bot_enabled: true,
     created_at: now,
     updated_at: now,
   };
@@ -201,6 +207,9 @@ function normalizeProfileFromDb(row: any): UserProfile {
     last_project: row.last_project ?? null,
     last_interaction_at: row.last_interaction_at ?? null,
     funnel_stage: (row.funnel_stage as FunnelStage) || "new",
+    // Default to true for legacy docs that pre-date the toggle. Only explicit
+    // `false` (set by the dashboard turn-off action) silences the bot.
+    bot_enabled: row.bot_enabled === false ? false : true,
     created_at: row.created_at ?? null,
     updated_at: row.updated_at ?? null,
   };
@@ -443,3 +452,56 @@ export function renderUserProfileBlock(p: UserProfile): string {
 
   return lines.length ? lines.join("\n") : "(no profile yet — first interaction)";
 }
+
+// ─── Bot kill-switch + dashboard list ─────────────────────────────────────
+
+/** Flip the per-phone bot toggle. Returns the new enabled state. */
+export async function setBotEnabled(
+  phone: string,
+  enabled: boolean,
+): Promise<boolean> {
+  const clean = cleanPhone(phone);
+  if (!clean) return enabled;
+  try {
+    const col = await getCollection<UserProfileDoc>(COL.USER_PROFILES);
+    // Upsert so the toggle works even if the operator flips a number we
+    // haven't received a message from yet (rare but supported).
+    await col.updateOne(
+      { _id: clean as any },
+      {
+        $set: { bot_enabled: enabled, updated_at: new Date().toISOString() },
+        $setOnInsert: {
+          _id: clean,
+          phone: clean,
+          funnel_stage: "new",
+          created_at: new Date().toISOString(),
+        },
+      },
+      { upsert: true },
+    );
+    console.log(`[UserProfile] bot_enabled=${enabled} for phone=${clean}`);
+    return enabled;
+  } catch (err: any) {
+    console.error(`[UserProfile] setBotEnabled threw: ${err.message}`);
+    return enabled;
+  }
+}
+
+/** List all user profiles for the dashboard — newest-interaction first.
+ *  Used to render the "Bot Override" section with one row per phone the
+ *  bot has talked to. */
+export async function listAllProfiles(limit: number = 500): Promise<UserProfile[]> {
+  try {
+    const col = await getCollection<UserProfileDoc>(COL.USER_PROFILES);
+    const cursor = col
+      .find({})
+      .sort({ last_interaction_at: -1, updated_at: -1 })
+      .limit(limit);
+    const docs = await cursor.toArray();
+    return docs.map((d: any) => normalizeProfileFromDb(d));
+  } catch (err: any) {
+    console.error(`[UserProfile] listAllProfiles failed: ${err.message}`);
+    return [];
+  }
+}
+
