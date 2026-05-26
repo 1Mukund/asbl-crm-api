@@ -61,6 +61,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     };
 
     const result = await ingestLead(lead);
+
+    // PRD v1.0: T=0 fanout — fire chatbot WhatsApp + AI call simultaneously
+    // ONLY for fresh creates (not resubmissions; resubmission has its own
+    // outreach cooldown via api/_utils/resubmission.ts).
+    // BUG fix 2026-05-26: this was only wired into ingest/meta.ts so every
+    // Website + FIM lead silently skipped PRD entirely → no first WhatsApp,
+    // no T=0 AI call, follow-up cron skipped them because PRD_Stage was null.
+    if (result.action === "created") {
+      try {
+        const { handleLeadCreated } = await import("../_utils/prd_orchestrator");
+        handleLeadCreated({
+          zoho_lead_id: result.zoho_lead_id,
+          phone: lead.mobile,
+          customer_name: `${lead.first_name} ${lead.last_name}`.replace(/\s+\.$/, "").trim() || "there",
+          project: lead.project,
+          is_resubmission: false,
+          last_page_visited: lead.last_page_visited,
+          budget: lead.budget,
+          size_preference: lead.size_preference,
+        }).catch((err) => console.error(`[Website→PRD] handleLeadCreated failed: ${err.message}`));
+      } catch (err: any) {
+        console.error(`[Website→PRD] orchestrator import failed: ${err.message}`);
+      }
+    }
+
     return res.status(200).json({ success: true, ...result });
 
   } catch (err: any) {

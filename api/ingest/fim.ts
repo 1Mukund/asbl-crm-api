@@ -100,6 +100,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
 
         const result = await ingestLead(normalized);
+
+        // PRD v1.0: T=0 fanout (Website / Meta / FIM all need this — was
+        // only wired into Meta before; fix 2026-05-26).
+        if (result.action === "created") {
+          try {
+            const { handleLeadCreated } = await import("../_utils/prd_orchestrator");
+            handleLeadCreated({
+              zoho_lead_id: result.zoho_lead_id,
+              phone: normalized.mobile,
+              customer_name: `${normalized.first_name} ${normalized.last_name}`.replace(/\s+\.$/, "").trim() || "there",
+              project: normalized.project,
+              is_resubmission: false,
+              last_page_visited: normalized.last_page_visited,
+              budget: normalized.budget,
+              size_preference: normalized.size_preference,
+            }).catch((err) => console.error(`[FIM→PRD] handleLeadCreated failed: ${err.message}`));
+          } catch (err: any) {
+            console.error(`[FIM→PRD] orchestrator import failed: ${err.message}`);
+          }
+        }
+
         results.push({
           source_id: row["id"],
           name: `${normalized.first_name} ${normalized.last_name}`.trim(),
