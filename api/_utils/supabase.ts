@@ -153,6 +153,91 @@ export async function findLeadByPLID(
   }
 }
 
+// ─── Atomic "claim" for lead creation — closes the last race window ──────
+//
+// Background: Phase 7 made the leads collection key on _id=plid so two
+// concurrent ingest requests with the same (phone, project) end up writing
+// to the same Mongo _id. Mongo serialises them, so only ONE leads doc
+// exists. But the upsertLead at the end of ingestLead is a $set OVERWRITE,
+// and the *Zoho* createLead call is NOT atomic — so two requests that both
+// see findLeadByPLID=null both call Zoho createLead, producing TWO Zoho
+// IDs even though only one leads-doc exists.
+//
+// Fix (2026-05-26): claim a creation slot in Mongo BEFORE calling Zoho.
+// findOneAndUpdate with returnDocument:'before' returns null IFF we just
+// inserted the doc (we are FIRST). Anyone else who tries to insert the
+// same plid gets back the pre-existing doc (we are DUPLICATE). The
+// duplicate path then waits briefly for the first request's zoho_lead_id
+// to land, and uses that ID for its updateLead instead of creating a new
+// Zoho lead.
+//
+// Result: even if 10 requests for the same (phone, project) hit the
+// webhook within 100ms, only ONE Zoho lead is created. The others all
+// resolve to that one ID and route to updateLead.
+
+export type ClaimResult =
+  | { status: "first" }                             // we won the race → create in Zoho
+  | { status: "duplicate"; zoho_lead_id: string }   // someone else already created
+  | { status: "duplicate_pending" };                // someone else creating but ID not landed yet
+
+export async function claimLeadCreation(
+  plid: string,
+  phone: string,
+  mlid: string,
+  waitMs: number = 6000,
+): Promise<ClaimResult> {
+  if (!plid) throw new Error("claimLeadCreation: empty plid");
+  const col = await getCollection<LeadDoc>(COL.LEADS);
+  const now = new Date().toISOString();
+
+  // returnDocument:'before' → null IFF we just inserted (upsert created
+  // the doc), non-null IFF doc existed (we lost the race).
+  const before = await col.findOneAndUpdate(
+    { _id: plid as any },
+    {
+      $setOnInsert: {
+        _id: plid,
+        plid,
+        phone: cleanPhone(phone),
+        mlid,
+        zoho_lead_id: null,
+        zoho_synced: false,
+        zoho_synced_at: null,
+        creation_in_progress: true,
+        created_at: now,
+        updated_at: now,
+      } as any,
+    },
+    { upsert: true, returnDocument: "before" },
+  );
+
+  if (!before) {
+    // We just inserted → we are FIRST
+    return { status: "first" };
+  }
+
+  const existing = before as any;
+  if (existing.zoho_lead_id) {
+    // Someone else already finished — use their ID, skip Zoho create
+    return { status: "duplicate", zoho_lead_id: String(existing.zoho_lead_id) };
+  }
+
+  // Doc exists but no zoho_lead_id yet — the first request is mid-flight.
+  // Poll briefly so we get its ID once the create completes.
+  const start = Date.now();
+  const interval = 200;
+  while (Date.now() - start < waitMs) {
+    await new Promise((r) => setTimeout(r, interval));
+    const check = await col.findOne({ _id: plid as any });
+    if ((check as any)?.zoho_lead_id) {
+      return { status: "duplicate", zoho_lead_id: String((check as any).zoho_lead_id) };
+    }
+  }
+  // First request timed out — return pending so caller decides whether
+  // to fall through to Zoho create (last-resort behaviour) or skip.
+  return { status: "duplicate_pending" };
+}
+
 // ─── Store lead in Mongo (source of truth + dedupe safety net) ───────────
 
 export async function upsertLead(

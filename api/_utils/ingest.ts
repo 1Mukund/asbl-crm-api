@@ -1,5 +1,5 @@
 import { NormalizedLead } from "./types";
-import { getOrCreateMLID, getOrCreatePLID, upsertLead, findLeadByPLID } from "./supabase";
+import { getOrCreateMLID, getOrCreatePLID, upsertLead, findLeadByPLID, claimLeadCreation } from "./supabase";
 import {
   findLeadByPhoneAndProject,
   findLeadByPhone,
@@ -86,49 +86,54 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
     Time_Spent_Minutes: lead.time_spent_minutes ?? 0,
   };
 
-  // ── Step 3: Dedup — Supabase first (atomic), Zoho search second ──────────
+  // ── Step 3: Atomic dedupe via Mongo claim — closes ALL race windows ─────
   //
-  // The Zoho search API has 5-30 seconds of indexing lag after a new lead
-  // is created, so two ingest requests for the same (phone, project) within
-  // that window BOTH see "no existing lead" and BOTH call createLead =>
-  // duplicate rows. (Observed 2026-05-22: 13 phones with 2 dupes each, all
-  // created 3-7 seconds apart, identical MLID/PLID, identical project.)
+  // Pattern: claimLeadCreation does an upsert on leads._id=plid with
+  // returnDocument:'before'. Mongo serialises concurrent calls — exactly
+  // ONE request gets `status: "first"` (the upsert just inserted the doc),
+  // every other concurrent request gets `status: "duplicate"` (the upsert
+  // found an existing doc). The duplicate path waits briefly for the first
+  // request's zoho_lead_id to land and uses that ID for updateLead —
+  // never calls Zoho createLead again. Result: at most ONE Zoho lead per
+  // PLID even under heavy concurrent submission.
   //
-  // Fix: pre-check Supabase `leads` table by PLID. PLID generation already
-  // uses a serialised Postgres function so it's race-safe — the leads row
-  // gets a zoho_lead_id once the FIRST ingest completes its upsertLead
-  // (last step below). Subsequent ingests with the same PLID see the
-  // zoho_lead_id immediately and skip Zoho search entirely, eliminating
-  // the indexing-lag race window.
-  //
-  // Race still possible: two requests both reach this lookup BEFORE the
-  // first one completes its upsertLead. Window is now ~100ms instead of
-  // ~30s — orders of magnitude smaller. Phase 7 will move the leads table
-  // to Mongo where findOneAndUpdate $setOnInsert closes the window
-  // entirely.
+  // History of this race:
+  //   2026-05-22: 13 dupes found created 3-7s apart (Zoho search lag).
+  //               Fix a4e0d62 added findLeadByPLID pre-check — shrunk
+  //               window from ~30s to ~3s but didn't close it.
+  //   2026-05-22: Phase 7 moved leads to Mongo with _id=plid atomic
+  //               upsert — Mongo doc is single but Zoho createLead still
+  //               fires twice if both requests reach it.
+  //   2026-05-26: 1 more dupe observed (1562-LOFT). Atomic CLAIM pattern
+  //               below now serialises Zoho-create attempts via Mongo's
+  //               upsert-returnDocument-before contract. Race fully closed.
   let existingLead: any = null;
+  let claimedFirst = false;
+
   try {
-    const supabaseHit = await findLeadByPLID(plid);
-    if (supabaseHit?.zoho_lead_id) {
-      // Direct GET by ID — no search-index lag. We need the full record
-      // (Resubmission_Count etc.) so recordResubmission can increment the
-      // counter correctly instead of starting back at 1.
+    const claim = await claimLeadCreation(plid, mobile, mlid);
+    if (claim.status === "first") {
+      claimedFirst = true;
+      console.log(`[Ingest] claim WON for plid=${plid} — will call Zoho createLead`);
+    } else if (claim.status === "duplicate") {
+      console.log(`[Ingest] claim LOST for plid=${plid} → reusing zoho_lead_id=${claim.zoho_lead_id}`);
       try {
-        existingLead = await getLeadById(supabaseHit.zoho_lead_id);
-        if (existingLead) {
-          console.log(`[Ingest] dedup hit via Supabase leads (plid=${plid} → ${supabaseHit.zoho_lead_id}) — skipped Zoho search`);
-        } else {
-          console.warn(`[Ingest] Supabase had zoho_lead_id=${supabaseHit.zoho_lead_id} but Zoho GET returned null — falling through to search`);
-        }
+        existingLead = await getLeadById(claim.zoho_lead_id);
       } catch (err: any) {
-        console.error(`[Ingest] getLeadById(${supabaseHit.zoho_lead_id}) threw: ${err.message} — falling through to search`);
+        console.error(`[Ingest] getLeadById(${claim.zoho_lead_id}) threw: ${err.message}`);
       }
+    } else {
+      // duplicate_pending — first request timed out before producing a
+      // zoho_lead_id. Fall through to legacy Zoho search as last resort.
+      console.warn(`[Ingest] claim PENDING for plid=${plid} — first request still in flight after 6s, falling through to Zoho search`);
     }
   } catch (err: any) {
-    console.error(`[Ingest] Supabase pre-check failed (${err.message}) — falling through to Zoho search`);
+    console.error(`[Ingest] claimLeadCreation threw: ${err.message} — falling through to legacy dedupe`);
   }
 
-  if (!existingLead) {
+  // Legacy fallback paths (only used when claim returned duplicate_pending
+  // OR threw). Kept for resilience — the claim path is the primary defence.
+  if (!claimedFirst && !existingLead) {
     if (project) {
       existingLead = await findLeadByPhoneAndProject(mobile, project);
     } else {
