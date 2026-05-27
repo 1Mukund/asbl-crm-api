@@ -93,6 +93,46 @@ async function ensureIndexes(): Promise<void> {
   }
 }
 
+/** Lightweight summary of every phone we've EVER exchanged a message with
+ *  (one row per phone doc). Excludes the heavy by_date payload — only the
+ *  counters + last_message_at. Used by the dashboard Bot Override list so it
+ *  shows ALL conversations, not just phones that have a user_profile. */
+export interface PhoneSummary {
+  phone: string;
+  total_count: number;
+  inbound_count: number;
+  outbound_count: number;
+  last_message_at: string | null;
+  first_message_at: string | null;
+}
+
+export async function listConversationPhones(limit: number = 5000): Promise<PhoneSummary[]> {
+  await ensureIndexes();
+  try {
+    const col = await getCollection(COL.WHATSAPP_MESSAGES);
+    const rows = await col
+      .find({})
+      .project({
+        phone: 1, total_count: 1, inbound_count: 1,
+        outbound_count: 1, last_message_at: 1, first_message_at: 1,
+      })
+      .sort({ last_message_at: -1 })
+      .limit(limit)
+      .toArray();
+    return (rows as any[]).map((r) => ({
+      phone: String(r.phone || r._id || ""),
+      total_count: r.total_count ?? 0,
+      inbound_count: r.inbound_count ?? 0,
+      outbound_count: r.outbound_count ?? 0,
+      last_message_at: r.last_message_at ?? null,
+      first_message_at: r.first_message_at ?? null,
+    }));
+  } catch (err: any) {
+    console.error(`[whatsapp_messages] listConversationPhones failed: ${err.message}`);
+    return [];
+  }
+}
+
 // ─── Write ────────────────────────────────────────────────────────────────
 
 /** Insert a single message. Upserts the phone document and $push'es the

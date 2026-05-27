@@ -226,10 +226,10 @@ async function renderDashboard(): Promise<string> {
   const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
   // All tables Mongo-backed as of Phase 8.
-  const { getRecentActivity, getInboundIntentStats } = await import("./_utils/whatsapp_messages");
+  const { getRecentActivity, getInboundIntentStats, listConversationPhones } = await import("./_utils/whatsapp_messages");
   const { listAllProfiles } = await import("./_utils/user_profile");
   const { getRecentCronRuns } = await import("./_utils/ops_collections");
-  const [factsRows, msgs24h, intentAgg, cronRows, docRows, inventory, profiles] = await Promise.all([
+  const [factsRows, msgs24h, intentAgg, cronRows, docRows, inventory, profiles, convPhones] = await Promise.all([
     listAllProjectFacts(),
     getRecentActivity(since24h, 300),
     getInboundIntentStats(since24h),
@@ -239,7 +239,8 @@ async function renderDashboard(): Promise<string> {
       console.error("[Dashboard] Inventory fetch failed:", err.message);
       return { rows: [], fetchedAt: 0 };
     }),
-    listAllProfiles(500),
+    listAllProfiles(2000),
+    listConversationPhones(5000),
   ]);
   // Convert aggregated intent stats to the row-shape the rest of the dashboard expects
   const intentRows = intentAgg.flatMap((r: any) => Array(r.count).fill({ intent: r.intent, project: r.project }));
@@ -686,56 +687,116 @@ ${SHARED_STYLE}
 
   ${(() => {
     // ── Bot Override (per-phone kill-switch) ─────────────────────────────
-    // Lists every phone the bot has a profile for, with last-interaction +
-    // current bot_enabled state + a toggle form. Disabled phones get the
-    // bot silenced — webhook still logs the incoming message, just no reply.
-    const totalProfiles = profiles.length;
-    const disabledCount = profiles.filter((p) => p.bot_enabled === false).length;
-    const rowsHtml = profiles.map((p) => {
-      const lastSeen = p.last_interaction_at
-        ? new Date(p.last_interaction_at).toLocaleString("en-IN")
-        : (p.created_at ? new Date(p.created_at).toLocaleString("en-IN") : "—");
-      const ago = p.last_interaction_at ? timeAgo(p.last_interaction_at) : "—";
-      const stateChip = p.bot_enabled === false
+    // Lists EVERY phone we've exchanged a WhatsApp message with (from the
+    // whatsapp_messages collection — 1 doc per phone), merged with
+    // user_profiles for bot_enabled + name + funnel. Earlier this only
+    // listed user_profiles (phones that messaged US) so most outbound-only
+    // numbers were invisible.
+    const profByPhone = new Map<string, any>();
+    for (const p of profiles) profByPhone.set(String(p.phone).replace(/\D/g, ""), p);
+
+    // Union of conversation phones + any profile-only phones (lazy-created
+    // via direct toggle but no messages yet).
+    const seen = new Set<string>();
+    const merged: Array<{
+      phone: string; name: string; project: string; funnel: string;
+      botEnabled: boolean; lastMs: number; lastStr: string; ago: string;
+      inbound: number; outbound: number; total: number;
+    }> = [];
+    const pushRow = (phone: string, conv: any | null) => {
+      const clean = String(phone).replace(/\D/g, "");
+      if (!clean || seen.has(clean)) return;
+      seen.add(clean);
+      const prof = profByPhone.get(clean);
+      const lastIso = conv?.last_message_at || prof?.last_interaction_at || prof?.created_at || null;
+      const lastMs = lastIso ? new Date(lastIso).getTime() : 0;
+      merged.push({
+        phone: clean,
+        name: prof?.name || "",
+        project: prof?.current_project || prof?.last_project || "",
+        funnel: prof?.funnel_stage || "—",
+        botEnabled: prof ? prof.bot_enabled !== false : true,
+        lastMs,
+        lastStr: lastIso ? new Date(lastIso).toLocaleString("en-IN") : "—",
+        ago: lastIso ? timeAgo(lastIso) : "—",
+        inbound: conv?.inbound_count ?? 0,
+        outbound: conv?.outbound_count ?? 0,
+        total: conv?.total_count ?? 0,
+      });
+    };
+    for (const c of convPhones) pushRow(c.phone, c);
+    for (const p of profiles) pushRow(String(p.phone), null);
+    merged.sort((a, b) => b.lastMs - a.lastMs);
+
+    const totalPhones = merged.length;
+    const disabledCount = merged.filter((m) => !m.botEnabled).length;
+
+    const rowsHtml = merged.map((m) => {
+      const stateChip = !m.botEnabled
         ? `<span style="color:#a00;font-weight:600">● OFF</span>`
         : `<span style="color:#080;font-weight:600">● ON</span>`;
-      const toggleTarget = p.bot_enabled === false ? "1" : "0";
-      const toggleLabel = p.bot_enabled === false ? "Turn ON" : "Turn OFF";
-      const toggleClass = p.bot_enabled === false ? "btn-primary" : "btn-danger";
-      const confirmMsg = p.bot_enabled === false
-        ? `Re-enable bot for ${p.phone}?`
-        : `Turn OFF bot for ${p.phone}? Incoming messages will be logged but the bot will NOT reply.`;
-      const nameStr = [p.name, p.current_project ? `(${p.current_project})` : ""].filter(Boolean).join(" ").trim() || "(no profile yet)";
-      return `<tr>
-        <td><code>${esc(p.phone)}</code></td>
+      const toggleTarget = !m.botEnabled ? "1" : "0";
+      const toggleLabel = !m.botEnabled ? "Turn ON" : "Turn OFF";
+      const toggleClass = !m.botEnabled ? "btn-primary" : "btn-danger";
+      const confirmMsg = !m.botEnabled
+        ? `Re-enable bot for ${m.phone}?`
+        : `Turn OFF bot for ${m.phone}? Incoming messages will be logged but the bot will NOT reply.`;
+      const nameStr = [m.name, m.project ? `(${m.project})` : ""].filter(Boolean).join(" ").trim() || "—";
+      // data-* attrs power the client-side filter
+      return `<tr class="bo-row" data-phone="${esc(m.phone)}" data-name="${esc(m.name.toLowerCase())}" data-project="${esc((m.project || '').toLowerCase())}" data-status="${m.botEnabled ? 'on' : 'off'}">
+        <td><code>${esc(m.phone)}</code></td>
         <td>${esc(nameStr)}</td>
-        <td>${esc(p.funnel_stage)}</td>
-        <td>${esc(lastSeen)} <span style="color:#888">(${esc(ago)})</span></td>
+        <td>${esc(m.funnel)}</td>
+        <td style="white-space:nowrap">${esc(m.lastStr)} <span style="color:#888">(${esc(m.ago)})</span></td>
+        <td style="text-align:center">${m.inbound}/${m.outbound}</td>
         <td>${stateChip}</td>
         <td>
-          <form method="POST" action="?action=toggle-bot&amp;phone=${encodeURIComponent(p.phone)}&amp;enabled=${toggleTarget}" style="display:inline" onsubmit="return confirm('${esc(confirmMsg)}')">
+          <form method="POST" action="?action=toggle-bot&amp;phone=${encodeURIComponent(m.phone)}&amp;enabled=${toggleTarget}" style="display:inline" onsubmit="return confirm('${esc(confirmMsg)}')">
             <button type="submit" class="${toggleClass}">${toggleLabel}</button>
           </form>
         </td>
       </tr>`;
     }).join("");
+
     return `<div class="card full" id="bot-override">
-    <h2>4b. Bot Override — Per-Phone Kill Switch (${totalProfiles} phones · ${disabledCount} disabled)</h2>
+    <h2>4b. Bot Override — Per-Phone Kill Switch (${totalPhones} phones · ${disabledCount} disabled)</h2>
     <div class="card-help">
-      Switch the WhatsApp bot ON / OFF for a specific customer's phone. When OFF,
-      incoming messages are still logged (so chat history stays complete) but
-      the bot does NOT call Gemini or send any reply — the conversation
-      goes silent until you flip it back ON. Useful when a human RM takes
-      over a hot lead, or when a customer asks not to be auto-replied.
-      <br><br>
-      Sorted newest-interaction first. Phones we've never received a message
-      from won't appear here — the toggle endpoint will lazy-create the
-      profile if you call it directly with a phone we haven't seen.
+      Switch the WhatsApp bot ON / OFF for any phone we've messaged. When OFF,
+      incoming messages are still logged but the bot does NOT reply — silent
+      until flipped back ON. Lists every conversation (inbound + outbound),
+      newest first.
     </div>
-    ${rowsHtml ? `<table>
-      <tr><th>Phone</th><th>Name / Project</th><th>Funnel</th><th>Last interaction</th><th>Bot</th><th>Action</th></tr>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+      <input type="text" id="bo-search" placeholder="🔍 search phone / name / project" oninput="boFilter()" style="flex:1;min-width:240px;padding:8px;border:1px solid var(--border,#ccc);border-radius:6px" />
+      <select id="bo-status" onchange="boFilter()" style="padding:8px;border:1px solid var(--border,#ccc);border-radius:6px">
+        <option value="all">All (${totalPhones})</option>
+        <option value="on">Bot ON</option>
+        <option value="off">Bot OFF (${disabledCount})</option>
+      </select>
+      <span id="bo-count" style="color:#888;font-size:13px"></span>
+    </div>
+    ${rowsHtml ? `<table id="bo-table">
+      <tr><th>Phone</th><th>Name / Project</th><th>Funnel</th><th>Last interaction</th><th>In/Out</th><th>Bot</th><th>Action</th></tr>
       ${rowsHtml}
-    </table>` : `<div class="empty">No profiles yet — once the bot has a conversation with any phone, it appears here.</div>`}
+    </table>` : `<div class="empty">No conversations yet.</div>`}
+    <script>
+    function boFilter() {
+      var q = (document.getElementById('bo-search').value || '').toLowerCase().trim();
+      var st = document.getElementById('bo-status').value;
+      var rows = document.querySelectorAll('#bo-table tr.bo-row');
+      var shown = 0;
+      rows.forEach(function(r) {
+        var hay = (r.getAttribute('data-phone') + ' ' + r.getAttribute('data-name') + ' ' + r.getAttribute('data-project'));
+        var matchQ = !q || hay.indexOf(q) !== -1;
+        var matchS = st === 'all' || r.getAttribute('data-status') === st;
+        var show = matchQ && matchS;
+        r.style.display = show ? '' : 'none';
+        if (show) shown++;
+      });
+      document.getElementById('bo-count').textContent = shown + ' shown';
+    }
+    boFilter();
+    </script>
   </div>`;
   })()}
 
