@@ -34,6 +34,7 @@
  */
 
 import { getCollection, COL } from "./mongo";
+import { ObjectId } from "mongodb";
 
 export interface ProjectDocumentRow {
   _id?: string;
@@ -45,10 +46,26 @@ export interface ProjectDocumentRow {
   unit_size_sft?: number | null;
   facing?: string | null;
   tower?: string | null;
+  /** When true, this doc is sent for ANY request of its doc_type for the
+   *  project — used for "single price sheet covers all units" projects so
+   *  the bot doesn't need a per-config strict match. */
+  applies_to_all?: boolean;
   text_extract?: string | null;
   text_extract_chars?: number | null;
   text_extracted_at?: string | null;
   fetched_at?: string | null;
+}
+
+/** Build a Mongo _id filter that matches BOTH a string _id (backfilled
+ *  "sb_<id>") and an ObjectId _id (fresh uploads). The dashboard renders
+ *  whatever String(_id) produces; for a 24-char hex we must reconstruct
+ *  the ObjectId or the match silently fails. */
+function idFilter(id: string): any {
+  const variants: any[] = [{ _id: id }];
+  if (/^[a-f0-9]{24}$/i.test(id)) {
+    try { variants.push({ _id: new ObjectId(id) }); } catch {}
+  }
+  return variants.length === 1 ? variants[0] : { $or: variants };
 }
 
 let _indexesEnsured = false;
@@ -97,6 +114,27 @@ export async function findStrictDocs(input: {
   } catch (err: any) {
     console.error(`[project_documents] findStrictDocs failed: ${err.message}`);
     return [];
+  }
+}
+
+/** Returns the project's "applies to all units" doc of a given type, if one
+ *  exists (e.g. a single price sheet covering every config). Most-recent wins. */
+export async function findAppliesToAllDoc(
+  project: string,
+  doc_type: string,
+): Promise<ProjectDocumentRow | null> {
+  await ensureIndexes();
+  try {
+    const col = await getCollection<ProjectDocumentRow>(COL.PROJECT_DOCUMENTS);
+    const doc = await col
+      .find({ project, doc_type, applies_to_all: true })
+      .sort({ fetched_at: -1 })
+      .limit(1)
+      .next();
+    return doc || null;
+  } catch (err: any) {
+    console.error(`[project_documents] findAppliesToAllDoc failed: ${err.message}`);
+    return null;
   }
 }
 
@@ -227,11 +265,11 @@ export async function updateDocFields(
 ): Promise<void> {
   await ensureIndexes();
   const col = await getCollection(COL.PROJECT_DOCUMENTS);
-  await col.updateOne({ _id: _id as any }, { $set: fields as any });
+  await col.updateOne(idFilter(_id), { $set: fields as any });
 }
 
 export async function deleteDoc(_id: string): Promise<void> {
   await ensureIndexes();
   const col = await getCollection(COL.PROJECT_DOCUMENTS);
-  await col.deleteOne({ _id: _id as any });
+  await col.deleteOne(idFilter(_id));
 }

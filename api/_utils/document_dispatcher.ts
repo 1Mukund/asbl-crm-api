@@ -15,6 +15,7 @@ import { findDocInKB } from "./kb_doc_extractor";
 import {
   findStrictDocs,
   findDocsByType,
+  findAppliesToAllDoc,
   listSizeLabels,
   listAllDocs,
 } from "./project_documents";
@@ -104,6 +105,15 @@ export async function getDocumentStrict(
   }
 
   try {
+    // "Applies to all" short-circuit: if the project has a single doc of
+    // this type flagged applies_to_all (e.g. one price sheet covering every
+    // config), send THAT regardless of the meta the bot supplied. Lets
+    // single-price-sheet projects work without per-config strict matching.
+    const allDoc = await findAppliesToAllDoc(project, docType);
+    if (allDoc) {
+      return { ok: true, doc: { ...allDoc, source: "applies_to_all" } };
+    }
+
     const rows = await findStrictDocs({
       project,
       doc_type: docType,

@@ -471,11 +471,12 @@ async function renderDashboard(): Promise<string> {
   const renderDocSlot = (project: string, docKey: string, label: string) => {
     const existing = (docsByProj[project]?.[docKey] || []).slice(0, 1)[0];
     if (existing) {
+      const docId = String((existing as any)._id ?? existing.id ?? "");
       return `<div class="doc-slot filled">
         <div class="doc-slot-label">${esc(label)} <span class="ok">●</span></div>
         <div class="doc-slot-file">
           <a href="${esc(existing.url)}" target="_blank" rel="noopener">${esc(existing.filename || "open")}</a>
-          <form method="POST" action="?action=delete-doc&id=${esc(existing.id)}" style="display:inline" onsubmit="return confirm('Delete ${esc(label)} for ${esc(project)}?')">
+          <form method="POST" action="?action=delete-doc&id=${encodeURIComponent(docId)}" style="display:inline" onsubmit="return confirm('Delete ${esc(label)} for ${esc(project)}?')">
             <button type="submit" class="btn-delete">×</button>
           </form>
         </div>
@@ -500,19 +501,22 @@ async function renderDashboard(): Promise<string> {
     // v5 strict lookup. A "—" in any strict column means the bot won't
     // match it; the row needs editing or backfill.
     const list = items.map((p) => {
+      const docId = String((p as any)._id ?? p.id ?? "");
       const strictParts: string[] = [];
       if (p.unit_size_sft) strictParts.push(`${p.unit_size_sft} sft`);
       if (p.facing) strictParts.push(String(p.facing));
       if (p.tower) strictParts.push(`Tower ${p.tower}`);
-      const strictTag = strictParts.length
-        ? `<span style="color:#1a7f37">${esc(strictParts.join(" · "))}</span>`
-        : `<span style="color:#a00">— missing —</span>`;
+      const strictTag = (p as any).applies_to_all
+        ? `<span style="color:#1a7f37;font-weight:600">★ ALL units</span>`
+        : (strictParts.length
+            ? `<span style="color:#1a7f37">${esc(strictParts.join(" · "))}</span>`
+            : `<span style="color:#a00">— missing —</span>`);
       return `<tr>
         <td>${esc(p.size_label || "—")}</td>
         <td>${strictTag}</td>
         <td><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.filename || "open")}</a></td>
         <td>
-          <form method="POST" action="?action=delete-doc&id=${esc(p.id)}" style="display:inline" onsubmit="return confirm('Delete ${esc(title)} ${esc(p.size_label || '')} for ${esc(project)}?')">
+          <form method="POST" action="?action=delete-doc&id=${encodeURIComponent(docId)}" style="display:inline" onsubmit="return confirm('Delete ${esc(title)} ${esc(p.size_label || '')} for ${esc(project)}?')">
             <button type="submit" class="btn-delete">delete</button>
           </form>
         </td>
@@ -520,12 +524,13 @@ async function renderDashboard(): Promise<string> {
     }).join("");
 
     // v5 strict inputs — these are what the bot's doc_meta matches against.
-    // For unit_plan: all three matter. For floor_plan: usually just tower
-    // (and optionally size + facing if you keep per-unit floor plans). For
-    // price_sheet: config is freeform so the strict columns are optional.
-    const wantsSize   = docType === "unit_plan";
-    const wantsFacing = docType === "unit_plan";
-    const wantsTower  = docType === "unit_plan" || docType === "floor_plan";
+    // unit_plan: size + facing + tower. floor_plan: tower. price_sheet:
+    // operator can optionally set strict keys per-config OR tick "applies
+    // to all units" so a single price sheet serves every price request.
+    const wantsSize   = docType === "unit_plan" || docType === "price_sheet";
+    const wantsFacing = docType === "unit_plan" || docType === "price_sheet";
+    const wantsTower  = docType === "unit_plan" || docType === "floor_plan" || docType === "price_sheet";
+    const wantsAllToggle = docType === "price_sheet";
 
     const facingOptions = [
       "", "east", "west", "north", "south",
@@ -540,12 +545,14 @@ async function renderDashboard(): Promise<string> {
       </table>` : `<div class="empty-inline">no ${esc(title.toLowerCase())} uploaded yet</div>`}
       <div class="add-unit-row" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:8px">
         <input type="text" id="multi-${esc(project)}-${esc(docType)}" placeholder="${esc(placeholder)}" class="size-input" style="min-width:180px" />
-        ${wantsSize ? `<input type="number" id="multi-${esc(project)}-${esc(docType)}-size" placeholder="size sft (e.g. 1695)" min="100" max="100000" class="size-input" style="width:160px" />` : ""}
-        ${wantsFacing ? `<select id="multi-${esc(project)}-${esc(docType)}-facing" class="size-input" style="width:140px">${facingOptions}</select>` : ""}
-        ${wantsTower ? `<input type="text" id="multi-${esc(project)}-${esc(docType)}-tower" placeholder="tower (e.g. A)" class="size-input" style="width:100px" />` : ""}
+        ${wantsSize ? `<input type="number" id="multi-${esc(project)}-${esc(docType)}-size" placeholder="size sft (e.g. 1695)" min="100" max="100000" class="size-input" style="width:150px" />` : ""}
+        ${wantsFacing ? `<select id="multi-${esc(project)}-${esc(docType)}-facing" class="size-input" style="width:130px">${facingOptions}</select>` : ""}
+        ${wantsTower ? `<input type="text" id="multi-${esc(project)}-${esc(docType)}-tower" placeholder="tower/config" class="size-input" style="width:110px" />` : ""}
+        ${wantsAllToggle ? `<label style="display:inline-flex;align-items:center;gap:4px;font-size:12px;white-space:nowrap"><input type="checkbox" id="multi-${esc(project)}-${esc(docType)}-all" /> applies to ALL units</label>` : ""}
         <button type="button" class="btn-upload" onclick="pickMulti('${esc(project)}', '${esc(docType)}', '${esc(title)}')">+ Add ${esc(title.toLowerCase().slice(0, -1))} PDF</button>
       </div>
-      ${(wantsSize || wantsFacing || wantsTower) ? `<div class="proj-help" style="font-size:11px;margin-top:4px">Strict fields are what the v5 bot matches on. The legacy label is kept for the storage filename.</div>` : ""}
+      ${wantsAllToggle ? `<div class="proj-help" style="font-size:11px;margin-top:4px">Tick <strong>"applies to ALL units"</strong> when the project has one price sheet for everything — the bot will send it for ANY price request, no per-config match needed. Otherwise set strict keys (size / facing / config) for per-config sheets.</div>`
+        : ((wantsSize || wantsFacing || wantsTower) ? `<div class="proj-help" style="font-size:11px;margin-top:4px">Strict fields are what the v5 bot matches on. The legacy label is kept for the storage filename.</div>` : "")}
     </div>`;
   };
 
@@ -800,9 +807,11 @@ function pickMulti(project, docType, title) {
   const sizeEl = document.getElementById('multi-' + project + '-' + docType + '-size');
   const facingEl = document.getElementById('multi-' + project + '-' + docType + '-facing');
   const towerEl = document.getElementById('multi-' + project + '-' + docType + '-tower');
+  const allEl = document.getElementById('multi-' + project + '-' + docType + '-all');
   const unitSizeSft = sizeEl ? parseInt(sizeEl.value, 10) : NaN;
   const facing = facingEl ? facingEl.value.trim() : '';
   const tower = towerEl ? towerEl.value.trim() : '';
+  const appliesToAll = allEl ? !!allEl.checked : false;
 
   // unit_plan REQUIRES the strict fields so the bot can match doc_meta exactly.
   if (docType === 'unit_plan') {
@@ -817,8 +826,25 @@ function pickMulti(project, docType, title) {
       return;
     }
   }
+
+  // price_sheet: if "applies to all" is ticked, no per-config keys needed and
+  // the size_label can default. Otherwise require at least a label.
+  if (docType === 'price_sheet' && appliesToAll) {
+    _ctx = {
+      kind: 'multi', project, docType,
+      sizeLabel: sizeLabel || 'All Units',
+      label: title + ' (all units)',
+      unit_size_sft: null, facing: null, tower: null,
+      applies_to_all: true,
+    };
+    _fileInput.accept = '.pdf,application/pdf';
+    _fileInput.value = '';
+    _fileInput.click();
+    return;
+  }
+
   if (!sizeLabel) {
-    alert('Enter a label first (e.g. "Tower A" for floor plans, "1695 East" for unit plans)');
+    alert('Enter a label first (e.g. "Tower A" for floor plans, "1695 East" for unit plans, or tick "applies to ALL units" for a single price sheet)');
     input?.focus();
     return;
   }
@@ -829,6 +855,7 @@ function pickMulti(project, docType, title) {
     unit_size_sft: isFinite(unitSizeSft) ? unitSizeSft : null,
     facing: facing || null,
     tower: tower || null,
+    applies_to_all: appliesToAll,
   };
   _fileInput.accept = '.pdf,application/pdf';
   _fileInput.value = '';
@@ -852,6 +879,7 @@ async function uploadFile(ctx, file, btn) {
       if (ctx.unit_size_sft !== undefined) signReq.unit_size_sft = ctx.unit_size_sft;
       if (ctx.facing !== undefined) signReq.facing = ctx.facing;
       if (ctx.tower !== undefined) signReq.tower = ctx.tower;
+      if (ctx.applies_to_all !== undefined) signReq.applies_to_all = ctx.applies_to_all;
     }
     const signRes = await fetch('?action=upload-sign', {
       method: 'POST',
@@ -885,6 +913,7 @@ async function uploadFile(ctx, file, btn) {
       if (ctx.unit_size_sft !== undefined) finReq.unit_size_sft = ctx.unit_size_sft;
       if (ctx.facing !== undefined) finReq.facing = ctx.facing;
       if (ctx.tower !== undefined) finReq.tower = ctx.tower;
+      if (ctx.applies_to_all !== undefined) finReq.applies_to_all = ctx.applies_to_all;
     }
     const finRes = await fetch('?action=upload-finalize', {
       method: 'POST',
@@ -3804,6 +3833,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               : null);
       const facingRaw = body.facing ? String(body.facing).toLowerCase().trim() : null;
       const towerRaw = body.tower ? String(body.tower).trim() : null;
+      const appliesToAll = body.applies_to_all === true || body.applies_to_all === "true";
 
       const insertBody: any = { project, doc_type: docType, filename, url: publicUrl };
       if (sizeLabel) insertBody.size_label = sizeLabel;
@@ -3812,6 +3842,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
       if (facingRaw) insertBody.facing = facingRaw;
       if (towerRaw) insertBody.tower = towerRaw;
+      if (appliesToAll) insertBody.applies_to_all = true;
       if (textExtract) {
         // Cap each PDF's extract at 8000 chars so even 8 doc types per project
         // stay under Gemini's effective input budget when bundled into context.
