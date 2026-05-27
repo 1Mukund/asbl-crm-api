@@ -6,7 +6,7 @@ export interface NormalizedLead {
   email?: string;
 
   // Source
-  lead_source: "FIM Forms" | "Website Inquiry" | "WhatsApp" | "Channel Partner";
+  lead_source: "FIM Forms" | "Website Inquiry" | "WhatsApp" | "Channel Partner" | "Meta Ads" | "Inncircles M1";
   source_lead_id?: string;  // Meta lead ID, form submission ID etc.
   campaign_name?: string;
   ad_set_name?: string;
