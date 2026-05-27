@@ -601,6 +601,9 @@ ${SHARED_STYLE}
   <nav>
     <a href="?view=dashboard">Dashboard</a>
     <a href="?view=edit-prompt">Bot Prompt</a>
+    <a href="?view=users">Users</a>
+    <a href="?view=audit">Audit Log</a>
+    <a href="?action=logout">Logout</a>
   </nav>
   <div class="meta">Loaded: ${new Date().toLocaleString("en-IN")} · <a href="javascript:location.reload()" style="color:var(--primary)">↻ refresh</a></div>
 </header>
@@ -1061,12 +1064,220 @@ function parseFormBody(body: any): Record<string, string> {
   return {};
 }
 
+// ─── Login / register page ─────────────────────────────────────────────────
+function renderLoginPage(flash: string, mode: string): string {
+  const isRegister = mode === "register";
+  return `<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASBL CRM — ${isRegister ? "Register" : "Login"}</title>
+<link rel="preconnect" href="https://rsms.me/"><link rel="stylesheet" href="https://rsms.me/inter/inter.css">
+${SHARED_STYLE}
+</head><body class="page-narrow">
+<main class="container" style="max-width:420px;margin-top:8vh">
+  <h1 class="page-title" style="text-align:center">ASBL CRM</h1>
+  <p class="page-sub" style="text-align:center">${isRegister ? "Create an account — an admin will approve it" : "Sign in to the operations dashboard"}</p>
+  ${flash ? `<div class="card" style="border-left:3px solid var(--primary);padding:10px 14px;margin-bottom:14px">${esc(flash)}</div>` : ""}
+  <div class="card">
+    <form method="POST" action="?action=${isRegister ? "register" : "login"}">
+      <label style="display:block;margin-bottom:6px;font-size:13px">Email</label>
+      <input type="email" name="email" required placeholder="you@asblloft.com" style="width:100%;padding:10px;margin-bottom:14px;border:1px solid var(--border,#ccc);border-radius:6px" />
+      <label style="display:block;margin-bottom:6px;font-size:13px">Password</label>
+      <input type="password" name="password" required minlength="6" placeholder="••••••••" style="width:100%;padding:10px;margin-bottom:18px;border:1px solid var(--border,#ccc);border-radius:6px" />
+      <button type="submit" class="btn-primary" style="width:100%;padding:11px">${isRegister ? "Register" : "Log in"}</button>
+    </form>
+  </div>
+  <p style="text-align:center;margin-top:16px;font-size:13px">
+    ${isRegister
+      ? `Already have an account? <a href="?view=login&mode=login">Log in</a>`
+      : `No account? <a href="?view=login&mode=register">Register</a>`}
+  </p>
+</main>
+</body></html>`;
+}
+
+// ─── Admin: user approvals page ─────────────────────────────────────────────
+async function renderUsersPage(adminEmail: string): Promise<string> {
+  const { listUsers } = await import("./_utils/dashboard_auth");
+  const users = await listUsers();
+  const rows = users.map((u) => {
+    const statusChip =
+      u.status === "approved" ? `<span style="color:#080;font-weight:600">approved</span>` :
+      u.status === "pending"  ? `<span style="color:#c80;font-weight:600">pending</span>` :
+      `<span style="color:#a00;font-weight:600">rejected</span>`;
+    const actions = u.role === "admin" ? `<em style="color:#888">admin</em>` : `
+      ${u.status !== "approved" ? `<form method="POST" action="?action=approve-user&email=${encodeURIComponent(u.email)}" style="display:inline"><button type="submit" class="btn-primary">Approve</button></form>` : ""}
+      ${u.status !== "rejected" ? `<form method="POST" action="?action=reject-user&email=${encodeURIComponent(u.email)}" style="display:inline;margin-left:6px" onsubmit="return confirm('Reject ${esc(u.email)}?')"><button type="submit" class="btn-danger">Reject</button></form>` : ""}`;
+    return `<tr>
+      <td>${esc(u.email)}</td>
+      <td>${esc(u.role)}</td>
+      <td>${statusChip}</td>
+      <td>${esc(u.created_at ? new Date(u.created_at).toLocaleString("en-IN") : "—")}</td>
+      <td>${esc(u.approved_by || "—")}</td>
+      <td>${actions}</td>
+    </tr>`;
+  }).join("");
+  const pending = users.filter((u) => u.status === "pending").length;
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>ASBL CRM — Users</title>
+<link rel="preconnect" href="https://rsms.me/"><link rel="stylesheet" href="https://rsms.me/inter/inter.css">${SHARED_STYLE}</head>
+<body><header class="topbar">
+  <div class="brand"><a href="?view=dashboard">ASBL CRM</a></div>
+  <nav><a href="?view=dashboard">← Dashboard</a> <a href="?view=audit">Audit Log</a> <a href="?action=logout">Logout</a></nav>
+  <div class="meta">${esc(adminEmail)}</div>
+</header>
+<main class="container">
+  <h1 class="page-title">User Access (${pending} pending)</h1>
+  <p class="page-sub">Approve or reject dashboard accounts. Only approved users can log in.</p>
+  <div class="card full"><table>
+    <tr><th>Email</th><th>Role</th><th>Status</th><th>Registered</th><th>Approved by</th><th>Action</th></tr>
+    ${rows || `<tr><td colspan="6"><em>No users yet</em></td></tr>`}
+  </table></div>
+</main></body></html>`;
+}
+
+// ─── Admin: audit log page ──────────────────────────────────────────────────
+async function renderAuditPage(): Promise<string> {
+  const { listAuditLogs } = await import("./_utils/audit");
+  const logs = await listAuditLogs(300);
+  const rows = logs.map((l) => {
+    const detailsStr = l.details ? esc(JSON.stringify(l.details).slice(0, 200)) : "";
+    return `<tr>
+      <td style="white-space:nowrap">${esc(new Date(l.ts).toLocaleString("en-IN"))}</td>
+      <td>${esc(l.actor_email)}</td>
+      <td><code>${esc(l.action)}</code></td>
+      <td>${esc(l.target)}</td>
+      <td>${esc(l.summary)}${detailsStr ? `<br><span style="color:#888;font-size:11px">${detailsStr}</span>` : ""}</td>
+      <td style="color:#888">${esc(l.ip || "—")}</td>
+    </tr>`;
+  }).join("");
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>ASBL CRM — Audit Log</title>
+<link rel="preconnect" href="https://rsms.me/"><link rel="stylesheet" href="https://rsms.me/inter/inter.css">${SHARED_STYLE}</head>
+<body><header class="topbar">
+  <div class="brand"><a href="?view=dashboard">ASBL CRM</a></div>
+  <nav><a href="?view=dashboard">← Dashboard</a> <a href="?view=users">Users</a> <a href="?action=logout">Logout</a></nav>
+</header>
+<main class="container">
+  <h1 class="page-title">Audit Log (last ${logs.length})</h1>
+  <p class="page-sub">Every change made through the dashboard — who, what, when, where. Append-only.</p>
+  <div class="card full"><table>
+    <tr><th>When</th><th>Who</th><th>Action</th><th>Target</th><th>Summary</th><th>IP</th></tr>
+    ${rows || `<tr><td colspan="6"><em>No audit entries yet</em></td></tr>`}
+  </table></div>
+</main></body></html>`;
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // Allow iframe embedding from Zoho
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(200).end();
+
+  // ─── Dashboard authentication gate ──────────────────────────────────────
+  // The HTML dashboard + its mutating form actions require a logged-in
+  // session (cookie). The curl/admin API endpoints keep their own
+  // ?secret=INHOUSE_POSTHOOK_SECRET auth and are NOT gated here. Webhooks
+  // and ingest live in other files, unaffected.
+  {
+    const auth = await import("./_utils/dashboard_auth");
+    const { logAudit, clientIp } = await import("./_utils/audit");
+    const view = String(req.query.view || "");
+    const action = String(req.query.action || "");
+    const session = auth.getSessionFromCookies(req.headers.cookie as string | undefined);
+
+    // Views + actions that make up the dashboard UI surface (session-gated)
+    const DASHBOARD_VIEWS = new Set(["dashboard", "edit-prompt", "edit-facts", "audit", "users"]);
+    const DASHBOARD_ACTIONS = new Set([
+      "save-prompt", "reset-prompt", "save-facts", "delete-doc", "toggle-bot",
+      "refresh-inventory", "set-pdf-extracts", "upload-sign", "upload-finalize",
+      "upload-kb", "upload-doc", "approve-user", "reject-user",
+    ]);
+    const ADMIN_ONLY = new Set(["audit", "users", "approve-user", "reject-user"]);
+
+    // ── Public auth endpoints (no session needed) ──
+    if (req.method === "GET" && view === "login") {
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).send(renderLoginPage(String(req.query.msg || ""), String(req.query.mode || "login")));
+    }
+    if (req.method === "POST" && action === "login") {
+      const body = parseFormBody(req.body);
+      const result = await auth.authenticate(String(body.email || ""), String(body.password || ""));
+      if (!result.ok || !result.user) {
+        await logAudit({ actor_email: String(body.email || "(unknown)"), action: "login-failed", target: "dashboard", summary: result.error || "login failed", ip: clientIp(req) });
+        res.setHeader("Location", `?view=login&mode=login&msg=${encodeURIComponent(result.error || "Login failed")}`);
+        return res.status(303).end();
+      }
+      const token = auth.createSessionToken(result.user.email, result.user.role);
+      res.setHeader("Set-Cookie", auth.buildSessionCookie(token));
+      await logAudit({ actor_email: result.user.email, action: "login", target: "dashboard", summary: `${result.user.role} logged in`, ip: clientIp(req) });
+      res.setHeader("Location", `?view=dashboard`);
+      return res.status(303).end();
+    }
+    if (req.method === "POST" && action === "register") {
+      const body = parseFormBody(req.body);
+      const result = await auth.registerUser(String(body.email || ""), String(body.password || ""));
+      if (!result.ok) {
+        res.setHeader("Location", `?view=login&mode=register&msg=${encodeURIComponent(result.error || "Registration failed")}`);
+        return res.status(303).end();
+      }
+      await logAudit({ actor_email: String(body.email || ""), action: "register", target: "dashboard", summary: "new user registered — awaiting admin approval", ip: clientIp(req) });
+      res.setHeader("Location", `?view=login&mode=login&msg=${encodeURIComponent("Registered! An admin must approve your account before you can log in.")}`);
+      return res.status(303).end();
+    }
+    if (action === "logout") {
+      res.setHeader("Set-Cookie", auth.buildLogoutCookie());
+      res.setHeader("Location", `?view=login&msg=${encodeURIComponent("Logged out")}`);
+      return res.status(303).end();
+    }
+
+    // ── Gate dashboard surfaces ──
+    const needsAuth = DASHBOARD_VIEWS.has(view) || DASHBOARD_ACTIONS.has(action);
+    if (needsAuth) {
+      if (!session) {
+        if (req.method === "GET") {
+          res.setHeader("Location", `?view=login&msg=${encodeURIComponent("Please log in")}`);
+          return res.status(303).end();
+        }
+        return res.status(401).json({ error: "Not authenticated — log in to the dashboard first" });
+      }
+      const isAdminSurface = ADMIN_ONLY.has(view) || ADMIN_ONLY.has(action);
+      if (isAdminSurface && session.role !== "admin") {
+        if (req.method === "GET") {
+          res.setHeader("Content-Type", "text/html; charset=utf-8");
+          return res.status(403).send(`<pre>403 — admin only. You are logged in as ${esc(session.email)} (${esc(session.role)}).</pre>`);
+        }
+        return res.status(403).json({ error: "admin only" });
+      }
+    }
+
+    // ── Admin views: user approvals + audit log ──
+    if (req.method === "GET" && view === "users") {
+      const html = await renderUsersPage(session!.email);
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).send(html);
+    }
+    if (req.method === "GET" && view === "audit") {
+      const html = await renderAuditPage();
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).send(html);
+    }
+    if (req.method === "POST" && (action === "approve-user" || action === "reject-user")) {
+      const targetEmail = String(req.query.email || "");
+      const status = action === "approve-user" ? "approved" : "rejected";
+      const ok = await auth.setUserStatus(targetEmail, status as any, session!.email);
+      await logAudit({ actor_email: session!.email, action, target: `user/${targetEmail}`, summary: `${session!.email} set ${targetEmail} → ${status}`, ip: clientIp(req) });
+      res.setHeader("Location", `?view=users`);
+      return res.status(303).end();
+    }
+
+    // Stash session + audit helper on the request for downstream handlers
+    (req as any)._session = session;
+  }
 
   // Dashboard view (HTML) — separate from chat history retrieval
   if (req.method === "GET" && req.query.view === "dashboard") {
@@ -1111,6 +1322,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).send(`Unknown project: ${esc(project)}`);
     }
     const result = await saveProjectFacts(project, factsText);
+    if (result.ok) {
+      const { logAudit, clientIp } = await import("./_utils/audit");
+      const sess = (req as any)._session;
+      await logAudit({
+        actor_email: sess?.email || "(unknown)",
+        action: "save-facts",
+        target: `project_facts/${project}`,
+        summary: `${sess?.email || "?"} edited ${project} offer text (${(factsText.length / 1024).toFixed(1)} KB)`,
+        ip: clientIp(req),
+      });
+    }
     const msg = result.ok ? `Saved (${(factsText.length / 1024).toFixed(1)} KB).` : `Error: ${result.error}`;
     res.setHeader("Location", `?view=edit-facts&project=${encodeURIComponent(project)}&msg=${encodeURIComponent(msg)}`);
     return res.status(303).end();
@@ -3858,6 +4080,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       } catch (err: any) {
         return res.status(500).json({ error: `DB insert failed: ${err.message}` });
       }
+      {
+        const { logAudit, clientIp } = await import("./_utils/audit");
+        const sess = (req as any)._session;
+        await logAudit({
+          actor_email: sess?.email || "(unknown)",
+          action: "upload-doc",
+          target: `project_documents/${insertedId}`,
+          summary: `${sess?.email || "?"} uploaded ${project} ${docType}${sizeLabel ? ` "${sizeLabel}"` : ""}${appliesToAll ? " (applies to ALL units)" : ""}`,
+          details: { project, doc_type: docType, size_label: sizeLabel, filename, applies_to_all: appliesToAll || false },
+          ip: clientIp(req),
+        });
+      }
       return res.status(200).json({
         ok: true,
         project, docType, sizeLabel, publicUrl,
@@ -3882,6 +4116,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!result.ok) {
       res.setHeader("Location", `?view=edit-prompt&msg=${encodeURIComponent("Save failed: " + result.error)}`);
     } else {
+      const { logAudit, clientIp } = await import("./_utils/audit");
+      const sess = (req as any)._session;
+      await logAudit({
+        actor_email: sess?.email || "(unknown)",
+        action: "save-prompt",
+        target: "bot_settings/system_prompt",
+        summary: `${sess?.email || "?"} edited the bot system prompt (${(prompt.length / 1024).toFixed(1)} KB)`,
+        ip: clientIp(req),
+      });
       res.setHeader("Location", `?view=edit-prompt&msg=${encodeURIComponent("Saved (" + (prompt.length / 1024).toFixed(1) + " KB). The bot will use this prompt on the next message.")}`);
     }
     return res.status(303).end();
@@ -4979,6 +5222,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     try {
       const { setBotEnabled } = await import("./_utils/user_profile");
       const newState = await setBotEnabled(phone, enabled);
+      const { logAudit, clientIp } = await import("./_utils/audit");
+      const sess = (req as any)._session;
+      await logAudit({
+        actor_email: sess?.email || "(unknown)",
+        action: "toggle-bot",
+        target: `phone/${phone}`,
+        summary: `${sess?.email || "?"} turned bot ${newState ? "ON" : "OFF"} for ${phone}`,
+        ip: clientIp(req),
+      });
       // Form post from dashboard → redirect back. JSON callers see the JSON
       // body when they pass Accept: application/json.
       const wantsJson = String(req.headers.accept || "").includes("application/json");
@@ -4997,8 +5249,32 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const id = String(req.query.id || "");
     if (!id) return res.status(400).json({ error: "id required" });
     try {
-      // Phase 6: Mongo
+      // Capture the doc BEFORE deletion so the audit log records what was erased
+      let snapshot: any = null;
+      try {
+        const { listAllDocs } = await import("./_utils/project_documents");
+        const all = await listAllDocs({ limit: 500 });
+        snapshot = all.find((d: any) => String(d._id) === id) || null;
+      } catch {}
+
       await deleteDoc(id);
+
+      const { logAudit, clientIp } = await import("./_utils/audit");
+      const sess = (req as any)._session;
+      await logAudit({
+        actor_email: sess?.email || "(unknown)",
+        action: "delete-doc",
+        target: `project_documents/${id}`,
+        summary: snapshot
+          ? `Deleted ${snapshot.project} ${snapshot.doc_type} "${snapshot.size_label || snapshot.filename || id}"`
+          : `Deleted document ${id}`,
+        details: snapshot ? {
+          project: snapshot.project, doc_type: snapshot.doc_type,
+          size_label: snapshot.size_label, filename: snapshot.filename, url: snapshot.url,
+        } : null,
+        ip: clientIp(req),
+      });
+
       res.setHeader("Location", `?view=dashboard`);
       return res.status(303).end();
     } catch (err: any) {
