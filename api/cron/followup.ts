@@ -267,27 +267,59 @@ async function runPrdCadenceProcessor(): Promise<{
         // replied) and CS (preferred call time given) both mean engagement.
         const customerEngaged = lead.PRD_Status === "CF" || lead.PRD_Status === "CS";
 
-        // 1. CHATBOT FOLLOW-UPS — decoupled from PRD_Status (was broken since
-        //    voice-bot posthook flips Status to "SS" within ~30s of T=0,
-        //    so no lead ever stayed in "NA" long enough for the old NA→SF
-        //    24h transition to fire). New logic: fire follow-up #N when
-        //    Created_Time + N*24h has elapsed AND customer hasn't engaged.
-        //    Caps at 3 follow-ups per PRD spec.
+        // 1. CHATBOT FOLLOW-UPS — gate STRICTLY on time since the last
+        //    outbound WhatsApp to this phone (read from Mongo
+        //    whatsapp_messages.last_message_at, filtered to outbound). The
+        //    previous "now - Created_Time >= (count+1)*24h" logic was a
+        //    DISASTER for backlogged leads — a 5-day-old lead with NULL
+        //    count fired 3 messages back-to-back across consecutive cron
+        //    ticks (each 15 min apart) because the creation-anchored
+        //    threshold stayed TRUE between increments. 141 phones got 2-6
+        //    msgs on 2026-05-28 before this fix.
+        //
+        //    New logic: ONLY fire a follow-up if the most recent outbound
+        //    msg to this phone was >= CHATBOT_FOLLOWUP_INTERVAL_MS ago.
+        //    Self-throttling regardless of counter state.
         const followupsSent = lead.Chatbot_Follow_up_Count ?? 0;
         if (
           !customerEngaged &&
           followupsSent < CFG.CHATBOT_FOLLOWUP_MAX_ATTEMPTS &&
-          createdTime > 0 &&
-          now - createdTime >= (followupsSent + 1) * CFG.CHATBOT_FOLLOWUP_INTERVAL_MS
+          createdTime > 0
         ) {
-          await handleChatbotFollowupTick({
-            zoho_lead_id: lead.id,
-            lead,
-            phone,
-            customer_name: fullName,
-            project: lead.ASBL_Project,
-          });
-          chatbotTicks++;
+          try {
+            const { getCollection, COL } = await import("../_utils/mongo");
+            const wmCol = await getCollection(COL.WHATSAPP_MESSAGES);
+            const phoneDoc = await wmCol.findOne({ _id: phone as any }, { projection: { last_message_at: 1, by_date: 1 } });
+            // Find the most recent OUTBOUND timestamp specifically (not just last_message_at,
+            // which could be an inbound). Walk by_date keys desc to find latest outbound.
+            let lastOutboundMs = 0;
+            if (phoneDoc?.by_date) {
+              const dates = Object.keys(phoneDoc.by_date).sort().reverse();
+              outer: for (const dk of dates) {
+                const outArr = (phoneDoc.by_date[dk] as any)?.outbound || [];
+                for (let i = outArr.length - 1; i >= 0; i--) {
+                  const t = new Date(outArr[i]?.time || 0).getTime();
+                  if (t > lastOutboundMs) lastOutboundMs = t;
+                  if (lastOutboundMs > 0) break outer;
+                }
+              }
+            }
+            // If we've never sent an outbound, anchor on Created_Time (T=0 should have fired).
+            const lastSendMs = lastOutboundMs > 0 ? lastOutboundMs : createdTime;
+            const sinceLast = now - lastSendMs;
+            if (sinceLast >= CFG.CHATBOT_FOLLOWUP_INTERVAL_MS) {
+              await handleChatbotFollowupTick({
+                zoho_lead_id: lead.id,
+                lead,
+                phone,
+                customer_name: fullName,
+                project: lead.ASBL_Project,
+              });
+              chatbotTicks++;
+            }
+          } catch (err: any) {
+            console.error(`[PRD cron] chatbot gate read failed for ${phone}: ${err.message}`);
+          }
         }
 
         // 2. SS call tick: SS state, due for next call attempt.
