@@ -210,30 +210,41 @@ async function runPrdCadenceProcessor(): Promise<{
     const now = Date.now();
     const nowIso = new Date(now).toISOString().replace(/\.\d{3}Z$/, "+00:00");
 
-    // Pull leads where PRD_Stage is non-terminal AND last action was over
-    // a window ago. Conservative: fetch most-recently-modified 100 leads
-    // with PRD_Stage set; filter in-memory. (Zoho search has limited
-    // negation support, so client-side filter is reliable.)
-    const r = await fetch(
-      `https://www.zohoapis.in/crm/v3/Leads?` +
-      `fields=id,First_Name,Last_Name,Mobile,Phone,ASBL_Project,` +
+    // Pull ALL leads where PRD_Stage is non-terminal. PRD lifecycle (3
+     // chatbot follow-ups × 24h + 3 SS calls × 4h) means a lead is "active"
+     // for up to 3 days. With 500+ leads and only per_page=100, the cron
+     // earlier only saw the 100 most-recently-modified — older leads silently
+     // skipped → 272 phones (51%) got T=0 only, no follow-ups ever. Fixed
+     // 2026-05-26 by paginating up to 10 pages of 200 (= 2000 leads max,
+     // well over current volume).
+    const FIELDS =
+      `id,First_Name,Last_Name,Mobile,Phone,ASBL_Project,` +
       `PRD_Stage,PRD_Status,PRD_Last_Action_Time,PRD_Last_Action,` +
       `Chatbot_Attempt_Count,Chatbot_Follow_up_Count,SS_Call_Attempt_Count,` +
       `Site_Visit_Date,Last_Customer_Response,Intent_Captured,` +
-      `Last_Resubmission_At` +
-      `&per_page=100&sort_by=Modified_Time&sort_order=desc`,
-      { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
-    );
-    if (r.status === 204) {
+      `Last_Resubmission_At`;
+    const leads: any[] = [];
+    const MAX_PAGES = 10;
+    for (let page = 1; page <= MAX_PAGES; page++) {
+      const r = await fetch(
+        `https://www.zohoapis.in/crm/v3/Leads?fields=${FIELDS}` +
+        `&per_page=200&page=${page}&sort_by=Modified_Time&sort_order=desc`,
+        { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
+      );
+      if (r.status === 204) break;
+      if (!r.ok) {
+        throw new Error(`Zoho list failed page ${page}: ${r.status} ${(await r.text()).slice(0, 200)}`);
+      }
+      const text = await r.text();
+      let data: any = null;
+      if (text.trim()) { try { data = JSON.parse(text); } catch {} }
+      const rows = (data?.data || []) as any[];
+      leads.push(...rows);
+      if (!data?.info?.more_records) break;
+    }
+    if (!leads.length) {
       return { ms: Date.now() - start, scanned: 0, chatbot_ticks: 0, ss_call_ticks: 0, no_reply_transitions: 0, exhaustion_closes: 0, errors: [] };
     }
-    if (!r.ok) {
-      throw new Error(`Zoho list failed ${r.status}: ${(await r.text()).slice(0, 300)}`);
-    }
-    const text = await r.text();
-    let data: any = null;
-    if (text.trim()) { try { data = JSON.parse(text); } catch {} }
-    const leads = (data?.data || []) as any[];
 
     for (const lead of leads) {
       if (!lead.PRD_Stage) continue;            // not on PRD flow yet
