@@ -81,25 +81,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       console.error(`[normalize-zoho-lead] upsertLead failed: ${err.message}`);
     }
 
-    // ── 7. Fire PRD T=0 fanout (chatbot WhatsApp + AI call in parallel) ────────
-    // Same as /api/ingest/website + /api/ingest/meta + /api/ingest/inncircles do.
-    // Skip if this is a RESUBMISSION (lead already had its PRD started) — heuristic:
-    // PRD_Stage already set on the Zoho doc means we've already done T=0.
-    const alreadyOnPrd = body.PRD_Stage || body.prd_stage; // Deluge may pass through
-    if (!alreadyOnPrd) {
-      try {
-        const { handleLeadCreated } = await import("./_utils/prd_orchestrator");
-        handleLeadCreated({
-          zoho_lead_id: zohoLeadId,
-          phone: mobile,
-          customer_name: `${first_name} ${last_name}`.replace(/\s+\.$/, "").trim() || "there",
-          project,
-          is_resubmission: false,
-        }).catch((err) => console.error(`[normalize-zoho-lead→PRD] handleLeadCreated failed: ${err.message}`));
-      } catch (err: any) {
-        console.error(`[normalize-zoho-lead→PRD] orchestrator import failed: ${err.message}`);
-      }
-    }
+    // ── 7. PRD T=0 fanout — DISABLED 2026-05-28 ────────────────────────────
+    // Was firing handleLeadCreated on every call. But Zoho Deluge fires this
+    // endpoint on lead UPDATES too (not just creations) → same lead got T=0
+    // re-fired 4-5x → mass WhatsApp spam. The /api/ingest/* webhooks (which
+    // ARE clearly one-shot per lead) handle PRD T=0 correctly. LeadChain
+    // leads are NOT a typical lead-create event flow — sales/ops handle
+    // those manually. So this endpoint is now strictly NORMALISE + SYNC,
+    // never triggers outbound bot messages.
+    //
+    // If you need T=0 for LeadChain leads in the future, gate it on a
+    // strict "first time only" check (e.g. findLeadByPLID returns null
+    // BEFORE the upsert above runs).
 
     console.log(`✅ Normalized lead ${zohoLeadId} → MLID: ${mlid}, PLID: ${plid}, Project: ${project}`);
 
