@@ -1708,7 +1708,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
       const token = await getAccessToken();
 
-      const fields = "id,First_Name,Last_Name,Mobile,Email,ASBL_Project,Lead_Status,Last_Intent,Call_Status,Call_Duration,Total_Call_Duration_Secs,Last_Inhouse_Call_ID,Last_Arrowhead_Call_ID,Master_Lead_ID,Project_Lead_ID,Created_Time,Modified_Time";
+      const fields = "id,First_Name,Last_Name,Mobile,Email,ASBL_Project,Lead_Status,Lead_Source,Last_Intent,Call_Status,Call_Duration,Total_Call_Duration_Secs,Last_Inhouse_Call_ID,Last_Arrowhead_Call_ID,Master_Lead_ID,Project_Lead_ID,Created_Time,Modified_Time,PRD_Stage,PRD_Status,PRD_Last_Action_Time,Chatbot_Attempt_Count,Chatbot_Follow_up_Count,SS_Call_Attempt_Count";
 
       let lead: any = null;
       const leadId = req.query.id as string;
