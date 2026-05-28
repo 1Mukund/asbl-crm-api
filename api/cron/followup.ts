@@ -218,7 +218,7 @@ async function runPrdCadenceProcessor(): Promise<{
      // 2026-05-26 by paginating up to 10 pages of 200 (= 2000 leads max,
      // well over current volume).
     const FIELDS =
-      `id,First_Name,Last_Name,Mobile,Phone,ASBL_Project,` +
+      `id,First_Name,Last_Name,Mobile,Phone,ASBL_Project,Created_Time,` +
       `PRD_Stage,PRD_Status,PRD_Last_Action_Time,PRD_Last_Action,` +
       `Chatbot_Attempt_Count,Chatbot_Follow_up_Count,SS_Call_Attempt_Count,` +
       `Site_Visit_Date,Last_Customer_Response,Intent_Captured,` +
@@ -260,30 +260,39 @@ async function runPrdCadenceProcessor(): Promise<{
         const lastActionTime = lead.PRD_Last_Action_Time
           ? new Date(lead.PRD_Last_Action_Time).getTime()
           : 0;
+        const createdTime = lead.Created_Time
+          ? new Date(lead.Created_Time).getTime()
+          : 0;
+        // Customer replied — don't spam more chatbot follow-ups. CF (chatbot
+        // replied) and CS (preferred call time given) both mean engagement.
+        const customerEngaged = lead.PRD_Status === "CF" || lead.PRD_Status === "CS";
 
-        // 1. NA → SF transition: no reply for X hours, status still NA
-        if (lead.PRD_Status === "NA" && lastActionTime > 0 &&
-            now - lastActionTime >= CFG.CHATBOT_NO_REPLY_WINDOW_MS) {
-          await handleChatbotNoReplyTimer({ zoho_lead_id: lead.id, lead });
-          noReplyTransitions++;
-          continue;
+        // 1. CHATBOT FOLLOW-UPS — decoupled from PRD_Status (was broken since
+        //    voice-bot posthook flips Status to "SS" within ~30s of T=0,
+        //    so no lead ever stayed in "NA" long enough for the old NA→SF
+        //    24h transition to fire). New logic: fire follow-up #N when
+        //    Created_Time + N*24h has elapsed AND customer hasn't engaged.
+        //    Caps at 3 follow-ups per PRD spec.
+        const followupsSent = lead.Chatbot_Follow_up_Count ?? 0;
+        if (
+          !customerEngaged &&
+          followupsSent < CFG.CHATBOT_FOLLOWUP_MAX_ATTEMPTS &&
+          createdTime > 0 &&
+          now - createdTime >= (followupsSent + 1) * CFG.CHATBOT_FOLLOWUP_INTERVAL_MS
+        ) {
+          await handleChatbotFollowupTick({
+            zoho_lead_id: lead.id,
+            lead,
+            phone,
+            customer_name: fullName,
+            project: lead.ASBL_Project,
+          });
+          chatbotTicks++;
         }
 
-        // 2. Chatbot follow-up tick: SF state, due for next follow-up
-        if (lead.PRD_Status === "SF" && !chatbotExhausted(lead)) {
-          if (lastActionTime > 0 && now - lastActionTime >= CFG.CHATBOT_FOLLOWUP_INTERVAL_MS) {
-            await handleChatbotFollowupTick({
-              zoho_lead_id: lead.id,
-              lead,
-              phone,
-              customer_name: fullName,
-              project: lead.ASBL_Project,
-            });
-            chatbotTicks++;
-          }
-        }
-
-        // 3. SS call tick: SS state, due for next call attempt
+        // 2. SS call tick: SS state, due for next call attempt.
+        //    SS_Call_Attempt_Count includes the T=0 call (set by
+        //    handleLeadCreated). Cap is 3 total attempts.
         if (lead.PRD_Status === "SS" && !ssCallExhausted(lead)) {
           if (lastActionTime > 0 && now - lastActionTime >= CFG.SS_CALL_INTERVAL_MS) {
             await handleSsCallTick({
