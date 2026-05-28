@@ -1,13 +1,19 @@
 import { VercelRequest, VercelResponse } from "@vercel/node";
 import { normalizePhone, parseName, detectProject } from "./_utils/normalize";
-import { getOrCreateMLID, getOrCreatePLID } from "./_utils/supabase";
+import { getOrCreateMLID, getOrCreatePLID, upsertLead } from "./_utils/supabase";
 import { updateLead } from "./_utils/zoho";
+import { NormalizedLead } from "./_utils/types";
 
 // ─── Called from Zoho Deluge Workflow after LeadChain creates a lead ──────────
 // Zoho sends: zoho_lead_id, phone, full_name, campaign_name, lead_source, email
+//
+// 2026-05-28 fix: was previously only generating MLID/PLID + patching Zoho.
+// Mongo `leads` collection was NEVER updated for LeadChain-sourced leads,
+// and PRD T=0 (chatbot WhatsApp + AI call) NEVER fired. Result: 36 leads
+// in Zoho without a Mongo `leads` doc, no WhatsApp greeting, no T=0 call.
+// Now does the full pipeline like /api/ingest/website + /api/ingest/meta.
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // Allow Zoho Deluge to call this (it uses GET sometimes)
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -39,7 +45,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // ── 3. Detect project from campaign name ──────────────────────────────────
     const project = detectProject(campaignName) ?? "LOFT"; // Default LOFT for LeadChain leads
 
-    // ── 4. Get or create MLID + PLID from Supabase (same logic as Vercel API) ─
+    // ── 4. Get or create MLID + PLID (Mongo-backed atomic counters) ────────────
     const mlid = await getOrCreateMLID(mobile);
     const plid = await getOrCreatePLID(mobile, mlid, project);
 
@@ -55,6 +61,45 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       Campaign_Name:    campaignName,
       ...(email ? { Email: email } : {}),
     });
+
+    // ── 6. UPSERT into Mongo `leads` so dedup + cron + PRD all see this lead ──
+    // Was skipped previously → 36 LeadChain leads existed in Zoho but not in Mongo.
+    const normalized: NormalizedLead = {
+      first_name,
+      last_name,
+      mobile,
+      email: email || undefined,
+      lead_source: (leadSource as any),
+      source_lead_id: "",
+      campaign_name: campaignName,
+      lead_received_at: new Date().toISOString(),
+      project,
+    };
+    try {
+      await upsertLead(normalized, mlid, plid, zohoLeadId, true);
+    } catch (err: any) {
+      console.error(`[normalize-zoho-lead] upsertLead failed: ${err.message}`);
+    }
+
+    // ── 7. Fire PRD T=0 fanout (chatbot WhatsApp + AI call in parallel) ────────
+    // Same as /api/ingest/website + /api/ingest/meta + /api/ingest/inncircles do.
+    // Skip if this is a RESUBMISSION (lead already had its PRD started) — heuristic:
+    // PRD_Stage already set on the Zoho doc means we've already done T=0.
+    const alreadyOnPrd = body.PRD_Stage || body.prd_stage; // Deluge may pass through
+    if (!alreadyOnPrd) {
+      try {
+        const { handleLeadCreated } = await import("./_utils/prd_orchestrator");
+        handleLeadCreated({
+          zoho_lead_id: zohoLeadId,
+          phone: mobile,
+          customer_name: `${first_name} ${last_name}`.replace(/\s+\.$/, "").trim() || "there",
+          project,
+          is_resubmission: false,
+        }).catch((err) => console.error(`[normalize-zoho-lead→PRD] handleLeadCreated failed: ${err.message}`));
+      } catch (err: any) {
+        console.error(`[normalize-zoho-lead→PRD] orchestrator import failed: ${err.message}`);
+      }
+    }
 
     console.log(`✅ Normalized lead ${zohoLeadId} → MLID: ${mlid}, PLID: ${plid}, Project: ${project}`);
 
