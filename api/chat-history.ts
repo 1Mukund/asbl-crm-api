@@ -5351,9 +5351,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             }),
           });
           let zohoPatched = false;
-          if (patchR.ok) {
+          let zohoErrorDetail: any = null;
+          try {
             const pj = await patchR.json() as any;
-            zohoPatched = pj?.data?.[0]?.code === "SUCCESS";
+            const row = pj?.data?.[0];
+            if (patchR.ok && row?.code === "SUCCESS") {
+              zohoPatched = true;
+            } else {
+              zohoErrorDetail = {
+                http: patchR.status,
+                code: row?.code || "(no code)",
+                message: row?.message || pj?.message || "(no message)",
+                details: row?.details || pj?.details || null,
+                raw: JSON.stringify(pj).slice(0, 500),
+              };
+              console.error(`[mark-spam] Zoho PATCH failed for ${id}:`, zohoErrorDetail);
+            }
+          } catch (err: any) {
+            zohoErrorDetail = { parse_error: err.message, http: patchR.status };
           }
 
           // 3. Mongo — silence the bot for this phone (so even mid-conversation
@@ -5381,6 +5396,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           results.push({
             id, phone, name: `${lead.First_Name || ""} ${lead.Last_Name || ""}`.trim(),
             zoho_patched: zohoPatched, bot_disabled: botDisabled, ok: zohoPatched,
+            zoho_error: zohoErrorDetail,
           });
         } catch (err: any) {
           results.push({ id, ok: false, error: err.message });
