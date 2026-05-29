@@ -221,6 +221,7 @@ async function runPrdCadenceProcessor(): Promise<{
       `id,First_Name,Last_Name,Mobile,Phone,ASBL_Project,Created_Time,` +
       `PRD_Stage,PRD_Status,PRD_Last_Action_Time,PRD_Last_Action,` +
       `Chatbot_Attempt_Count,Chatbot_Follow_up_Count,SS_Call_Attempt_Count,` +
+      `Total_Call_Duration_Secs,` +  // needed for 7-day silence check
       `Site_Visit_Date,Last_Customer_Response,Intent_Captured,` +
       `Last_Resubmission_At`;
     const leads: any[] = [];
@@ -249,7 +250,24 @@ async function runPrdCadenceProcessor(): Promise<{
     for (const lead of leads) {
       if (!lead.PRD_Stage) continue;            // not on PRD flow yet
       if (lead.PRD_Stage === "Not Interested") continue;
+      if (lead.PRD_Stage === "Spam") continue;             // sales-marked spam — never follow up
       if (lead.PRD_Stage === "Pre Site Visit") continue;  // reminder cron is separate concern
+
+      // 7-DAY SILENCE AUTO-STOP — if a lead was created more than 7 days ago
+      // and we've had ZERO inbound + ZERO connected calls, stop bothering them.
+      // (PRD spec gives 3 chatbot follow-ups + 3 SS calls; if 7d in with no
+      //  engagement on EITHER channel, the customer is clearly not interested.)
+      const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+      const createdTimeForSilence = lead.Created_Time ? new Date(lead.Created_Time).getTime() : 0;
+      if (createdTimeForSilence > 0 && (now - createdTimeForSilence) >= SEVEN_DAYS_MS) {
+        const totalCallSecs = Number(lead.Total_Call_Duration_Secs ?? 0);
+        const customerEngagedEver = lead.PRD_Status === "CF" || lead.PRD_Status === "CS";
+        // "Connected call" proxy = any total duration > 10s (rings <10s = no answer)
+        const everConnected = totalCallSecs > 10;
+        if (!customerEngagedEver && !everConnected) {
+          continue; // skip outreach silently
+        }
+      }
 
       scanned++;
       try {

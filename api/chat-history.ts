@@ -5273,6 +5273,130 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // POST /api/chat-history?action=toggle-bot&phone=<digits>&enabled=0|1
   // Flips user_profiles.bot_enabled. When false, the WhatsApp webhook
   // logs inbound messages but skips Gemini + Periskope reply for that phone.
+  // ─── Mark leads as SPAM (bulk-capable) ─────────────────────────────────
+  // Triggered from a Zoho custom button (Deluge function) on the Leads
+  // module's list view. Sales multi-selects gali/galoz contacts, clicks
+  // "Mark as Spam", and Deluge calls this endpoint with all their lead IDs.
+  //
+  // POST /api/chat-history?action=mark-spam&secret=<INHOUSE_POSTHOOK_SECRET>
+  // Body: { lead_ids: ["1288576...","1288576..."] }
+  //   OR  ?lead_ids=id1,id2,id3 in the query string (Deluge convenience)
+  //
+  // Per lead:
+  //   1. Zoho: Lead_Status="Spam", PRD_Stage="Spam", PRD_Status=null
+  //   2. Mongo user_profiles.bot_enabled = false → WhatsApp webhook stays silent
+  //   3. PRD cron skips PRD_Stage="Spam" — no follow-ups, no SS calls, ever
+  //   4. Audit log entry per lead
+  if (req.query.action === "mark-spam" && (req.method === "POST" || req.method === "GET")) {
+    const secret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const sess = (req as any)._session;
+    const expected = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    // Allow EITHER an admin-session OR the shared secret (so Deluge can call without a user session)
+    const okAuth = (sess?.role === "admin") || (expected && secret === expected);
+    if (!okAuth) {
+      return res.status(401).json({ error: "Unauthorized — admin login or ?secret=<INHOUSE_POSTHOOK_SECRET> required" });
+    }
+    try {
+      const body = (req.body || {}) as any;
+      let ids: string[] = [];
+      if (Array.isArray(body.lead_ids)) ids = body.lead_ids.map((x: any) => String(x).trim()).filter(Boolean);
+      else if (typeof body.lead_ids === "string") ids = body.lead_ids.split(",").map((s: string) => s.trim()).filter(Boolean);
+      else if (req.query.lead_ids) ids = String(req.query.lead_ids).split(",").map((s) => s.trim()).filter(Boolean);
+      else if (req.query.lead_id) ids = [String(req.query.lead_id)];
+      if (!ids.length) {
+        return res.status(400).json({ error: "lead_ids required — pass as JSON body {lead_ids:[...]} or ?lead_ids=id1,id2" });
+      }
+
+      const { getAccessToken } = await import("./_utils/zoho");
+      const { setBotEnabled } = await import("./_utils/user_profile");
+      const { logAudit, clientIp } = await import("./_utils/audit");
+      const token = await getAccessToken();
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const actor = sess?.email || "deluge-button";
+
+      const results: any[] = [];
+      for (const id of ids) {
+        try {
+          // 1. Pull lead so we have the phone for the Mongo bot toggle
+          const getR = await fetch(`${ZOHO_API_BASE}/Leads/${id}?fields=id,Mobile,Phone,First_Name,Last_Name,Lead_Status,PRD_Stage`, {
+            headers: { Authorization: `Zoho-oauthtoken ${token}` },
+          });
+          if (!getR.ok) {
+            results.push({ id, ok: false, error: `Zoho GET ${getR.status}` });
+            continue;
+          }
+          const j = await getR.json() as any;
+          const lead = j?.data?.[0];
+          if (!lead) {
+            results.push({ id, ok: false, error: "lead not found" });
+            continue;
+          }
+          const phone = String(lead.Mobile || lead.Phone || "").replace(/\D/g, "");
+          const before = { Lead_Status: lead.Lead_Status, PRD_Stage: lead.PRD_Stage };
+
+          // 2. Patch Zoho — flag as Spam (Status + Stage). PRD_Status set to
+          //    null since Spam is terminal — cron skips on Stage check anyway.
+          const patchR = await fetch(`${ZOHO_API_BASE}/Leads`, {
+            method: "PATCH",
+            headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              data: [{
+                id,
+                Lead_Status: "Spam",
+                PRD_Stage: "Spam",
+                PRD_Status: null,
+                PRD_Last_Action_Time: new Date().toISOString().replace(/\.\d{3}Z$/, "+00:00"),
+                PRD_Last_Action: "Marked as Spam",
+              }],
+            }),
+          });
+          let zohoPatched = false;
+          if (patchR.ok) {
+            const pj = await patchR.json() as any;
+            zohoPatched = pj?.data?.[0]?.code === "SUCCESS";
+          }
+
+          // 3. Mongo — silence the bot for this phone (so even mid-conversation
+          //    inbound messages get NO Gemini reply).
+          let botDisabled = false;
+          if (phone) {
+            try {
+              await setBotEnabled(phone, false);
+              botDisabled = true;
+            } catch (err: any) {
+              console.error(`[mark-spam] setBotEnabled(${phone}) failed: ${err.message}`);
+            }
+          }
+
+          // 4. Audit log
+          await logAudit({
+            actor_email: actor,
+            action: "mark-spam",
+            target: `lead/${id}`,
+            summary: `${actor} marked ${lead.First_Name || ""} ${lead.Last_Name || ""} (${phone || "no-phone"}) as Spam`,
+            details: { before, after: { Lead_Status: "Spam", PRD_Stage: "Spam" }, phone, bot_disabled: botDisabled, zoho_patched: zohoPatched },
+            ip: clientIp(req),
+          });
+
+          results.push({
+            id, phone, name: `${lead.First_Name || ""} ${lead.Last_Name || ""}`.trim(),
+            zoho_patched: zohoPatched, bot_disabled: botDisabled, ok: zohoPatched,
+          });
+        } catch (err: any) {
+          results.push({ id, ok: false, error: err.message });
+        }
+      }
+
+      const ok = results.filter((r) => r.ok).length;
+      return res.status(200).json({
+        success: true, requested: ids.length, marked: ok, failed: ids.length - ok, results,
+      });
+    } catch (err: any) {
+      console.error(`[mark-spam] failed: ${err.message}`);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   if (req.method === "POST" && req.query.action === "toggle-bot") {
     const phone = String(req.query.phone || "").replace(/\D/g, "");
     const enabledParam = String(req.query.enabled ?? "1");
