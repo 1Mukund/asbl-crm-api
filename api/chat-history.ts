@@ -5334,15 +5334,52 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           const phone = String(lead.Mobile || lead.Phone || "").replace(/\D/g, "");
           const before = { Lead_Status: lead.Lead_Status, PRD_Stage: lead.PRD_Stage };
 
-          // 2. Patch Zoho — flag as Spam (Status + Stage). PRD_Status set to
-          //    null since Spam is terminal — cron skips on Stage check anyway.
+          // 2a. Try Blueprint transition for Lead_Status. Zoho enforces
+          //     RECORD_IN_BLUEPRINT — direct PATCH on Lead_Status returns
+          //     400 unless the field isn't in a blueprint. We attempt the
+          //     transition by common names — user must have added at least
+          //     one of these as a blueprint transition.
+          let blueprintApplied = false;
+          let blueprintErrorDetail: any = null;
+          const SPAM_TRANSITIONS = ["Spam", "Mark as Spam", "Move to Spam", "Spam Lead"];
+          for (const txName of SPAM_TRANSITIONS) {
+            try {
+              const bpListR = await fetch(`${ZOHO_API_BASE}/Leads/${id}/actions/blueprint`, {
+                headers: { Authorization: `Zoho-oauthtoken ${token}` },
+              });
+              const bpListJ = await bpListR.json() as any;
+              const transitions: any[] = bpListJ?.blueprint?.[0]?.transitions || bpListJ?.blueprint?.transitions || [];
+              const match = transitions.find((t: any) =>
+                String(t.name || "").toLowerCase() === txName.toLowerCase()
+              );
+              if (!match) continue;
+              const fireR = await fetch(`${ZOHO_API_BASE}/Leads/${id}/actions/blueprint`, {
+                method: "PUT",
+                headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+                body: JSON.stringify({ blueprint: [{ transition_id: match.id, data: {} }] }),
+              });
+              if (fireR.ok) {
+                blueprintApplied = true;
+                break;
+              } else {
+                blueprintErrorDetail = { transition: txName, status: fireR.status, body: (await fireR.text()).slice(0, 200) };
+              }
+            } catch (err: any) {
+              blueprintErrorDetail = { transition: txName, error: err.message };
+            }
+          }
+
+          // 2b. PATCH the non-blueprint PRD_* fields directly — these are
+          //     custom fields, NOT in the blueprint, so the PATCH succeeds.
+          //     PRD_Stage="Spam" is what the cron actually skips on, so this
+          //     alone stops all follow-ups + SS calls even if Lead_Status
+          //     blueprint transition couldn't apply.
           const patchR = await fetch(`${ZOHO_API_BASE}/Leads`, {
             method: "PATCH",
             headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
             body: JSON.stringify({
               data: [{
                 id,
-                Lead_Status: "Spam",
                 PRD_Stage: "Spam",
                 PRD_Status: null,
                 PRD_Last_Action_Time: new Date().toISOString().replace(/\.\d{3}Z$/, "+00:00"),
@@ -5365,7 +5402,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 details: row?.details || pj?.details || null,
                 raw: JSON.stringify(pj).slice(0, 500),
               };
-              console.error(`[mark-spam] Zoho PATCH failed for ${id}:`, zohoErrorDetail);
+              console.error(`[mark-spam] Zoho PRD PATCH failed for ${id}:`, zohoErrorDetail);
             }
           } catch (err: any) {
             zohoErrorDetail = { parse_error: err.message, http: patchR.status };
@@ -5395,8 +5432,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
           results.push({
             id, phone, name: `${lead.First_Name || ""} ${lead.Last_Name || ""}`.trim(),
-            zoho_patched: zohoPatched, bot_disabled: botDisabled, ok: zohoPatched,
-            zoho_error: zohoErrorDetail,
+            prd_stage_set: zohoPatched,                  // PRD_Stage = "Spam" worked
+            lead_status_set: blueprintApplied,            // Lead_Status moved via blueprint
+            bot_disabled: botDisabled,                    // Mongo bot off
+            ok: zohoPatched,                              // primary success = PRD_Stage set (cron skip key)
+            zoho_prd_error: zohoErrorDetail,
+            blueprint_error: blueprintApplied ? null : (blueprintErrorDetail || "no matching transition found (add 'Spam' transition in Zoho Blueprint)"),
           });
         } catch (err: any) {
           results.push({ id, ok: false, error: err.message });
