@@ -330,6 +330,93 @@ async function updateZohoIntent(leadId: string, intent: string, token: string): 
   console.log(`[Periskope Webhook] Zoho updated — Lead ${leadId}: Last_Intent=${intent}`);
 }
 
+// ── Callback trigger — fires voice-bot call when customer asks for callback ──
+// Hit when classified intent maps to "call_me" (CALLBACK / NRI_QUERY).
+// Throttled to 1 callback per 30 min per lead so a spammy customer can't
+// dial themselves repeatedly via WhatsApp.
+//
+// Rate-limit signal: max(PRD_Last_Action_Time when PRD_Last_Action='AI Call',
+// Last_Call_At). The first is set by our PRD orchestrator; the second by the
+// Deluge `triggerArrowheadCall` (bulk button + workflow). Together they
+// cover every code path that places a call to this lead.
+const CALLBACK_COOLDOWN_MIN = 30;
+
+async function triggerCallbackCall(
+  leadId: string,
+  phone: string,
+  customerName: string,
+  project: string | null,
+  token: string,
+): Promise<{ ok: boolean; reason?: string }> {
+  // 1. Cooldown check — read both PRD + legacy timestamps from Zoho
+  try {
+    const r = await fetch(
+      `${ZOHO_API_BASE}/Leads/${leadId}?fields=PRD_Last_Action,PRD_Last_Action_Time,Last_Call_At`,
+      { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
+    );
+    if (r.ok) {
+      const data = (await r.json()) as any;
+      const lead = data?.data?.[0];
+      if (lead) {
+        const stamps: number[] = [];
+        if (lead.PRD_Last_Action === "AI Call" && lead.PRD_Last_Action_Time) {
+          stamps.push(new Date(lead.PRD_Last_Action_Time).getTime());
+        }
+        if (lead.Last_Call_At) {
+          stamps.push(new Date(lead.Last_Call_At).getTime());
+        }
+        const mostRecent = stamps.length ? Math.max(...stamps) : 0;
+        if (mostRecent > 0) {
+          const minsSince = (Date.now() - mostRecent) / 60_000;
+          if (minsSince < CALLBACK_COOLDOWN_MIN) {
+            return {
+              ok: false,
+              reason: `cooldown: last call ${minsSince.toFixed(1)}m ago (need ${CALLBACK_COOLDOWN_MIN}m gap)`,
+            };
+          }
+        }
+      }
+    }
+  } catch (err: any) {
+    // Cooldown read failure → fail open (place the call). Better to risk a
+    // duplicate than silently swallow a customer-initiated callback request.
+    console.error(`[Periskope Webhook] cooldown read failed: ${err.message}`);
+  }
+
+  // 2. Fire the call through our in-house relay
+  const SELF_BASE = process.env.SELF_PUBLIC_URL || "https://asbl-crm-api.vercel.app";
+  const payload = {
+    _zoho_lead_id: leadId,
+    phone_number: phone,
+    customer_full_name: customerName,
+    external_schedule_id: `wa-callme-${leadId}-${Date.now()}`,
+    external_customer_id: leadId,
+    retell_llm_dynamic_variables: {
+      customer_name: customerName,
+      customer_phone: phone,
+      project_name: project || "",
+      trigger_reason: "whatsapp_callback_request",
+    },
+  };
+  try {
+    const callR = await fetch(`${SELF_BASE}/api/relay/inhouse-call`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const j = await callR.json().catch(() => ({}));
+    if (!callR.ok) {
+      return {
+        ok: false,
+        reason: `relay ${callR.status}: ${JSON.stringify(j).slice(0, 200)}`,
+      };
+    }
+    return { ok: true };
+  } catch (err: any) {
+    return { ok: false, reason: err.message };
+  }
+}
+
 // ── Save message to Supabase (with optional project + intent tags) ───────────
 async function saveMessage(
   phone: string,
@@ -1475,6 +1562,38 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     } else {
       console.log(`[Periskope Webhook] Skipping Zoho update — lead not found`);
+    }
+
+    // 13b. If customer asked for callback ("call me" intent), trigger an
+    // in-house voice-bot call immediately. Throttled to 1/30min per lead.
+    // bot_enabled=false leads have already returned early at step ~7, so
+    // by reaching here the bot is enabled for this phone.
+    if (leadDetails && zohoToken && zohoIntent === "call_me") {
+      const fullName =
+        [leadDetails.firstName, leadDetails.lastName].filter(Boolean).join(" ").trim() ||
+        "Sir/Ma'am";
+      try {
+        const callRes = await triggerCallbackCall(
+          leadDetails.id,
+          phone,
+          fullName,
+          leadDetails.asblProject,
+          zohoToken,
+        );
+        if (callRes.ok) {
+          console.log(
+            `[Periskope Webhook] ✓ Callback call triggered for ${phone} (lead ${leadDetails.id})`,
+          );
+        } else {
+          console.log(
+            `[Periskope Webhook] ✗ Callback call skipped for ${phone}: ${callRes.reason}`,
+          );
+        }
+      } catch (err: any) {
+        console.error(
+          `[Periskope Webhook] Callback call threw for ${phone}: ${err.message}`,
+        );
+      }
     }
 
     return res.status(200).json({
