@@ -2834,6 +2834,156 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── Arrowhead cleanup audit ─────────────────────────────────────────────
+  // GET ?action=arrowhead-cleanup-audit&secret=<INHOUSE_POSTHOOK_SECRET>
+  //   Probes Zoho settings APIs for everything still named "Arrowhead":
+  //   workflow rules, custom functions, custom buttons, fields. Tries
+  //   multiple endpoint variants because Zoho's v3 settings API surface
+  //   isn't fully documented — captures status + raw body of each probe.
+  //   Used 2026-05-30 to plan the Arrowhead → in-house migration cleanup.
+  if (req.method === "GET" && req.query.action === "arrowhead-cleanup-audit") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZBASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+      const HDR = { Authorization: `Zoho-oauthtoken ${token}` };
+
+      async function probe(label: string, path: string) {
+        try {
+          const r = await fetch(`${ZBASE}${path}`, { headers: HDR });
+          const txt = await r.text();
+          let body: any = null;
+          if (txt.trim()) { try { body = JSON.parse(txt); } catch { body = txt.slice(0, 500); } }
+          return { label, path, status: r.status, ok: r.ok, body };
+        } catch (err: any) {
+          return { label, path, status: 0, ok: false, body: { error: err.message } };
+        }
+      }
+
+      // Try every documented variant; whatever returns 200 wins.
+      const probes = await Promise.all([
+        probe("workflow_rules_v1", "/settings/automation/actions/workflow_rules?module=Leads"),
+        probe("workflow_rules_v2", "/settings/workflow_rules?module=Leads"),
+        probe("workflow_rules_v3", "/settings/automation/rules?module=Leads"),
+        probe("functions",         "/settings/functions?category=standalone"),
+        probe("functions_all",     "/settings/functions"),
+        probe("custom_buttons",    "/settings/custom_buttons?module=Leads"),
+        probe("related_lists",     "/settings/related_lists?module=Leads"),
+        probe("fields_leads",      "/settings/fields?module=Leads"),
+        probe("blueprint",         "/settings/automation/blueprint?module=Leads"),
+        probe("scoring_rules",     "/settings/automation/actions/scoring_rules?module=Leads"),
+      ]);
+
+      // Filter every result for the keyword "arrowhead" to narrow down
+      // which APIs returned actionable info.
+      function findArrowhead(obj: any, path: string[] = []): Array<{ path: string; snippet: string }> {
+        const out: Array<{ path: string; snippet: string }> = [];
+        if (obj == null) return out;
+        if (typeof obj === "string") {
+          if (/arrowhead/i.test(obj)) {
+            out.push({ path: path.join("."), snippet: obj.slice(0, 200) });
+          }
+          return out;
+        }
+        if (Array.isArray(obj)) {
+          for (let i = 0; i < obj.length; i++) out.push(...findArrowhead(obj[i], [...path, String(i)]));
+          return out;
+        }
+        if (typeof obj === "object") {
+          for (const k of Object.keys(obj)) out.push(...findArrowhead(obj[k], [...path, k]));
+          return out;
+        }
+        return out;
+      }
+
+      const arrowheadHits = probes
+        .filter((p) => p.ok)
+        .map((p) => ({ probe: p.label, hits: findArrowhead(p.body) }))
+        .filter((p) => p.hits.length > 0);
+
+      // For each workflow probe that worked, extract structured rule list
+      // with key fields (name, active, execute_on, actions).
+      const workflowProbe = probes.find((p) => p.label.startsWith("workflow_rules") && p.ok);
+      let workflowRules: any[] = [];
+      if (workflowProbe && Array.isArray(workflowProbe.body?.workflow_rules)) {
+        workflowRules = workflowProbe.body.workflow_rules.map((w: any) => ({
+          id: w.id,
+          name: w.name,
+          active: w.active,
+          execute_on: w.execute_on,
+          trigger: w.trigger,
+          modified_time: w.modified_time,
+          arrowhead_match: /arrowhead/i.test(JSON.stringify(w)),
+        }));
+      }
+
+      // Likewise for functions
+      const fnProbe = probes.find((p) => p.label.startsWith("functions") && p.ok);
+      let customFns: any[] = [];
+      if (fnProbe && Array.isArray(fnProbe.body?.functions)) {
+        customFns = fnProbe.body.functions.map((f: any) => ({
+          id: f.id,
+          name: f.name || f.display_name,
+          category: f.category,
+          arrowhead_match: /arrowhead/i.test(JSON.stringify(f)),
+        }));
+      }
+
+      // Buttons
+      const btnProbe = probes.find((p) => p.label === "custom_buttons" && p.ok);
+      let customBtns: any[] = [];
+      if (btnProbe && Array.isArray(btnProbe.body?.custom_buttons)) {
+        customBtns = btnProbe.body.custom_buttons.map((b: any) => ({
+          id: b.id,
+          name: b.name,
+          display_label: b.display_label,
+          arrowhead_match: /arrowhead/i.test(JSON.stringify(b)),
+        }));
+      }
+
+      // Field check
+      const fieldsProbe = probes.find((p) => p.label === "fields_leads" && p.ok);
+      let arrowheadFields: any[] = [];
+      if (fieldsProbe && Array.isArray(fieldsProbe.body?.fields)) {
+        arrowheadFields = fieldsProbe.body.fields
+          .filter((f: any) => /arrowhead/i.test(f.api_name || "") || /arrowhead/i.test(f.field_label || ""))
+          .map((f: any) => ({
+            api_name: f.api_name,
+            field_label: f.field_label,
+            data_type: f.data_type,
+            custom: f.custom_field,
+          }));
+      }
+
+      return res.status(200).json({
+        timestamp: new Date().toISOString(),
+        probe_results: probes.map((p) => ({
+          label: p.label,
+          path: p.path,
+          status: p.status,
+          ok: p.ok,
+          body_size: typeof p.body === "string" ? p.body.length : JSON.stringify(p.body || {}).length,
+        })),
+        workflow_rules: workflowRules,
+        workflow_rules_arrowhead_only: workflowRules.filter((w) => w.arrowhead_match),
+        custom_functions: customFns,
+        custom_functions_arrowhead_only: customFns.filter((f) => f.arrowhead_match),
+        custom_buttons: customBtns,
+        custom_buttons_arrowhead_only: customBtns.filter((b) => b.arrowhead_match),
+        arrowhead_fields_on_leads: arrowheadFields,
+        all_arrowhead_hits_across_probes: arrowheadHits,
+        raw_probes_full: probes,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── Zoho field metadata + auto-create Last_Inhouse_Call_ID ────────────
   // GET ?action=zoho-fields&secret=<INHOUSE_POSTHOOK_SECRET>
   //   Lists ALL custom fields on the Leads module + checks for the call-id
