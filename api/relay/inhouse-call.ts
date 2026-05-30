@@ -1,22 +1,25 @@
 /**
- * Outbound call trigger — country-routes the lead:
+ * Outbound call trigger — ALL countries now route through the in-house
+ * ASBL Voice Bot (Anandita) at https://voice.asbl.in/api/trigger-call.
  *
- *   +91 (India) → in-house ASBL Voice Bot (Anandita) at
- *                 https://voice.asbl.in/api/trigger-call
- *                 (previously https://asbl-voice-bot.onrender.com — Render
- *                  service was suspended on 2026-05-21, replaced with the
- *                  self-hosted nginx behind voice.asbl.in).
- *   ANY other   → Arrowhead campaign (international leads — US, UK,
- *                 UAE, Canada, AUS, etc.)
+ * History:
+ *   - Pre-2026-05-21: Render-hosted voice-bot (asbl-voice-bot.onrender.com),
+ *     India calls only. International calls → Arrowhead (US-only originally,
+ *     then expanded to all non-India).
+ *   - 2026-05-21: Voice-bot moved to self-hosted nginx behind voice.asbl.in.
+ *   - 2026-05-30 (this change): Voice-bot team added Telnyx for international
+ *     routing in addition to Plivo for India. Arrowhead is no longer used —
+ *     every call (any country code) is dispatched through the same in-house
+ *     endpoint with the same payload shape; the voice-bot itself selects the
+ *     telephony provider (Plivo for +91, Telnyx for everything else).
  *
  * Contract (kept compatible with existing Zoho Deluge):
  *   POST /api/relay/inhouse-call
  *   Body: { _zoho_lead_id, phone_number | mobile_number, ...extras }
  *
- * For the in-house path we stamp the returned call_id onto Zoho as
- * Last_Inhouse_Call_ID so /api/relay/inhouse-posthook can correlate.
- * For the Arrowhead path we keep the original Last_Arrowhead_Call_ID
- * scheme via the Deluge-side payload + /api/relay/arrowhead-posthook.
+ * Posthook for ALL calls now lands on /api/relay/inhouse-posthook (the
+ * voice-bot fires call_completed there for both Plivo and Telnyx calls).
+ * Zoho field Last_Inhouse_Call_ID is the single correlation key.
  */
 import { VercelRequest, VercelResponse } from "@vercel/node";
 import { triggerBlueprintTransition, updateLead } from "../_utils/zoho";
@@ -31,11 +34,6 @@ const VOICEBOT_URL =
     : "https://voice.asbl.in";
 const VOICEBOT_API_KEY = process.env.ASBL_VOICEBOT_API_KEY || "";
 
-const ARROWHEAD_BEARER_TOKEN = process.env.ARROWHEAD_BEARER_TOKEN || "";
-const ARROWHEAD_CAMPAIGN_URL_US =
-  process.env.ARROWHEAD_CAMPAIGN_URL_US ||
-  "https://api.agent.arrowhead.team/api/v2/public/domain/932f86fc-ed03-42d5-a127-7dfc63216a8a/campaign/adcc6884-03d1-4bfa-8b2f-ce4da5ddc527/schedule";
-
 /** Normalise phone input → E.164 with leading "+". */
 function toE164(raw: string): string {
   const trimmed = String(raw || "").trim();
@@ -48,30 +46,17 @@ function toE164(raw: string): string {
   return `+${digits}`;
 }
 
-/** Detect country region from E.164 number.
- *  India (+91)         → in-house voice bot
- *  ANY other country   → Arrowhead campaign (international leads)
+/** Trigger the in-house ASBL voice bot for ANY country.
  *
- *  Previously only +1 (US/Canada) went to Arrowhead and other intl
- *  numbers (UAE +971, UK +44, AUS +61, etc.) were rejected with 400.
- *  Per Mukund: all non-Indian international leads should be routed to
- *  Arrowhead. */
-function detectRegion(e164: string): "IN" | "INTL" {
-  const digits = e164.replace(/^\+/, "");
-  if (digits.startsWith("91")) return "IN";
-  return "INTL";
-}
-
-/** Trigger the in-house ASBL voice bot (India calls).
+ *  Per 2026-05-30 voice-bot change: the bot itself routes Plivo (+91) vs
+ *  Telnyx (all other country codes). We just pass the E.164 phone number
+ *  and the bot picks the right provider. No region-detection logic on our
+ *  side anymore — keeping it here would just risk drift if the voice-bot
+ *  team adds new providers later.
  *
- *  Per user 2026-05-21: target /api/trigger-call directly on voice.asbl.in.
  *  The rich payload (customer_name, external_schedule_id, external_customer_id,
- *  metadata) is sent — the new self-hosted bot exposes the same surface
- *  as the old Render deployment and ignores fields it doesn't understand.
- *
- *  Returns ok=true only when the bot replies with success:true. Earlier
- *  500/403/503 responses were due to the suspended Render service — now
- *  routed through voice.asbl.in those should resolve.
+ *  metadata) is sent — the bot ignores fields it doesn't understand. Returns
+ *  ok=true only when the bot replies with success:true.
  */
 async function triggerInHouseBot(
   phone: string,
@@ -102,80 +87,6 @@ async function triggerInHouseBot(
   return { ok: r.ok && (data as any)?.success === true, status: r.status, data };
 }
 
-/** Trigger Arrowhead campaign for international leads.
- *
- * Translates Deluge's legacy Retell-style payload to Arrowhead's current
- * schema. As of May 2026, Arrowhead requires:
- *   - mobile_number (Deluge sends phone_number — rename)
- *   - external_customer_id (Deluge doesn't send — derive from mlid/lead_id)
- *   - external_schedule_id (Deluge sends ✓)
- *   - customer_full_name (Deluge sends inside retell_llm_dynamic_variables.customer_name)
- *   - input_variables (Deluge sends retell_llm_dynamic_variables — rename + flatten)
- *
- * Updating Deluge code requires Zoho admin access + testing; transforming
- * on the Vercel side is cheaper and keeps Deluge stable.
- */
-async function triggerArrowheadUs(
-  phone: string,
-  rawBody: any,
-): Promise<{ ok: boolean; status: number; data: any }> {
-  const {
-    _zoho_lead_id,
-    phone_number,
-    mobile_number,
-    retell_llm_dynamic_variables,
-    input_variables,
-    external_schedule_id,
-    external_customer_id,
-    customer_full_name,
-    agent_id, // ignored — Arrowhead's new schema doesn't use agent_id in body
-    ...rest
-  } = rawBody || {};
-
-  const dyn = retell_llm_dynamic_variables || {};
-
-  // Translate Retell-style dynamic variables → Arrowhead input_variables
-  const builtInputVars = input_variables || {
-    budget:                       dyn.budget                       || "",
-    intent:                       dyn.intent                       || "",
-    country:                      dyn.country                      || "",
-    project:                      dyn.project_name                 || dyn.project || "",
-    comments:                     dyn.comments                     || "",
-    customer_name:                dyn.customer_name                || "",
-    web_time_spent:               dyn.web_time_spent               || dyn.time_spent_minutes || "",
-    size_preference:              dyn.size_preference              || "",
-    call_enrichment_data:         dyn.call_enrichment_data         || "",
-    floor_level_preference:       dyn.floor_level_preference       || dyn.floor_preference || "",
-    handover_timeline_preference: dyn.handover_timeline_preference || dyn.timeline || "",
-  };
-
-  const arrowheadPayload = {
-    customer_full_name:    customer_full_name      || dyn.customer_name || "",
-    mobile_number:         mobile_number           || phone_number       || phone,
-    external_customer_id:  external_customer_id    || dyn.mlid           || _zoho_lead_id || "",
-    external_schedule_id:  external_schedule_id    || "",
-    input_variables:       builtInputVars,
-  };
-
-  console.log(
-    `[Arrowhead] POST ${ARROWHEAD_CAMPAIGN_URL_US} | ` +
-    `payload keys=${Object.keys(arrowheadPayload).join(",")} ` +
-    `ext_customer=${arrowheadPayload.external_customer_id} ` +
-    `ext_schedule=${arrowheadPayload.external_schedule_id}`,
-  );
-
-  const r = await fetch(ARROWHEAD_CAMPAIGN_URL_US, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${ARROWHEAD_BEARER_TOKEN}`,
-    },
-    body: JSON.stringify(arrowheadPayload),
-  });
-  const data = await r.json().catch(() => ({}));
-  return { ok: r.ok, status: r.status, data };
-}
-
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
@@ -190,155 +101,99 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    const region = detectRegion(phone);
-    console.log(`[InHouse Call] Region=${region} phone=${phone} lead=${zohoLeadId || "(none)"}`);
+    if (!VOICEBOT_API_KEY) {
+      return res.status(500).json({ error: "ASBL_VOICEBOT_API_KEY env var not configured" });
+    }
 
-    // ── A. India (+91) → in-house ASBL Voice Bot (Anandita) ────────────
-    if (region === "IN") {
-      if (!VOICEBOT_API_KEY) {
-        return res.status(500).json({ error: "ASBL_VOICEBOT_API_KEY env var not configured" });
-      }
+    // Single path — voice-bot picks Plivo (+91) vs Telnyx (rest) on its end.
+    const isIndia = phone.replace(/^\+/, "").startsWith("91");
+    console.log(`[InHouse Call] phone=${phone} (${isIndia ? "IN/Plivo" : "INTL/Telnyx"}) lead=${zohoLeadId || "(none)"}`);
 
-      // Extract context that Zoho Deluge already supplies on every trigger.
-      // This is what enables Anandita to greet by name + speak about the
-      // right project (was missing earlier — bot knew nothing about the lead).
-      const customerName: string =
-        body.customer_full_name ||
-        body.customer_name ||
-        (body.retell_llm_dynamic_variables?.customer_name) ||
-        "";
-      const externalScheduleId: string = body.external_schedule_id || "";
-      const externalCustomerId: string =
-        body.external_customer_id ||
-        body.retell_llm_dynamic_variables?.mlid ||
-        "";
+    // Extract context that Zoho Deluge already supplies on every trigger.
+    // This is what enables Anandita to greet by name + speak about the
+    // right project (was missing earlier — bot knew nothing about the lead).
+    const customerName: string =
+      body.customer_full_name ||
+      body.customer_name ||
+      (body.retell_llm_dynamic_variables?.customer_name) ||
+      "";
+    const externalScheduleId: string = body.external_schedule_id || "";
+    const externalCustomerId: string =
+      body.external_customer_id ||
+      body.retell_llm_dynamic_variables?.mlid ||
+      "";
 
-      // Pass everything Deluge gave us (project, mlid, plid, etc.) as
-      // metadata so the voice-bot's LLM session has full context.
-      const dynVars = body.retell_llm_dynamic_variables || {};
-      const metadata: Record<string, any> = {
-        project: dynVars.project_name || body.project || "",
-        plid: dynVars.plid || "",
-        mlid: dynVars.mlid || "",
-        customer_phone: dynVars.customer_phone || phone,
-        customer_name: customerName,
-      };
-      // Strip empty values so we don't ship noise
-      for (const k of Object.keys(metadata)) {
-        if (!metadata[k]) delete metadata[k];
-      }
+    // Pass everything Deluge gave us (project, mlid, plid, etc.) as
+    // metadata so the voice-bot's LLM session has full context.
+    const dynVars = body.retell_llm_dynamic_variables || {};
+    const metadata: Record<string, any> = {
+      project: dynVars.project_name || body.project || "",
+      plid: dynVars.plid || "",
+      mlid: dynVars.mlid || "",
+      customer_phone: dynVars.customer_phone || phone,
+      customer_name: customerName,
+    };
+    // Strip empty values so we don't ship noise
+    for (const k of Object.keys(metadata)) {
+      if (!metadata[k]) delete metadata[k];
+    }
 
-      const result = await triggerInHouseBot(phone, {
-        customer_name: customerName || undefined,
-        external_schedule_id: externalScheduleId || undefined,
-        external_customer_id: externalCustomerId || undefined,
-        metadata: Object.keys(metadata).length ? metadata : undefined,
-      });
-      if (!result.ok) {
-        console.error(`[InHouse Call IN] Voice-bot trigger failed (${result.status}):`, result.data);
-        return res.status(result.status || 500).json({
-          error: result.data?.error || `voice-bot ${result.status}`,
-          voicebot_response: result.data,
-        });
-      }
-
-      const callId: string = result.data.call_id || result.data.external_schedule_id || "";
-      const provider: string = result.data.provider || "voice-bot";
-      console.log(
-        `[InHouse Call IN] Triggered → call_id=${callId} provider=${provider} ` +
-        `customer=${customerName || "(unknown)"} project=${metadata.project || "(none)"} ` +
-        `external_schedule_id=${externalScheduleId || "(none)"}`,
-      );
-
-      // Zoho stamping — MUST await in Vercel serverless. Earlier version
-      // used .catch() fire-and-forget which gets killed when the handler
-      // returns 200, so Last_Inhouse_Call_ID never persisted → posthook
-      // could not correlate the completion back to the lead → Call_Status
-      // never set, blueprint never transitioned, sales saw the lead stuck.
-      // Promise.allSettled lets both writes proceed in parallel and we
-      // still log either failure individually.
-      if (zohoLeadId) {
-        const [updateRes, transRes] = await Promise.allSettled([
-          updateLead(zohoLeadId, {
-            Lead_Status: "Lead Initiated",
-            Last_Inhouse_Call_ID: callId,
-          }),
-          triggerBlueprintTransition(zohoLeadId, "Lead Initiated"),
-        ]);
-        if (updateRes.status === "rejected") {
-          console.error(`[InHouse Call IN] updateLead failed: ${updateRes.reason?.message || updateRes.reason}`);
-        } else {
-          console.log(`[InHouse Call IN] Zoho stamped Lead_Status + Last_Inhouse_Call_ID=${callId} on lead ${zohoLeadId}`);
-        }
-        if (transRes.status === "rejected") {
-          console.error(`[InHouse Call IN] blueprint transition failed: ${transRes.reason?.message || transRes.reason}`);
-        }
-      }
-
-      return res.status(200).json({
-        success: true,
-        region: "IN",
-        provider,
-        call_id: callId,
-        external_schedule_id: externalScheduleId,
-        customer_name: customerName,
-        to: phone,
+    const result = await triggerInHouseBot(phone, {
+      customer_name: customerName || undefined,
+      external_schedule_id: externalScheduleId || undefined,
+      external_customer_id: externalCustomerId || undefined,
+      metadata: Object.keys(metadata).length ? metadata : undefined,
+    });
+    if (!result.ok) {
+      console.error(`[InHouse Call] Voice-bot trigger failed (${result.status}):`, result.data);
+      return res.status(result.status || 500).json({
+        error: result.data?.error || `voice-bot ${result.status}`,
+        voicebot_response: result.data,
       });
     }
 
-    // ── B. International (any non-IN number) → Arrowhead campaign ──────
-    if (region === "INTL") {
-      if (!ARROWHEAD_BEARER_TOKEN) {
-        console.error(`[InHouse Call INTL] ARROWHEAD_BEARER_TOKEN env var missing — call to ${phone} NOT scheduled`);
-        return res.status(500).json({
-          error: "ARROWHEAD_BEARER_TOKEN env var not configured. International calls cannot be scheduled.",
-          attempted_phone: phone,
-        });
+    const callId: string = result.data.call_id || result.data.external_schedule_id || "";
+    const provider: string = result.data.provider || (isIndia ? "plivo" : "telnyx");
+    console.log(
+      `[InHouse Call] Triggered → call_id=${callId} provider=${provider} ` +
+      `customer=${customerName || "(unknown)"} project=${metadata.project || "(none)"} ` +
+      `external_schedule_id=${externalScheduleId || "(none)"}`,
+    );
+
+    // Zoho stamping — MUST await in Vercel serverless. Earlier version
+    // used .catch() fire-and-forget which gets killed when the handler
+    // returns 200, so Last_Inhouse_Call_ID never persisted → posthook
+    // could not correlate the completion back to the lead → Call_Status
+    // never set, blueprint never transitioned, sales saw the lead stuck.
+    // Promise.allSettled lets both writes proceed in parallel and we
+    // still log either failure individually.
+    if (zohoLeadId) {
+      const [updateRes, transRes] = await Promise.allSettled([
+        updateLead(zohoLeadId, {
+          Lead_Status: "Lead Initiated",
+          Last_Inhouse_Call_ID: callId,
+        }),
+        triggerBlueprintTransition(zohoLeadId, "Lead Initiated"),
+      ]);
+      if (updateRes.status === "rejected") {
+        console.error(`[InHouse Call] updateLead failed: ${updateRes.reason?.message || updateRes.reason}`);
+      } else {
+        console.log(`[InHouse Call] Zoho stamped Lead_Status + Last_Inhouse_Call_ID=${callId} on lead ${zohoLeadId}`);
       }
-
-      const result = await triggerArrowheadUs(phone, body);
-      console.log(
-        `[InHouse Call INTL] Arrowhead POST → ${ARROWHEAD_CAMPAIGN_URL_US} | status=${result.status} ok=${result.ok} ` +
-        `response=${JSON.stringify(result.data).slice(0, 300)}`,
-      );
-
-      if (!result.ok) {
-        console.error(`[InHouse Call INTL] Arrowhead trigger FAILED for ${phone} (${result.status}):`, result.data);
-        return res.status(result.status || 500).json({
-          error: result.data?.error || result.data || `arrowhead ${result.status}`,
-          arrowhead_response: result.data,
-          attempted_phone: phone,
-        });
+      if (transRes.status === "rejected") {
+        console.error(`[InHouse Call] blueprint transition failed: ${transRes.reason?.message || transRes.reason}`);
       }
-
-      console.log(`[InHouse Call INTL] Arrowhead campaign triggered for ${phone} ✓`);
-
-      // Move Zoho lead to "Lead Initiated" — MUST await in Vercel serverless
-      // (see IN branch comment above for why fire-and-forget was wrong).
-      if (zohoLeadId) {
-        const [updateRes, transRes] = await Promise.allSettled([
-          updateLead(zohoLeadId, { Lead_Status: "Lead Initiated" }),
-          triggerBlueprintTransition(zohoLeadId, "Lead Initiated"),
-        ]);
-        if (updateRes.status === "rejected") {
-          console.error(`[InHouse Call INTL] updateLead failed: ${updateRes.reason?.message || updateRes.reason}`);
-        }
-        if (transRes.status === "rejected") {
-          console.error(`[InHouse Call INTL] blueprint transition failed: ${transRes.reason?.message || transRes.reason}`);
-        }
-      }
-
-      return res.status(200).json({
-        success: true,
-        region: "INTL",
-        provider: "arrowhead",
-        to: phone,
-        arrowhead_response: result.data,
-      });
     }
 
-    // Should never reach here — IN + INTL cover all cases now
-    return res.status(500).json({ error: `Unexpected region for ${phone}` });
+    return res.status(200).json({
+      success: true,
+      region: isIndia ? "IN" : "INTL",
+      provider,
+      call_id: callId,
+      external_schedule_id: externalScheduleId,
+      customer_name: customerName,
+      to: phone,
+    });
   } catch (err: any) {
     console.error("[InHouse Call] Unexpected error:", err.message);
     return res.status(500).json({ error: err.message });
