@@ -2834,6 +2834,150 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── Backfill Last_Inhouse_Call_ID for leads stuck due to PATCH bug ─────
+  // GET/POST ?action=backfill-inhouse-call-id&secret=<INHOUSE_POSTHOOK_SECRET>&dry=1|0&days=N
+  //
+  // Until 2026-06-03 the relay handler bundled Lead_Status+Last_Inhouse_Call_ID
+  // in a single PATCH. Zoho's blueprint rejected the whole PATCH whenever
+  // Lead_Status couldn't be set directly from the lead's current state →
+  // Last_Inhouse_Call_ID was silently dropped on EVERY trigger after T=0.
+  // This endpoint walks recent leads, finds the latest "Arrowhead Call — <uuid>"
+  // note attached to each, and PATCHes Last_Inhouse_Call_ID with that uuid.
+  // Posthook lookup now works again for these backfilled leads.
+  //
+  // Defaults: dry=1 (REPORT ONLY, no writes), days=30, limit=2000.
+  if ((req.method === "GET" || req.method === "POST") && req.query.action === "backfill-inhouse-call-id") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    const dry = String(req.query.dry ?? "1") !== "0"; // default DRY
+    const days = Math.max(1, Math.min(90, Number(req.query.days ?? 30)));
+    const limit = Math.max(1, Math.min(5000, Number(req.query.limit ?? 2000)));
+
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZBASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+      const HDR = { Authorization: `Zoho-oauthtoken ${token}` };
+
+      // 1. List recent leads, last N days, paginated. Pull only the fields we need.
+      const sinceDate = new Date(Date.now() - days * 86400_000).toISOString();
+      const FIELDS = "id,First_Name,Last_Name,Mobile,Last_Inhouse_Call_ID,Last_Arrowhead_Call_ID,SS_Call_Attempt_Count,PRD_Stage,PRD_Status,Modified_Time,Created_Time";
+      const candidates: any[] = [];
+      const PAGE_SIZE = 200;
+      for (let page = 1; page <= Math.ceil(limit / PAGE_SIZE); page++) {
+        const u = `${ZBASE}/Leads?fields=${FIELDS}&per_page=${PAGE_SIZE}&page=${page}&sort_by=Modified_Time&sort_order=desc`;
+        const r = await fetch(u, { headers: HDR });
+        if (r.status === 204) break;
+        if (!r.ok) {
+          return res.status(r.status).json({ error: "Zoho leads list failed", body: (await r.text()).slice(0, 500) });
+        }
+        const j = (await r.json()) as any;
+        const rows: any[] = j?.data || [];
+        // Stop when we hit a lead older than sinceDate
+        let hitOld = false;
+        for (const row of rows) {
+          if (row.Modified_Time && row.Modified_Time < sinceDate) { hitOld = true; break; }
+          candidates.push(row);
+        }
+        if (hitOld || !j?.info?.more_records) break;
+      }
+
+      // 2. Filter for stuck leads: empty Last_Inhouse_Call_ID + (SS counter>0 OR PRD_Status set)
+      const stuckLeads = candidates.filter(
+        (l) =>
+          (!l.Last_Inhouse_Call_ID || String(l.Last_Inhouse_Call_ID).trim() === "") &&
+          (Number(l.SS_Call_Attempt_Count ?? 0) > 0 || l.PRD_Status === "SS" || l.PRD_Status === "CF"),
+      );
+
+      // 3. For each, fetch notes and find latest "Arrowhead Call — <uuid>" (no recording suffix)
+      const CALL_NOTE_RE = /Arrowhead Call\s*[—-]+\s*([a-f0-9-]{36})\s*$/i;
+      const planned: any[] = [];
+      const noNote: any[] = [];
+      const updated: any[] = [];
+      const failed: any[] = [];
+
+      // Cap how many we process to keep response under Vercel timeout
+      const PROCESS_CAP = 200;
+      const toProcess = stuckLeads.slice(0, PROCESS_CAP);
+
+      for (const lead of toProcess) {
+        try {
+          // Fetch notes for this lead via search (Parent_Id criteria)
+          const noteR = await fetch(
+            `${ZBASE}/Notes/search?criteria=(Parent_Id:equals:${lead.id})&fields=Note_Title,Created_Time`,
+            { headers: HDR },
+          );
+          let callId: string | null = null;
+          let noteId: string | null = null;
+          if (noteR.ok) {
+            const nj = (await noteR.json()) as any;
+            const notes: any[] = nj?.data || [];
+            // Sort by Created_Time desc, find first match
+            notes.sort((a, b) => String(b.Created_Time || "").localeCompare(String(a.Created_Time || "")));
+            for (const n of notes) {
+              const m = CALL_NOTE_RE.exec(String(n.Note_Title || ""));
+              if (m) { callId = m[1]; noteId = n.id; break; }
+            }
+          }
+
+          if (!callId) {
+            noNote.push({ lead_id: lead.id, name: [lead.First_Name, lead.Last_Name].filter(Boolean).join(" "), mobile: lead.Mobile });
+            continue;
+          }
+
+          planned.push({
+            lead_id: lead.id,
+            name: [lead.First_Name, lead.Last_Name].filter(Boolean).join(" "),
+            mobile: lead.Mobile,
+            ss_count: lead.SS_Call_Attempt_Count,
+            prd_status: lead.PRD_Status,
+            backfill_call_id: callId,
+            source_note: noteId,
+          });
+
+          if (!dry) {
+            const pr = await fetch(`${ZBASE}/Leads`, {
+              method: "PATCH",
+              headers: { ...HDR, "Content-Type": "application/json" },
+              body: JSON.stringify({ data: [{ id: lead.id, Last_Inhouse_Call_ID: callId }] }),
+            });
+            const pj = await pr.json().catch(() => ({}));
+            const pjData = (pj as any)?.data?.[0];
+            if (pr.ok && pjData?.status === "success") {
+              updated.push({ lead_id: lead.id, call_id: callId });
+            } else {
+              failed.push({ lead_id: lead.id, call_id: callId, error: pjData || pj || `HTTP ${pr.status}` });
+            }
+          }
+        } catch (err: any) {
+          failed.push({ lead_id: lead.id, error: err.message });
+        }
+      }
+
+      return res.status(200).json({
+        timestamp: new Date().toISOString(),
+        dry_run: dry,
+        scope: { days, limit, processed: toProcess.length, candidates_total: candidates.length, stuck_total: stuckLeads.length, process_cap: PROCESS_CAP },
+        planned_count: planned.length,
+        no_callable_note_count: noNote.length,
+        updated_count: updated.length,
+        failed_count: failed.length,
+        planned: planned.slice(0, 50),
+        no_note_sample: noNote.slice(0, 10),
+        updated_sample: updated.slice(0, 50),
+        failed_sample: failed.slice(0, 10),
+        hint: dry
+          ? "Dry run — pass &dry=0 to apply. Re-run if stuck_total > process_cap to chunk."
+          : `Applied. ${updated.length} stamped, ${failed.length} failed.`,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── Arrowhead cleanup audit ─────────────────────────────────────────────
   // GET ?action=arrowhead-cleanup-audit&secret=<INHOUSE_POSTHOOK_SECRET>
   //   Probes Zoho settings APIs for everything still named "Arrowhead":
