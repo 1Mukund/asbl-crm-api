@@ -165,23 +165,32 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // returns 200, so Last_Inhouse_Call_ID never persisted → posthook
     // could not correlate the completion back to the lead → Call_Status
     // never set, blueprint never transitioned, sales saw the lead stuck.
-    // Promise.allSettled lets both writes proceed in parallel and we
-    // still log either failure individually.
+    //
+    // CRITICAL — Lead_Status MUST NOT be in the direct-field PATCH.
+    // Zoho's blueprint enforces transitions on Lead_Status: a direct
+    // PATCH from a non-allowed state ("Virtual Tour", "Contacted", etc.)
+    // is rejected by Zoho's validation AND drops every OTHER field in the
+    // same PATCH with it — so Last_Inhouse_Call_ID disappears silently.
+    // Confirmed by live test on 2026-06-03 (lead 1288576000000693005,
+    // call 1ab17a11-...) — PATCH with {Lead_Status, Last_Inhouse_Call_ID}
+    // returned 200 but neither field changed in Zoho. Same bug we hit on
+    // mark-spam (commit c072d8c) — now fixed here too. Lead_Status flips
+    // only via triggerBlueprintTransition; the field stamp is its own
+    // standalone PATCH.
     if (zohoLeadId) {
       const [updateRes, transRes] = await Promise.allSettled([
         updateLead(zohoLeadId, {
-          Lead_Status: "Lead Initiated",
           Last_Inhouse_Call_ID: callId,
         }),
         triggerBlueprintTransition(zohoLeadId, "Lead Initiated"),
       ]);
       if (updateRes.status === "rejected") {
-        console.error(`[InHouse Call] updateLead failed: ${updateRes.reason?.message || updateRes.reason}`);
+        console.error(`[InHouse Call] updateLead(Last_Inhouse_Call_ID) failed: ${updateRes.reason?.message || updateRes.reason}`);
       } else {
-        console.log(`[InHouse Call] Zoho stamped Lead_Status + Last_Inhouse_Call_ID=${callId} on lead ${zohoLeadId}`);
+        console.log(`[InHouse Call] Zoho stamped Last_Inhouse_Call_ID=${callId} on lead ${zohoLeadId}`);
       }
       if (transRes.status === "rejected") {
-        console.error(`[InHouse Call] blueprint transition failed: ${transRes.reason?.message || transRes.reason}`);
+        console.error(`[InHouse Call] blueprint transition 'Lead Initiated' failed: ${transRes.reason?.message || transRes.reason}`);
       }
     }
 
