@@ -33,11 +33,19 @@ There is **no test suite** and no linter configured. Verification is done by cur
 
 1. **Vercel Hobby plan caps serverless functions at 12.** The repo is permanently at the limit. Never add a new top-level file under `api/` (or nested) without removing one first. Count: `find api -type f \( -name "*.ts" -o -name "*.js" \) -not -path "*/_utils/*" | wc -l` should equal 12. Helpers go in `api/_utils/`.
 
-2. **Vercel deploy is gated on commit author.** The Vercel project owner is GitHub user `1Mukund` (= `balmukund21xxx074`). Commits authored by anyone else show as "Blocked" in the Vercel deploy list and don't ship. Always commit with:
+2. **Vercel deploy is gated on commit author.** Vercel resolves the commit's author email to a GitHub user, then to a Vercel account, then checks team membership. The repo `1Mukund/asbl-crm-api` is deployed by the Pro team `balmukund21xxx074-akgecacins-projects` whose owner is the Vercel account `balmukund21xxx074-8026`. Always commit with:
    ```bash
-   git -c user.email="209125596+1Mukund@users.noreply.github.com" -c user.name="1Mukund" commit ...
+   git -c user.email="mukundasbl@gmail.com" -c user.name="1Mukund" commit ...
    ```
-   The earlier `mukundasbl@gmail.com` stopped working on 2026-06-03 — Vercel started rejecting it because that email is linked to a separate Vercel account (`mukundasbl-5482`) that isn't a team member of the project. Use the GitHub noreply email above instead — it's bound directly to the `1Mukund` GitHub identity which Vercel trusts. The local stored `git config` is intentionally **not** updated (safety rule). Do not run `git config --global user.email`.
+   Why this works: `mukundasbl@gmail.com` is registered to the `1Mukund` GitHub user. As of 2026-06-03 (late), the `1Mukund` GitHub identity is **only** linked to the `balmukund21xxx074-8026` Vercel account (the team owner) — the conflicting link to the personal Hobby account `mukundasbl-5482` was deliberately removed. So Vercel's resolution chain lands cleanly on the owner: ✅ auto-deploy, no manual Redeploy needed.
+
+   Timeline of this email saga (so future sessions don't re-litigate it):
+   - Pre-2026-06-03: `mukundasbl@gmail.com` worked because `mukundasbl-5482` was a team member.
+   - 2026-06-03 mid-day: `mukundasbl-5482` got removed from the team — commits started landing as "Blocked".
+   - Tried the GitHub noreply email and `balmukund21xxx074@akgec.ac.in` (which resolves to a different GitHub user `mukund9162` that has no Vercel link) — both got auto-blocked too.
+   - 2026-06-03 late: Identified the root cause — `1Mukund` GitHub had been linked to *two* Vercel accounts (`mukundasbl-5482` and `balmukund21xxx074-8026`), and Vercel was resolving to the wrong (non-team) one. Disconnecting GitHub from the personal Hobby account fixes the resolution permanently. Don't add a second GitHub link to `1Mukund` from any Vercel account again — it'll re-introduce the same ambiguity.
+
+   The local stored `git config` is intentionally **not** updated (safety rule). Do not run `git config --global user.email`.
 
 3. **Vercel env-var changes need a redeploy.** Saving an env var doesn't hot-swap into the runtime — push an empty commit with `git commit --allow-empty -m "chore: redeploy ..."` to force a rebuild, or expect a stale runtime.
 
