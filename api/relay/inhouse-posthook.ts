@@ -115,7 +115,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       (req.headers["x-posthook-secret"] as string) ||
       "";
     if (incoming !== POSTHOOK_SECRET) {
-      console.warn("[InHouse Posthook] Rejected — bad/missing X-Webhook-Secret");
+      // Byte-level diag so we can pin whether bot sends a different value
+      // or no header at all. Logs prefix+suffix (4 chars each) + length —
+      // enough to verify match without exposing the full secret.
+      const got = String(incoming || "");
+      const exp = String(POSTHOOK_SECRET || "");
+      const allHeaders = Object.keys(req.headers).join(",");
+      console.warn(
+        `[InHouse Posthook] AUTH REJECT | ` +
+        `got: len=${got.length} prefix='${got.slice(0, 4)}' suffix='${got.slice(-4)}' | ` +
+        `expected: len=${exp.length} prefix='${exp.slice(0, 4)}' suffix='${exp.slice(-4)}' | ` +
+        `headers=[${allHeaders}]`,
+      );
       return res.status(401).json({ error: "Unauthorized" });
     }
   }
