@@ -2905,21 +2905,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       for (const lead of toProcess) {
         try {
-          // Fetch notes for this lead via search (Parent_Id criteria)
+          // Fetch notes for this lead via search (Parent_Id criteria).
+          // Zoho returns 204 No Content when there are NO matching notes —
+          // calling .json() on an empty body throws "Unexpected end of
+          // JSON input". Read text first, only parse when non-empty.
           const noteR = await fetch(
             `${ZBASE}/Notes/search?criteria=(Parent_Id:equals:${lead.id})&fields=Note_Title,Created_Time`,
             { headers: HDR },
           );
           let callId: string | null = null;
           let noteId: string | null = null;
-          if (noteR.ok) {
-            const nj = (await noteR.json()) as any;
-            const notes: any[] = nj?.data || [];
-            // Sort by Created_Time desc, find first match
-            notes.sort((a, b) => String(b.Created_Time || "").localeCompare(String(a.Created_Time || "")));
-            for (const n of notes) {
-              const m = CALL_NOTE_RE.exec(String(n.Note_Title || ""));
-              if (m) { callId = m[1]; noteId = n.id; break; }
+          if (noteR.ok && noteR.status !== 204) {
+            const txt = await noteR.text();
+            if (txt.trim()) {
+              let nj: any = null;
+              try { nj = JSON.parse(txt); } catch {}
+              const notes: any[] = nj?.data || [];
+              // Sort by Created_Time desc, find first match
+              notes.sort((a, b) => String(b.Created_Time || "").localeCompare(String(a.Created_Time || "")));
+              for (const n of notes) {
+                const m = CALL_NOTE_RE.exec(String(n.Note_Title || ""));
+                if (m) { callId = m[1]; noteId = n.id; break; }
+              }
             }
           }
 
