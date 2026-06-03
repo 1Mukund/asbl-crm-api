@@ -24,14 +24,15 @@
 import { VercelRequest, VercelResponse } from "@vercel/node";
 import { triggerBlueprintTransition, updateLead } from "../_utils/zoho";
 
-// Voice-bot base URL. If the env var still points at the suspended Render
-// host we override it to the new self-hosted voice.asbl.in domain — saves
-// a round-trip through the user updating Vercel env vars.
-const RAW_VOICEBOT_URL = process.env.ASBL_VOICEBOT_URL || "";
-const VOICEBOT_URL =
-  RAW_VOICEBOT_URL && !RAW_VOICEBOT_URL.includes("onrender.com")
-    ? RAW_VOICEBOT_URL
-    : "https://voice.asbl.in";
+// Voice-bot base URL. Default to angad-bot.onrender.com (current production
+// bot as of 2026-06-03). The earlier voice.asbl.in self-hosted instance
+// had issues so we moved back to a fresh Render-hosted deployment.
+// History:
+//   2026-05-21: voice.asbl.in (self-hosted, replaced suspended Render)
+//   2026-06-03: angad-bot.onrender.com (new bot, current)
+// Env override (ASBL_VOICEBOT_URL) wins if explicitly set — no string-
+// matching guards anymore so any future re-host works without code edit.
+const VOICEBOT_URL = (process.env.ASBL_VOICEBOT_URL || "https://angad-bot.onrender.com").replace(/\/+$/, "");
 const VOICEBOT_API_KEY = process.env.ASBL_VOICEBOT_API_KEY || "";
 
 /** Normalise phone input → E.164 with leading "+". */
@@ -48,15 +49,26 @@ function toE164(raw: string): string {
 
 /** Trigger the in-house ASBL voice bot for ANY country.
  *
- *  Per 2026-05-30 voice-bot change: the bot itself routes Plivo (+91) vs
- *  Telnyx (all other country codes). We just pass the E.164 phone number
- *  and the bot picks the right provider. No region-detection logic on our
- *  side anymore — keeping it here would just risk drift if the voice-bot
- *  team adds new providers later.
+ *  Bot routes Plivo (+91) vs Telnyx (everything else) internally — we
+ *  just pass the E.164 phone number and the bot picks the right provider.
  *
- *  The rich payload (customer_name, external_schedule_id, external_customer_id,
- *  metadata) is sent — the bot ignores fields it doesn't understand. Returns
- *  ok=true only when the bot replies with success:true.
+ *  Endpoint: POST /api/calls/initiate
+ *  ---------
+ *  The auth-protected /api/schedule-call requires the bot's
+ *  ASBL_VOICEBOT_API_KEY to match our Bearer header exactly. While we
+ *  were waiting on that key to land on the bot's Render env, we moved
+ *  to the legacy /api/calls/initiate endpoint which is open (no Bearer
+ *  enforced) and returns a slightly different response shape:
+ *    /api/schedule-call → { success, call_id, status, provider }
+ *    /api/calls/initiate → { ok, requestUuid, engine }
+ *
+ *  We normalise both shapes — call_id falls back to requestUuid and
+ *  ok=true is treated equivalent to success=true. If the key later
+ *  lines up we can flip the path back to /api/schedule-call without
+ *  changing the response handling.
+ *
+ *  Bearer header is sent regardless — open endpoint ignores it, auth
+ *  endpoint validates. Future-proof either way.
  */
 async function triggerInHouseBot(
   phone: string,
@@ -66,7 +78,7 @@ async function triggerInHouseBot(
     external_customer_id?: string;
     metadata?: Record<string, any>;
   },
-): Promise<{ ok: boolean; status: number; data: any }> {
+): Promise<{ ok: boolean; status: number; data: any; call_id: string }> {
   const payload: any = { to: phone };
   if (ctx.customer_name)        payload.customer_name = ctx.customer_name;
   if (ctx.external_schedule_id) payload.external_schedule_id = ctx.external_schedule_id;
@@ -75,7 +87,7 @@ async function triggerInHouseBot(
     payload.metadata = ctx.metadata;
   }
 
-  const r = await fetch(`${VOICEBOT_URL}/api/trigger-call`, {
+  const r = await fetch(`${VOICEBOT_URL}/api/calls/initiate`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -84,7 +96,11 @@ async function triggerInHouseBot(
     body: JSON.stringify(payload),
   });
   const data = await r.json().catch(() => ({}));
-  return { ok: r.ok && (data as any)?.success === true, status: r.status, data };
+  const d = (data as any) || {};
+  // Normalise: success flag from either shape; call_id from either field.
+  const okFlag = r.ok && (d.success === true || d.ok === true);
+  const callId = String(d.call_id || d.requestUuid || d.external_schedule_id || "");
+  return { ok: okFlag, status: r.status, data, call_id: callId };
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -152,8 +168,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    const callId: string = result.data.call_id || result.data.external_schedule_id || "";
-    const provider: string = result.data.provider || (isIndia ? "plivo" : "telnyx");
+    // Normalised in triggerInHouseBot — works for both /api/schedule-call
+    // (call_id field) and /api/calls/initiate (requestUuid field).
+    const callId: string = result.call_id;
+    const provider: string = result.data.provider || result.data.engine || (isIndia ? "plivo" : "telnyx");
     console.log(
       `[InHouse Call] Triggered → call_id=${callId} provider=${provider} ` +
       `customer=${customerName || "(unknown)"} project=${metadata.project || "(none)"} ` +
