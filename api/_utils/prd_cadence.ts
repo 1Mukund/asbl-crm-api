@@ -130,3 +130,16 @@ export function preSiteVisitReminder3hAt(siteVisitDate: string): Date {
 function nowIso(): string {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "+00:00");
 }
+
+// ─── Calling-hours gate (voice-bot enforces 9 AM-10 PM IST = +0530) ─────
+// Voice-bot returns 403 "Outside calling hours" otherwise. We mirror the
+// gate on our side so we don't burn relay calls + log noise for every
+// PRD tick at night. Cron retries every 15 min; the first tick after
+// 9 AM IST will fire the deferred call naturally.
+export function isWithinCallingHours(now: Date = new Date()): boolean {
+  // IST hour = UTC hour + 5 (+ 1 if UTC minutes >= 30) modulo 24
+  const utcH = now.getUTCHours();
+  const utcM = now.getUTCMinutes();
+  const istHour = (utcH + 5 + (utcM >= 30 ? 1 : 0)) % 24;
+  return istHour >= 9 && istHour < 22;
+}
