@@ -31,7 +31,6 @@ import {
   incrementChatbotAttempt,
   incrementChatbotFollowup,
   incrementSsCallAttempt,
-  isWithinCallingHours,
 } from "./prd_cadence";
 
 const PERISKOPE_API_KEY = process.env.PERISKOPE_API_KEY || "";
@@ -111,11 +110,12 @@ async function fireChatbotMessage(phone: string, message: string, project?: stri
 /** Fire an outbound AI call via our self-deployed relay → in-house voice-bot
  *  (Plivo for +91 India, Telnyx for everything else; voice-bot picks).
  *
- *  Gated on 9 AM-10 PM IST window: voice-bot itself returns 403 outside
- *  this range, so we mirror the check here to avoid burning a relay
- *  call + log noise for every PRD tick at night. Counters are NOT
- *  incremented on this skip — cron retries every 15 min and the first
- *  tick after 9 AM IST will fire the deferred call naturally. */
+ *  No calling-hours gate on our side anymore — per 2026-06-04 product call,
+ *  every new lead gets an immediate AI call regardless of time-of-day.
+ *  The earlier 9-22 IST gate was tied to the old voice.asbl.in bot's 403
+ *  behaviour; the new angad-bot dials anytime. (`isWithinCallingHours`
+ *  helper still exists in prd_cadence for any future caller that wants
+ *  the check explicitly.) */
 async function fireAiCall(opts: {
   zoho_lead_id: string;
   phone: string;
@@ -127,13 +127,6 @@ async function fireAiCall(opts: {
   size_preference?: string;
   preferred_call_time?: string;
 }): Promise<{ ok: boolean; error?: string; response?: any }> {
-  if (!isWithinCallingHours()) {
-    console.log(
-      `[PRD Orch] Skipping AI call for lead ${opts.zoho_lead_id} ` +
-      `— outside 9 AM-10 PM IST window (will retry next cron tick in hours)`,
-    );
-    return { ok: false, error: "outside_calling_hours" };
-  }
   const SELF_BASE_URL = process.env.SELF_PUBLIC_URL || "https://asbl-crm-api.vercel.app";
   const externalScheduleId = `prd-${opts.zoho_lead_id}-${Date.now()}`;
   const payload: Record<string, any> = {
