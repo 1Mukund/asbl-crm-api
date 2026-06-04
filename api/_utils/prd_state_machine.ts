@@ -25,6 +25,7 @@
  *   Customer says not interested → Not Interested / NA
  */
 import { updateLead } from "./zoho";
+import { mirrorLeadStateToMongo } from "./supabase";
 
 // ─── Canonical Stage + Status values (mirror Zoho picklist values) ──────
 export type Stage =
@@ -131,6 +132,9 @@ export async function transitionStage(input: TransitionInput): Promise<Transitio
 
   try {
     await updateLead(input.leadId, updates);
+    // Mirror to Mongo — every state transition (Stage/Status/extraFields)
+    // also lands in the Mongo `leads` doc for downstream readers.
+    await mirrorLeadStateToMongo(input.leadId, updates);
     console.log(
       `[PRD State] Lead ${input.leadId}: → ${targetStage}/${targetStatus || "(terminal)"} ` +
       `reason=${effectiveReason}`,

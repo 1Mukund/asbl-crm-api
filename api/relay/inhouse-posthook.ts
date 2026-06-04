@@ -26,6 +26,7 @@ import {
   createCallNote,
   triggerBlueprintTransition,
 } from "../_utils/zoho";
+import { mirrorLeadStateToMongo } from "../_utils/supabase";
 
 /** Lookup chain: Last_Inhouse_Call_ID → Last_Arrowhead_Call_ID → phone.
  *  Deluge still stamps the call_id in Last_Arrowhead_Call_ID (the legacy
@@ -161,6 +162,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       //    custom field if it exists in Zoho schema).
       try {
         await updateLead(lead.id, { Last_Recording_URL: recordingUrl });
+        await mirrorLeadStateToMongo(lead.id, { Last_Recording_URL: recordingUrl });
         console.log(`[InHouse Posthook ${callSid}] Last_Recording_URL set on lead ${lead.id}`);
       } catch (err: any) {
         console.warn(`[InHouse Posthook ${callSid}] Last_Recording_URL update failed (field may not exist): ${err.message}`);
@@ -240,11 +242,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // ── 2. Update lead-level fields (latest call status + accumulate duration) ──
     const prevDuration = Number(lead.Total_Call_Duration_Secs ?? 0);
-    await updateLead(lead.id, {
+    const callOutcomeFields = {
       Call_Status: callStatus,
       Call_Duration: durationSecs,
       Total_Call_Duration_Secs: prevDuration + durationSecs,
-    });
+    };
+    await updateLead(lead.id, callOutcomeFields);
+    // Mirror to Mongo so downstream readers see the same state.
+    await mirrorLeadStateToMongo(lead.id, callOutcomeFields);
 
     // ── 3. Best-effort blueprint transition based on outcome ─────────────
     const transitionMap: Record<string, string> = {

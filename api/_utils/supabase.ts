@@ -294,3 +294,63 @@ export async function upsertLead(
     { upsert: true },
   );
 }
+
+// ─── Mirror PRD state from Zoho into Mongo `leads` collection ─────────────
+// Every PRD update site (cron increments, state-machine transitions,
+// inhouse-call call_id stamp, posthook Call_Status update) calls this
+// AFTER its Zoho updateLead — so Mongo holds the same lifecycle state
+// Zoho holds, just with snake_case field names. Eventual consistency is
+// fine; Zoho remains source-of-truth, Mongo is read-side optimisation +
+// resilience against Zoho outages.
+//
+// Whitelist-driven — only fields in ZOHO_TO_MONGO_PRD_FIELD_MAP are
+// mirrored. Any other key in the input map is silently skipped (so
+// callers can pass their existing Zoho payload as-is without filtering).
+const ZOHO_TO_MONGO_PRD_FIELD_MAP: Record<string, string> = {
+  PRD_Stage:                "prd_stage",
+  PRD_Status:               "prd_status",
+  PRD_Last_Action:          "prd_last_action",
+  PRD_Last_Action_Time:     "prd_last_action_time",
+  Chatbot_Attempt_Count:    "chatbot_attempt_count",
+  Chatbot_Follow_up_Count:  "chatbot_follow_up_count",
+  SS_Call_Attempt_Count:    "ss_call_attempt_count",
+  Call_Status:              "call_status",
+  Call_Duration:            "call_duration",
+  Total_Call_Duration_Secs: "total_call_duration_secs",
+  Last_Inhouse_Call_ID:     "last_inhouse_call_id",
+  Last_Arrowhead_Call_ID:   "last_arrowhead_call_id",
+  Lead_Status:              "lead_status",
+  Site_Visit_Date:          "site_visit_date",
+  Last_Recording_URL:       "last_recording_url",
+  Call_Attempt_Count:       "call_attempt_count",
+  Last_Call_At:             "last_call_at",
+};
+
+export async function mirrorLeadStateToMongo(
+  zohoLeadId: string,
+  zohoFields: Record<string, any>,
+): Promise<void> {
+  if (!zohoLeadId || !zohoFields) return;
+  const mongoUpdate: Record<string, any> = {};
+  for (const [zohoKey, val] of Object.entries(zohoFields)) {
+    const mongoKey = ZOHO_TO_MONGO_PRD_FIELD_MAP[zohoKey];
+    if (mongoKey !== undefined) mongoUpdate[mongoKey] = val;
+  }
+  if (Object.keys(mongoUpdate).length === 0) return; // nothing PRD-relevant
+  mongoUpdate.updated_at = new Date().toISOString();
+  try {
+    const col = await getCollection<LeadDoc>(COL.LEADS);
+    // Match on zoho_lead_id — Mongo doc exists from initial ingest.
+    // upsert:false so we don't create orphan docs if zoho_lead_id has no
+    // matching Mongo lead (e.g., LeadChain leads created direct in Zoho
+    // without going through our ingest path).
+    await col.updateOne(
+      { zoho_lead_id: zohoLeadId },
+      { $set: mongoUpdate },
+      { upsert: false },
+    );
+  } catch (err: any) {
+    // Never block the caller's main flow (Zoho update already succeeded).
+    console.error(`[mirrorLeadStateToMongo] zoho_lead_id=${zohoLeadId} failed: ${err.message}`);
+  }
+}

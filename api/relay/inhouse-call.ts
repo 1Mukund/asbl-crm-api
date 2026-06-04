@@ -23,6 +23,7 @@
  */
 import { VercelRequest, VercelResponse } from "@vercel/node";
 import { triggerBlueprintTransition, updateLead } from "../_utils/zoho";
+import { mirrorLeadStateToMongo } from "../_utils/supabase";
 
 // Voice-bot base URL. Default to angad-bot.onrender.com (current production
 // bot as of 2026-06-03). The earlier voice.asbl.in self-hosted instance
@@ -196,16 +197,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // only via triggerBlueprintTransition; the field stamp is its own
     // standalone PATCH.
     if (zohoLeadId) {
+      const stampFields = { Last_Inhouse_Call_ID: callId };
       const [updateRes, transRes] = await Promise.allSettled([
-        updateLead(zohoLeadId, {
-          Last_Inhouse_Call_ID: callId,
-        }),
+        updateLead(zohoLeadId, stampFields),
         triggerBlueprintTransition(zohoLeadId, "Lead Initiated"),
       ]);
       if (updateRes.status === "rejected") {
         console.error(`[InHouse Call] updateLead(Last_Inhouse_Call_ID) failed: ${updateRes.reason?.message || updateRes.reason}`);
       } else {
         console.log(`[InHouse Call] Zoho stamped Last_Inhouse_Call_ID=${callId} on lead ${zohoLeadId}`);
+        // Mirror to Mongo so downstream readers (cron, dashboards) see
+        // the same call_id without an extra Zoho roundtrip.
+        await mirrorLeadStateToMongo(zohoLeadId, stampFields);
       }
       if (transRes.status === "rejected") {
         console.error(`[InHouse Call] blueprint transition 'Lead Initiated' failed: ${transRes.reason?.message || transRes.reason}`);

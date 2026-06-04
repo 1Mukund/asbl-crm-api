@@ -9,6 +9,7 @@
  * Configuration constants (PRD section 15 — user-confirmed defaults):
  */
 import { updateLead } from "./zoho";
+import { mirrorLeadStateToMongo } from "./supabase";
 
 // ─── CONFIG (PRD section 15 — Sales/Product-decided values) ─────────────
 export const CFG = {
@@ -66,31 +67,37 @@ export function bothChannelsExhausted(lead: LeadCadenceState): boolean {
 
 export async function incrementChatbotAttempt(leadId: string, lead: LeadCadenceState): Promise<number> {
   const next = (lead.Chatbot_Attempt_Count ?? 0) + 1;
-  await updateLead(leadId, {
+  const fields = {
     Chatbot_Attempt_Count: next,
     PRD_Last_Action: "Chatbot",
     PRD_Last_Action_Time: nowIso(),
-  });
+  };
+  await updateLead(leadId, fields);
+  await mirrorLeadStateToMongo(leadId, fields);
   return next;
 }
 
 export async function incrementChatbotFollowup(leadId: string, lead: LeadCadenceState): Promise<number> {
   const next = (lead.Chatbot_Follow_up_Count ?? 0) + 1;
-  await updateLead(leadId, {
+  const fields = {
     Chatbot_Follow_up_Count: next,
     PRD_Last_Action: "Chatbot",
     PRD_Last_Action_Time: nowIso(),
-  });
+  };
+  await updateLead(leadId, fields);
+  await mirrorLeadStateToMongo(leadId, fields);
   return next;
 }
 
 export async function incrementSsCallAttempt(leadId: string, lead: LeadCadenceState): Promise<number> {
   const next = (lead.SS_Call_Attempt_Count ?? 0) + 1;
-  await updateLead(leadId, {
+  const fields = {
     SS_Call_Attempt_Count: next,
     PRD_Last_Action: "AI Call",
     PRD_Last_Action_Time: nowIso(),
-  });
+  };
+  await updateLead(leadId, fields);
+  await mirrorLeadStateToMongo(leadId, fields);
   return next;
 }
 

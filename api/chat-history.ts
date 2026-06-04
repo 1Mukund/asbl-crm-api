@@ -2985,6 +2985,119 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── Backfill PRD state from Zoho into Mongo `leads` collection ─────────
+  // GET/POST ?action=backfill-prd-state&secret=<INHOUSE_POSTHOOK_SECRET>&dry=1|0&days=N
+  //
+  // One-time backfill after the 2026-06-03 write-through change. Every PRD
+  // update site now mirrors to Mongo on the fly, but existing leads have
+  // empty PRD fields in Mongo. This endpoint walks recent Zoho leads and
+  // copies their PRD state into Mongo. Idempotent — safe to re-run.
+  //
+  // Defaults: dry=1 (REPORT ONLY), days=60, limit=2000.
+  if ((req.method === "GET" || req.method === "POST") && req.query.action === "backfill-prd-state") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    const dry = String(req.query.dry ?? "1") !== "0";
+    const days = Math.max(1, Math.min(120, Number(req.query.days ?? 60)));
+    const limit = Math.max(1, Math.min(5000, Number(req.query.limit ?? 2000)));
+
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const { mirrorLeadStateToMongo } = await import("./_utils/supabase");
+      const ZBASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+      const HDR = { Authorization: `Zoho-oauthtoken ${token}` };
+
+      const sinceDate = new Date(Date.now() - days * 86400_000).toISOString();
+      const FIELDS = [
+        "id",
+        "PRD_Stage", "PRD_Status", "PRD_Last_Action", "PRD_Last_Action_Time",
+        "Chatbot_Attempt_Count", "Chatbot_Follow_up_Count", "SS_Call_Attempt_Count",
+        "Call_Status", "Call_Duration", "Total_Call_Duration_Secs",
+        "Last_Inhouse_Call_ID", "Last_Arrowhead_Call_ID",
+        "Lead_Status", "Site_Visit_Date", "Last_Recording_URL",
+        "Call_Attempt_Count", "Last_Call_At",
+        "Modified_Time",
+      ].join(",");
+
+      const PAGE_SIZE = 200;
+      const candidates: any[] = [];
+      for (let page = 1; page <= Math.ceil(limit / PAGE_SIZE); page++) {
+        const u = `${ZBASE}/Leads?fields=${FIELDS}&per_page=${PAGE_SIZE}&page=${page}&sort_by=Modified_Time&sort_order=desc`;
+        const r = await fetch(u, { headers: HDR });
+        if (r.status === 204) break;
+        if (!r.ok) {
+          return res.status(r.status).json({ error: "Zoho leads list failed", body: (await r.text()).slice(0, 500) });
+        }
+        const j = (await r.json()) as any;
+        const rows: any[] = j?.data || [];
+        let hitOld = false;
+        for (const row of rows) {
+          if (row.Modified_Time && row.Modified_Time < sinceDate) { hitOld = true; break; }
+          candidates.push(row);
+        }
+        if (hitOld || !j?.info?.more_records) break;
+      }
+
+      // Filter to leads that actually have PRD state to mirror (skip blanks)
+      const withState = candidates.filter((l) =>
+        l.PRD_Stage || l.PRD_Status || l.SS_Call_Attempt_Count || l.Chatbot_Attempt_Count ||
+        l.Last_Inhouse_Call_ID || l.Call_Status,
+      );
+
+      let updated = 0;
+      let skipped = 0;
+      const failures: any[] = [];
+
+      if (!dry) {
+        for (const lead of withState) {
+          try {
+            const fields: Record<string, any> = {};
+            for (const k of [
+              "PRD_Stage", "PRD_Status", "PRD_Last_Action", "PRD_Last_Action_Time",
+              "Chatbot_Attempt_Count", "Chatbot_Follow_up_Count", "SS_Call_Attempt_Count",
+              "Call_Status", "Call_Duration", "Total_Call_Duration_Secs",
+              "Last_Inhouse_Call_ID", "Last_Arrowhead_Call_ID",
+              "Lead_Status", "Site_Visit_Date", "Last_Recording_URL",
+              "Call_Attempt_Count", "Last_Call_At",
+            ]) {
+              if (lead[k] !== undefined && lead[k] !== null) fields[k] = lead[k];
+            }
+            if (!Object.keys(fields).length) { skipped++; continue; }
+            await mirrorLeadStateToMongo(lead.id, fields);
+            updated++;
+          } catch (err: any) {
+            failures.push({ lead_id: lead.id, error: err.message });
+          }
+        }
+      }
+
+      return res.status(200).json({
+        timestamp: new Date().toISOString(),
+        dry_run: dry,
+        scope: { days, limit, candidates_total: candidates.length, with_state_total: withState.length },
+        updated_count: updated,
+        skipped_count: skipped,
+        failed_count: failures.length,
+        failed_sample: failures.slice(0, 10),
+        sample_with_state: withState.slice(0, 5).map((l) => ({
+          lead_id: l.id,
+          prd_stage: l.PRD_Stage,
+          prd_status: l.PRD_Status,
+          ss_count: l.SS_Call_Attempt_Count,
+          last_inhouse_call_id: l.Last_Inhouse_Call_ID,
+          modified: l.Modified_Time,
+        })),
+        hint: dry ? "Dry run — pass &dry=0 to apply." : `Done. ${updated} mirrored, ${failures.length} failed.`,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── Arrowhead cleanup audit ─────────────────────────────────────────────
   // GET ?action=arrowhead-cleanup-audit&secret=<INHOUSE_POSTHOOK_SECRET>
   //   Probes Zoho settings APIs for everything still named "Arrowhead":
