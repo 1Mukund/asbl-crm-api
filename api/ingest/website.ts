@@ -68,10 +68,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // BUG fix 2026-05-26: this was only wired into ingest/meta.ts so every
     // Website + FIM lead silently skipped PRD entirely → no first WhatsApp,
     // no T=0 AI call, follow-up cron skipped them because PRD_Stage was null.
+    // MUST await — fire-and-forget gets killed when Vercel returns 200.
     if (result.action === "created") {
       try {
         const { handleLeadCreated } = await import("../_utils/prd_orchestrator");
-        handleLeadCreated({
+        await handleLeadCreated({
           zoho_lead_id: result.zoho_lead_id,
           phone: lead.mobile,
           customer_name: `${lead.first_name} ${lead.last_name}`.replace(/\s+\.$/, "").trim() || "there",
@@ -80,9 +81,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           last_page_visited: lead.last_page_visited,
           budget: lead.budget,
           size_preference: lead.size_preference,
-        }).catch((err) => console.error(`[Website→PRD] handleLeadCreated failed: ${err.message}`));
+        });
       } catch (err: any) {
-        console.error(`[Website→PRD] orchestrator import failed: ${err.message}`);
+        console.error(`[Website→PRD] handleLeadCreated failed: ${err.message}`);
       }
     }
 

@@ -117,10 +117,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const result = await ingestLead(lead);
 
         // PRD v1.0 T=0 — fire chatbot WhatsApp + AI call on fresh creates only.
+        // MUST await — Vercel kills the worker on handler return, so fire-and-
+        // forget (.catch without await) silently dies mid-flight. Confirmed
+        // by lead 1288576000002161053 (mahee/BROADWAY, 2026-06-05) where
+        // Chatbot_Attempt_Count never incremented despite the lead being
+        // ingested. Adds ~3-7s to response, well under Inncircles' 44s timeout.
         if (result.action === "created") {
           try {
             const { handleLeadCreated } = await import("../_utils/prd_orchestrator");
-            handleLeadCreated({
+            await handleLeadCreated({
               zoho_lead_id: result.zoho_lead_id,
               phone: lead.mobile,
               customer_name: `${lead.first_name} ${lead.last_name}`.replace(/\s+\.$/, "").trim() || "there",
@@ -129,9 +134,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               last_page_visited: lead.last_page_visited,
               budget: lead.budget,
               size_preference: lead.size_preference,
-            }).catch((err) => console.error(`[Inncircles→PRD] handleLeadCreated failed: ${err.message}`));
+            });
           } catch (err: any) {
-            console.error(`[Inncircles→PRD] orchestrator import failed: ${err.message}`);
+            console.error(`[Inncircles→PRD] handleLeadCreated failed: ${err.message}`);
           }
         }
 

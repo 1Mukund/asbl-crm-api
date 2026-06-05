@@ -169,10 +169,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             // PRD v1.0: T=0 fanout — fire chatbot + AI call simultaneously
             // only for fresh creates (not resubmissions; resubmission has
             // its own outreach cooldown via api/_utils/resubmission.ts).
+            // MUST await — Vercel kills fire-and-forget on handler return.
             if (result.action === "created") {
               try {
                 const { handleLeadCreated } = await import("../_utils/prd_orchestrator");
-                handleLeadCreated({
+                await handleLeadCreated({
                   zoho_lead_id: result.zoho_lead_id,
                   phone: lead.mobile,
                   customer_name: `${lead.first_name} ${lead.last_name}`.replace(/\s+\.$/, "").trim() || "there",
@@ -181,9 +182,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                   last_page_visited: lead.last_page_visited,
                   budget: lead.budget,
                   size_preference: lead.size_preference,
-                }).catch((err) => console.error(`[Meta→PRD] handleLeadCreated failed: ${err.message}`));
+                });
               } catch (err: any) {
-                console.error(`[Meta→PRD] orchestrator import failed: ${err.message}`);
+                console.error(`[Meta→PRD] handleLeadCreated failed: ${err.message}`);
               }
             }
 
