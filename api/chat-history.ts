@@ -3063,8 +3063,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       const results: any[] = [];
       let appliedCount = 0;
-      let botFetchFailedCount = 0;
-      let posthookFailedCount = 0;
+      let inProgressCount = 0;       // bot 204 — call still initiated/dialing
+      let notFoundOnBotCount = 0;    // bot 404 — call_id unknown to bot
+      let botAuthFailedCount = 0;    // bot 401 — our bearer doesn't match bot's env
+      let botFetchFailedCount = 0;   // any other non-2xx
+      let posthookFailedCount = 0;   // our posthook returned non-2xx
       let dryCount = 0;
 
       for (const lead of toProcess) {
@@ -3080,6 +3083,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             headers: { Authorization: `Bearer ${BOT_API_KEY}` },
           });
 
+          // 204: call still in-progress on bot side — not a failure, retry later
+          if (botRes.status === 204) {
+            inProgressCount++;
+            results.push({ lead_id: leadId, call_id: callId, phone, status: "in_progress_on_bot", code: 204 });
+            continue;
+          }
+          // 404: bot doesn't know this call_id — data permanently lost, skip
+          if (botRes.status === 404) {
+            notFoundOnBotCount++;
+            results.push({ lead_id: leadId, call_id: callId, phone, status: "call_not_found_on_bot", code: 404 });
+            continue;
+          }
+          // 401: our ASBL_VOICEBOT_API_KEY doesn't match bot's env — abort whole run
+          if (botRes.status === 401) {
+            botAuthFailedCount++;
+            return res.status(500).json({
+              error: "Bot rejected our Bearer token — ASBL_VOICEBOT_API_KEY mismatch with bot's env. Fix Vercel env to match what dev set on Render.",
+              first_failed_call: callId,
+              partial_results: results,
+            });
+          }
           if (!botRes.ok) {
             botFetchFailedCount++;
             const txt = (await botRes.text()).slice(0, 200);
@@ -3087,7 +3111,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             continue;
           }
 
-          const callData = (await botRes.json()) as any;
+          // 200 — full call data. Guard against empty body just in case.
+          const rawTxt = await botRes.text();
+          if (!rawTxt.trim()) {
+            inProgressCount++;
+            results.push({ lead_id: leadId, call_id: callId, phone, status: "empty_body_treated_as_in_progress" });
+            continue;
+          }
+          let callData: any = null;
+          try { callData = JSON.parse(rawTxt); } catch {
+            botFetchFailedCount++;
+            results.push({ lead_id: leadId, call_id: callId, phone, status: "bot_returned_non_json", body: rawTxt.slice(0, 200) });
+            continue;
+          }
 
           if (dry) {
             dryCount++;
@@ -3159,12 +3195,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         },
         applied_count: appliedCount,
         would_apply_count: dryCount,
+        in_progress_count: inProgressCount,
+        call_not_found_on_bot_count: notFoundOnBotCount,
+        bot_auth_failed_count: botAuthFailedCount,
         bot_fetch_failed_count: botFetchFailedCount,
         posthook_failed_count: posthookFailedCount,
         results_sample: results.slice(0, 25),
         hint: dry
-          ? "Dry run — pass &dry=0 to actually backfill. Re-run if stuck_total > process_cap."
-          : `Applied ${appliedCount}, ${botFetchFailedCount} bot-fetch fails, ${posthookFailedCount} posthook fails.`,
+          ? "Dry run — pass &dry=0 to actually backfill. Re-run after a few min if in_progress_count > 0."
+          : `Applied ${appliedCount}. in-progress=${inProgressCount}, not-found=${notFoundOnBotCount}, bot-fail=${botFetchFailedCount}, posthook-fail=${posthookFailedCount}.`,
       });
     } catch (err: any) {
       return res.status(500).json({ error: err.message });
