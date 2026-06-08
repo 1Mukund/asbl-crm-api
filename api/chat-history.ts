@@ -2985,6 +2985,192 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ─── Backfill completed-call data (transcript / recording / outcome) ────
+  // GET ?action=backfill-call-completions&secret=<INHOUSE_POSTHOOK_SECRET>&dry=1|0&days=14&limit=200
+  //
+  // The posthook auth-mismatch saga (whk_...ca3d vs cd98...aa41) caused a
+  // window of completed calls whose webhook delivery 401-rejected — their
+  // transcript / recording_url / call_outcome never reached Zoho. Their
+  // Last_Inhouse_Call_ID IS stamped (relay → bot trigger worked), but the
+  // posthook-driven downstream updates (Call_Status, Note, Call log) are
+  // missing.
+  //
+  // This endpoint:
+  //   1. Walks Zoho leads with Last_Inhouse_Call_ID set + Call_Status in
+  //      (null, "Not Called") — they got triggered but never reconciled.
+  //   2. For each, GETs the bot's /api/calls/<call_id> (built by dev
+  //      2026-06-08) which returns the same shape the call_completed
+  //      webhook would have sent.
+  //   3. Synthetically POSTs that payload to our own /api/relay/inhouse-
+  //      posthook with the matching secret — the existing posthook handler
+  //      then does the proper Zoho write + Mongo mirror + Note + Call log.
+  //   4. Returns per-lead status. Idempotent — re-runnable safely.
+  if ((req.method === "GET" || req.method === "POST") && req.query.action === "backfill-call-completions") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    const dry = String(req.query.dry ?? "1") !== "0";
+    const days = Math.max(1, Math.min(60, Number(req.query.days ?? 14)));
+    const limit = Math.max(1, Math.min(500, Number(req.query.limit ?? 200)));
+
+    const BOT_BASE_URL = (process.env.ASBL_VOICEBOT_URL || "https://angad-bot.onrender.com").replace(/\/+$/, "");
+    const BOT_API_KEY = process.env.ASBL_VOICEBOT_API_KEY || "";
+    const SELF_BASE_URL = process.env.SELF_PUBLIC_URL || "https://asbl-crm-api.vercel.app";
+
+    if (!BOT_API_KEY) {
+      return res.status(500).json({ error: "ASBL_VOICEBOT_API_KEY env var missing — required for bot's GET /api/calls/<id>" });
+    }
+
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZBASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+      const HDR = { Authorization: `Zoho-oauthtoken ${token}` };
+
+      // 1. List leads with stamped call_id but no reconciliation yet.
+      const sinceDate = new Date(Date.now() - days * 86400_000).toISOString();
+      const FIELDS = "id,First_Name,Last_Name,Mobile,Last_Inhouse_Call_ID,Call_Status,Call_Duration,Modified_Time";
+      const candidates: any[] = [];
+      const PAGE_SIZE = 200;
+      for (let page = 1; page <= Math.ceil(limit / PAGE_SIZE); page++) {
+        const u = `${ZBASE}/Leads?fields=${FIELDS}&per_page=${PAGE_SIZE}&page=${page}&sort_by=Modified_Time&sort_order=desc`;
+        const r = await fetch(u, { headers: HDR });
+        if (r.status === 204) break;
+        if (!r.ok) {
+          return res.status(r.status).json({ error: "Zoho leads list failed", body: (await r.text()).slice(0, 500) });
+        }
+        const j = (await r.json()) as any;
+        const rows: any[] = j?.data || [];
+        let hitOld = false;
+        for (const row of rows) {
+          if (row.Modified_Time && row.Modified_Time < sinceDate) { hitOld = true; break; }
+          candidates.push(row);
+        }
+        if (hitOld || !j?.info?.more_records) break;
+      }
+
+      // Filter: has call_id, no proper Call_Status reconciliation yet.
+      const stuck = candidates.filter((l) => {
+        const hasCallId = l.Last_Inhouse_Call_ID && String(l.Last_Inhouse_Call_ID).trim() !== "";
+        const notReconciled = !l.Call_Status || l.Call_Status === "Not Called";
+        return hasCallId && notReconciled;
+      });
+
+      const PROCESS_CAP = 100;
+      const toProcess = stuck.slice(0, PROCESS_CAP);
+
+      const results: any[] = [];
+      let appliedCount = 0;
+      let botFetchFailedCount = 0;
+      let posthookFailedCount = 0;
+      let dryCount = 0;
+
+      for (const lead of toProcess) {
+        const callId = String(lead.Last_Inhouse_Call_ID).trim();
+        const leadId = lead.id;
+        const phone = lead.Mobile;
+
+        try {
+          // 2. Fetch call data from bot
+          const botUrl = `${BOT_BASE_URL}/api/calls/${encodeURIComponent(callId)}`;
+          const botRes = await fetch(botUrl, {
+            method: "GET",
+            headers: { Authorization: `Bearer ${BOT_API_KEY}` },
+          });
+
+          if (!botRes.ok) {
+            botFetchFailedCount++;
+            const txt = (await botRes.text()).slice(0, 200);
+            results.push({ lead_id: leadId, call_id: callId, phone, status: "bot_fetch_failed", code: botRes.status, body: txt });
+            continue;
+          }
+
+          const callData = (await botRes.json()) as any;
+
+          if (dry) {
+            dryCount++;
+            results.push({
+              lead_id: leadId,
+              call_id: callId,
+              phone,
+              status: "would_apply",
+              outcome: callData?.call_outcome,
+              duration: callData?.duration_seconds,
+              has_transcript: Boolean(callData?.transcript || callData?.full_text),
+              has_recording: Boolean(callData?.recording_url),
+            });
+            continue;
+          }
+
+          // 3. Ensure event field set so posthook handler routes correctly
+          if (!callData.event) callData.event = "call_completed";
+          if (!callData.call_id) callData.call_id = callId;
+
+          // 4. Synthetic POST to our own posthook with the proper secret
+          const phRes = await fetch(`${SELF_BASE_URL}/api/relay/inhouse-posthook`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Webhook-Secret": expectedSecret,
+            },
+            body: JSON.stringify(callData),
+          });
+          const phJson = await phRes.json().catch(() => ({}));
+
+          if (phRes.ok) {
+            appliedCount++;
+            results.push({
+              lead_id: leadId,
+              call_id: callId,
+              phone,
+              status: "applied",
+              outcome: callData?.call_outcome,
+              duration: callData?.duration_seconds,
+              posthook_response: phJson,
+            });
+          } else {
+            posthookFailedCount++;
+            results.push({
+              lead_id: leadId,
+              call_id: callId,
+              phone,
+              status: "posthook_failed",
+              code: phRes.status,
+              error: phJson,
+            });
+          }
+        } catch (err: any) {
+          results.push({ lead_id: leadId, call_id: callId, phone, status: "exception", error: err.message });
+        }
+      }
+
+      return res.status(200).json({
+        timestamp: new Date().toISOString(),
+        dry_run: dry,
+        scope: {
+          days,
+          limit,
+          candidates_total: candidates.length,
+          stuck_total: stuck.length,
+          process_cap: PROCESS_CAP,
+          processed: toProcess.length,
+        },
+        applied_count: appliedCount,
+        would_apply_count: dryCount,
+        bot_fetch_failed_count: botFetchFailedCount,
+        posthook_failed_count: posthookFailedCount,
+        results_sample: results.slice(0, 25),
+        hint: dry
+          ? "Dry run — pass &dry=0 to actually backfill. Re-run if stuck_total > process_cap."
+          : `Applied ${appliedCount}, ${botFetchFailedCount} bot-fetch fails, ${posthookFailedCount} posthook fails.`,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── Backfill PRD state from Zoho into Mongo `leads` collection ─────────
   // GET/POST ?action=backfill-prd-state&secret=<INHOUSE_POSTHOOK_SECRET>&dry=1|0&days=N
   //
