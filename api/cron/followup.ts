@@ -495,7 +495,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
-  // Default = daily follow-up sequence (legacy 10-message cron at 10AM IST).
+  // Default = legacy 10-day daily follow-up sequence — DISABLED 2026-06-09.
+  // Reason: messages are all hardcoded for "ASBL Loft current offer" copy
+  // which is outdated (offer ended) AND would fire for BROADWAY/SPECTRA/
+  // LANDMARK leads with the wrong project name. PRD chatbot follow-up
+  // (3 attempts max, 24h gated, project-aware) supersedes this loop.
+  // Schedule entry removed from vercel.json; this early-return ensures
+  // any manual hits also no-op cleanly.
+  if (req.query.task !== "prd-cadence" && req.query.task !== "meta-backfill") {
+    return res.status(200).json({
+      task: "legacy-followup",
+      disabled: true,
+      reason: "Legacy 10-day daily follow-up cron disabled 2026-06-09. PRD chatbot follow-up (task=prd-cadence) is the only active outbound follow-up loop now.",
+    });
+  }
+
+  // (Unreachable — kept for code archaeology, can be deleted in next pass.)
   const followupStartTs = Date.now();
   try {
     const now = Date.now();

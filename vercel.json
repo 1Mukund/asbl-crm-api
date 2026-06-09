@@ -2,10 +2,6 @@
   "version": 2,
   "crons": [
     {
-      "path": "/api/cron/followup",
-      "schedule": "30 4 * * *"
-    },
-    {
       "path": "/api/cron/followup?task=meta-backfill",
       "schedule": "*/15 * * * *"
     },
