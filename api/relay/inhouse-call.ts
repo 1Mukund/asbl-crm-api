@@ -53,23 +53,24 @@ function toE164(raw: string): string {
  *  Bot routes Plivo (+91) vs Telnyx (everything else) internally — we
  *  just pass the E.164 phone number and the bot picks the right provider.
  *
- *  Endpoint: POST /api/calls/initiate
+ *  Endpoint: POST /api/schedule-call (auth-protected)
  *  ---------
- *  The auth-protected /api/schedule-call requires the bot's
- *  ASBL_VOICEBOT_API_KEY to match our Bearer header exactly. While we
- *  were waiting on that key to land on the bot's Render env, we moved
- *  to the legacy /api/calls/initiate endpoint which is open (no Bearer
- *  enforced) and returns a slightly different response shape:
- *    /api/schedule-call → { success, call_id, status, provider }
- *    /api/calls/initiate → { ok, requestUuid, engine }
+ *  History:
+ *    Pre-2026-06-08: We were on the legacy /api/calls/initiate (no auth)
+ *      because bot's env had a stale ASBL_VOICEBOT_API_KEY that didn't
+ *      match our Bearer header → 401 on /api/schedule-call.
+ *    2026-06-09: Confirmed via dev's curl test that /api/calls/initiate
+ *      uses a DIFFERENT (and broken) Telnyx outbound voice profile that
+ *      bars most international destinations with
+ *      "Calls to this destination region are barred." 500. NRI calls
+ *      (e.g. +14084619317) work cleanly on /api/schedule-call. Switched
+ *      back to the auth-protected path now that the API key has landed.
  *
- *  We normalise both shapes — call_id falls back to requestUuid and
- *  ok=true is treated equivalent to success=true. If the key later
- *  lines up we can flip the path back to /api/schedule-call without
- *  changing the response handling.
- *
- *  Bearer header is sent regardless — open endpoint ignores it, auth
- *  endpoint validates. Future-proof either way.
+ *  Response shape normalisation:
+ *    /api/schedule-call  → { success, call_id, status, provider }
+ *    /api/calls/initiate → { ok, requestUuid, engine }    (legacy fallback)
+ *  Both shapes are handled by triggerInHouseBot — success / call_id are
+ *  derived from whichever fields are present.
  */
 async function triggerInHouseBot(
   phone: string,
@@ -88,7 +89,7 @@ async function triggerInHouseBot(
     payload.metadata = ctx.metadata;
   }
 
-  const r = await fetch(`${VOICEBOT_URL}/api/calls/initiate`, {
+  const r = await fetch(`${VOICEBOT_URL}/api/schedule-call`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
