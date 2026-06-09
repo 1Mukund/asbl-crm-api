@@ -3029,9 +3029,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const token = await getAccessToken();
       const HDR = { Authorization: `Zoho-oauthtoken ${token}` };
 
-      // 1. List leads with stamped call_id but no reconciliation yet.
+      // 1. List leads with any backfill key but no reconciliation yet.
       const sinceDate = new Date(Date.now() - days * 86400_000).toISOString();
-      const FIELDS = "id,First_Name,Last_Name,Mobile,Last_Inhouse_Call_ID,Call_Status,Call_Duration,Modified_Time";
+      const FIELDS = "id,First_Name,Last_Name,Mobile,Last_Inhouse_Call_ID,Last_Arrowhead_Call_ID,Call_Status,Call_Duration,Modified_Time";
       const candidates: any[] = [];
       const PAGE_SIZE = 200;
       for (let page = 1; page <= Math.ceil(limit / PAGE_SIZE); page++) {
@@ -3051,11 +3051,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         if (hitOld || !j?.info?.more_records) break;
       }
 
-      // Filter: has call_id, no proper Call_Status reconciliation yet.
+      // Filter: has any backfill key, no proper Call_Status reconciliation yet.
       const stuck = candidates.filter((l) => {
-        const hasCallId = l.Last_Inhouse_Call_ID && String(l.Last_Inhouse_Call_ID).trim() !== "";
+        const hasInhouseId = l.Last_Inhouse_Call_ID && String(l.Last_Inhouse_Call_ID).trim() !== "";
+        const hasArrowheadId = l.Last_Arrowhead_Call_ID && String(l.Last_Arrowhead_Call_ID).trim() !== "";
         const notReconciled = !l.Call_Status || l.Call_Status === "Not Called";
-        return hasCallId && notReconciled;
+        return (hasInhouseId || hasArrowheadId) && notReconciled;
       });
 
       const PROCESS_CAP = 100;
@@ -3071,13 +3072,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       let dryCount = 0;
 
       for (const lead of toProcess) {
-        const callId = String(lead.Last_Inhouse_Call_ID).trim();
         const leadId = lead.id;
         const phone = lead.Mobile;
+        const inhouseCallId = lead.Last_Inhouse_Call_ID ? String(lead.Last_Inhouse_Call_ID).trim() : "";
+        const externalScheduleId = lead.Last_Arrowhead_Call_ID ? String(lead.Last_Arrowhead_Call_ID).trim() : "";
+
+        // Per dev 2026-06-08: prefer external_schedule_id (stable across
+        // Plivo connected-call requestUuid → CallUUID promotion). Bot's
+        // GET /api/calls/<id> accepts either, but external_schedule_id
+        // hits every lookup priority. Fall back to call_id only if no
+        // external_schedule_id stored (legacy leads from before the
+        // 2026-06-08 stamp-both-fields fix).
+        const lookupKey = externalScheduleId || inhouseCallId;
+        const lookupKeyType = externalScheduleId ? "external_schedule_id" : "call_id";
+        const callId = inhouseCallId || externalScheduleId; // for results display
 
         try {
           // 2. Fetch call data from bot
-          const botUrl = `${BOT_BASE_URL}/api/calls/${encodeURIComponent(callId)}`;
+          const botUrl = `${BOT_BASE_URL}/api/calls/${encodeURIComponent(lookupKey)}`;
           const botRes = await fetch(botUrl, {
             method: "GET",
             headers: { Authorization: `Bearer ${BOT_API_KEY}` },
@@ -3086,13 +3098,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           // 204: call still in-progress on bot side — not a failure, retry later
           if (botRes.status === 204) {
             inProgressCount++;
-            results.push({ lead_id: leadId, call_id: callId, phone, status: "in_progress_on_bot", code: 204 });
+            results.push({ lead_id: leadId, call_id: callId, phone, status: "in_progress_on_bot", code: 204, lookup: lookupKeyType });
             continue;
           }
           // 404: bot doesn't know this call_id — data permanently lost, skip
           if (botRes.status === 404) {
             notFoundOnBotCount++;
-            results.push({ lead_id: leadId, call_id: callId, phone, status: "call_not_found_on_bot", code: 404 });
+            results.push({ lead_id: leadId, call_id: callId, phone, status: "call_not_found_on_bot", code: 404, lookup: lookupKeyType, lookup_key: lookupKey });
             continue;
           }
           // 401: our ASBL_VOICEBOT_API_KEY doesn't match bot's env — abort whole run

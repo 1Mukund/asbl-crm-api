@@ -197,15 +197,34 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // only via triggerBlueprintTransition; the field stamp is its own
     // standalone PATCH.
     if (zohoLeadId) {
-      const stampFields = { Last_Inhouse_Call_ID: callId };
+      // Stamp BOTH fields:
+      //   Last_Inhouse_Call_ID = bot's call_id (Plivo requestUuid / Telnyx call_control_id)
+      //   Last_Arrowhead_Call_ID = external_schedule_id we sent (stable lookup key)
+      //
+      // Why both? On Plivo connected calls, the bot promotes requestUuid →
+      // CallUUID once the WebSocket starts, and the originally-returned
+      // requestUuid stops being a valid lookup key on the bot side. The
+      // external_schedule_id we passed in (e.g. "1714-BROADWAY-call-5"
+      // from Deluge, or "prd-<lead_id>-<ts>" from PRD orchestrator) is
+      // always stable on the bot — so it's the more reliable backfill
+      // key. Deluge already stamps Last_Arrowhead_Call_ID for its own
+      // path; this ensures PRD T=0 / WhatsApp callback paths also stamp it.
+      const stampFields: Record<string, any> = { Last_Inhouse_Call_ID: callId };
+      if (externalScheduleId) {
+        stampFields.Last_Arrowhead_Call_ID = externalScheduleId;
+      }
       const [updateRes, transRes] = await Promise.allSettled([
         updateLead(zohoLeadId, stampFields),
         triggerBlueprintTransition(zohoLeadId, "Lead Initiated"),
       ]);
       if (updateRes.status === "rejected") {
-        console.error(`[InHouse Call] updateLead(Last_Inhouse_Call_ID) failed: ${updateRes.reason?.message || updateRes.reason}`);
+        console.error(`[InHouse Call] updateLead(call-id fields) failed: ${updateRes.reason?.message || updateRes.reason}`);
       } else {
-        console.log(`[InHouse Call] Zoho stamped Last_Inhouse_Call_ID=${callId} on lead ${zohoLeadId}`);
+        console.log(
+          `[InHouse Call] Zoho stamped Last_Inhouse_Call_ID=${callId}` +
+          (externalScheduleId ? ` + Last_Arrowhead_Call_ID=${externalScheduleId}` : "") +
+          ` on lead ${zohoLeadId}`,
+        );
         // Mirror to Mongo so downstream readers (cron, dashboards) see
         // the same call_id without an extra Zoho roundtrip.
         await mirrorLeadStateToMongo(zohoLeadId, stampFields);
