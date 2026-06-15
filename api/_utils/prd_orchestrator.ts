@@ -282,7 +282,9 @@ export async function handleChatbotNoReplyTimer(opts: { zoho_lead_id: string; le
   // (Phase 7 wiring) — we just transitioned status here.
 }
 
-/** A scheduled chatbot follow-up tick fires → send next message + increment. */
+/** A scheduled chatbot follow-up tick fires → send next message + increment.
+ *  COLD-lead path — customer has never replied. Uses the 6-template rotating
+ *  bank in buildFollowupMessage. */
 export async function handleChatbotFollowupTick(opts: {
   zoho_lead_id: string;
   lead: any;
@@ -298,6 +300,38 @@ export async function handleChatbotFollowupTick(opts: {
   }
   const followupIdx = (opts.lead.Chatbot_Follow_up_Count ?? 0) + 1;
   const msg = buildFollowupMessage(opts.customer_name, opts.project, followupIdx);
+  const r = await fireChatbotMessage(opts.phone, msg, opts.project);
+  if (r.ok) {
+    await incrementChatbotFollowup(opts.zoho_lead_id, opts.lead);
+  }
+}
+
+/** GHOST re-engagement tick fires for warm-then-silent leads (customer replied
+ *  at some point but has been quiet for >= GHOST_THRESHOLD_MS).
+ *  Uses the context-aware buildReengagementMessage bank instead of cold-pitch
+ *  templates. Counter shared with regular chatbot follow-up to enforce the
+ *  same 30-attempt safety cap. */
+export async function handleChatbotReengagementTick(opts: {
+  zoho_lead_id: string;
+  lead: any;
+  phone: string;
+  customer_name: string;
+  project?: string;
+  hours_since_last_reply: number;
+}): Promise<void> {
+  if (chatbotExhausted(opts.lead)) {
+    if (bothChannelsExhausted(opts.lead)) {
+      await onSsTreeExhausted(opts.zoho_lead_id, opts.lead);
+    }
+    return;
+  }
+  const followupIdx = (opts.lead.Chatbot_Follow_up_Count ?? 0) + 1;
+  const msg = buildReengagementMessage(
+    opts.customer_name,
+    opts.project,
+    opts.hours_since_last_reply,
+    followupIdx,
+  );
   const r = await fireChatbotMessage(opts.phone, msg, opts.project);
   if (r.ok) {
     await incrementChatbotFollowup(opts.zoho_lead_id, opts.lead);
@@ -368,19 +402,61 @@ export function detectsNotInterestedIntent(msg: string | null | undefined): bool
 
 // ─── Templates ──────────────────────────────────────────────────────────
 
+/** COLD follow-up — customer has never replied. Rotating bank of 6
+ *  messages covering different angles (brochure, site visit, pricing,
+ *  configurations, urgency, soft check-in) so 2-hour cadence doesn't
+ *  feel robotic. Index wraps around so attempt #7 = #1 again. */
 function buildFollowupMessage(customerName: string, project: string | undefined, idx: number): string {
   const name = (customerName || "").trim() || "Sir/Ma'am";
   const proj = project || "ASBL";
-  // 3 distinct follow-ups so we don't sound robotic
   const messages = [
+    // 1: Brochure / pricing offer
     `Hi ${name}, just following up on my earlier message about ${proj}. ` +
     `Would you like me to share the brochure / pricing, or shall I help you schedule a quick site visit?`,
-    `${name}, sharing one more time — ${proj} has limited inventory left in the popular configurations. ` +
+    // 2: Inventory urgency
+    `${name}, sharing one more time — ${proj} me popular configurations me limited inventory hai. ` +
     `Are you available for a 10-minute call or a site visit this weekend?`,
-    `Hi ${name}, this will be my final check-in. ${proj} ki current offers limited time ke liye hain. ` +
-    `If you're still considering, just reply and I'll send you the details and book a slot.`,
+    // 3: Final-tone gentle
+    `Hi ${name}, just one more check-in. ${proj} ki current options aapke budget aur preference ke hisaab se discuss kar sakte hain. ` +
+    `Reply karein, main details share kar dungi.`,
+    // 4: Configuration-focused
+    `${name}, kya aapko ${proj} me kisi specific configuration / size ya floor me interest hai? ` +
+    `Bata dijiye, main matching options + pricing share karti hu.`,
+    // 5: Site visit nudge
+    `Hi ${name}, ${proj} me ek quick site visit consider karenge? Even 30 minutes me poora project samajh aa jata hai. ` +
+    `Apka koi preferred day batayenge?`,
+    // 6: Soft re-engage
+    `${name}, ek choti si update — ${proj} ke kuch new amenities + payment options confirm hue hain. ` +
+    `Interested ho to reply karein, main share karti hu.`,
   ];
-  return messages[Math.min(idx - 1, messages.length - 1)];
+  return messages[(idx - 1) % messages.length];
+}
+
+/** GHOST RE-ENGAGEMENT — customer ne pehle reply kiya tha but ab silent
+ *  ho gaya hai. Context-aware: acknowledges the prior conversation
+ *  instead of generic cold-pitch. Rotating bank of 4 messages. */
+export function buildReengagementMessage(
+  customerName: string,
+  project: string | undefined,
+  hoursSinceLastReply: number,
+  idx: number,
+): string {
+  const name = (customerName || "").trim() || "Sir/Ma'am";
+  const proj = project || "ASBL";
+  const messages = [
+    `Hi ${name}, hamari pichli baat ${proj} ke baare me chal rahi thi — koi update share karu? ` +
+    `Pricing, inventory, ya site visit slot — jo bhi chahiye, bata dijiye.`,
+
+    `${name}, hope you're doing well. Pichli conversation ke baad agar koi specific question rah gaya ho ${proj} ke baare me, ` +
+    `feel free to ask. Main 5 min me reply kar sakti hu.`,
+
+    `Hi ${name}, ek quick check-in — ${proj} pe abhi tak final decision liya kya? ` +
+    `Agar koi confusion ya specific detail chahiye to message kar dijiye, main turant respond karungi.`,
+
+    `${name}, hamare pichle chat ke baad ek update — ${proj} me kuch fresh inventory aur payment options confirm hue hain. ` +
+    `Ek 5-min call ya site visit lagaun?`,
+  ];
+  return messages[(idx - 1) % messages.length];
 }
 
 // Re-export key state-machine helpers so callers can import everything
