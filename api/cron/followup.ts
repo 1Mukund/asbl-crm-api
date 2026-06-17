@@ -546,6 +546,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ── Unique-lead flag sync (every hour) ────────────────────────────────────
+  // Walks all Zoho leads, picks the most-recently-modified per phone, and
+  // PATCHes Is_Unique_Lead=true on that one + false on its siblings. Drives
+  // the "Unique Leads" Custom View in Zoho. Idempotent — only PATCHes records
+  // whose computed value differs from the current Zoho value, so steady-state
+  // runs are nearly free.
+  if (req.query.task === "mark-unique-leads") {
+    try {
+      const { syncUniqueLeadFlags } = await import("../_utils/unique_leads");
+      const result = await syncUniqueLeadFlags();
+      await logCronRun("mark-unique-leads", result.ms, result, null);
+      return res.status(200).json({ task: "mark-unique-leads", ...result });
+    } catch (err: any) {
+      console.error("[Mark Unique Leads Cron] Fatal:", err.message);
+      await logCronRun("mark-unique-leads", 0, {}, err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // Default = legacy 10-day daily follow-up sequence — DISABLED 2026-06-09.
   // Reason: messages are all hardcoded for "ASBL Loft current offer" copy
   // which is outdated (offer ended) AND would fire for BROADWAY/SPECTRA/
@@ -553,7 +572,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // (3 attempts max, 24h gated, project-aware) supersedes this loop.
   // Schedule entry removed from vercel.json; this early-return ensures
   // any manual hits also no-op cleanly.
-  if (req.query.task !== "prd-cadence" && req.query.task !== "meta-backfill") {
+  if (req.query.task !== "prd-cadence" && req.query.task !== "meta-backfill" && req.query.task !== "mark-unique-leads") {
     return res.status(200).json({
       task: "legacy-followup",
       disabled: true,

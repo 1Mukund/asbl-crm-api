@@ -1180,6 +1180,30 @@ ${SHARED_STYLE}
 
   ${fetchError ? `<div class="card full" style="border-color:#d33;color:#a00"><strong>Zoho fetch error:</strong> ${esc(fetchError)}</div>` : ""}
 
+  <div class="card full" style="border-color:#7aaad6">
+    <h2 style="margin-top:0">⚙️ Sync to Zoho (so you can filter in Zoho directly)</h2>
+    <div class="card-help">
+      Yeh page existing leads ko dedupe karke yahaan dikhata hai. <strong>Zoho ke andar
+      hi filter karna ho</strong> to yeh 3 step ek baar karo:
+      <ol style="margin:8px 0 8px 18px">
+        <li>Click <strong>Step 1 — Create field</strong> below. Yeh <code>Is_Unique_Lead</code> (boolean)
+            field Zoho ke Leads module pe banayega.</li>
+        <li>Click <strong>Step 2 — Sync flags</strong>. Yeh saare leads pe flag set karega
+            (most-recently-modified per phone = true, baaki = false). Hourly cron isko
+            auto-refresh karta rahega.</li>
+        <li>Zoho UI me jao → <em>Leads → All Leads dropdown → Create View</em>. Naam do
+            "Unique Leads". Filter criterion: <strong>Is Unique Lead = true</strong>. Save.
+            Wahaan se yeh hamesha ek-click filter ban jayega.</li>
+      </ol>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+      <button type="button" id="step1-btn" class="btn-primary" onclick="ulStep1()">Step 1 — Create field</button>
+      <button type="button" id="step2-btn" class="btn-primary" onclick="ulStep2()">Step 2 — Sync flags now</button>
+      <span id="ul-status" style="color:#555;font-size:13px"></span>
+    </div>
+    <pre id="ul-result" style="display:none;background:#f3f5f8;padding:10px;border-radius:6px;margin-top:10px;font-size:12px;max-height:200px;overflow:auto;white-space:pre-wrap"></pre>
+  </div>
+
   <div class="card full">
     <div style="margin-bottom:14px">
       <span class="stat"><strong>${totalRecords.toLocaleString("en-IN")}</strong> Records pulled</span>
@@ -1236,6 +1260,39 @@ function uniqFilter() {
 function uniqClearProjects() {
   document.querySelectorAll('.proj-filter-chip input').forEach(function(c) { c.checked = false; });
   uniqFilter();
+}
+async function ulCall(action, btn, label) {
+  var prev = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = label;
+  document.getElementById('ul-status').textContent = 'Running…';
+  try {
+    // Field create endpoint is GET-only on the dashboard, sync is GET-OK too.
+    var r = await fetch('/api/chat-history?action=' + action, { method: 'GET', credentials: 'include' });
+    var txt = await r.text();
+    var j; try { j = JSON.parse(txt); } catch (e) { j = { raw: txt }; }
+    var pre = document.getElementById('ul-result');
+    pre.style.display = 'block';
+    pre.textContent = JSON.stringify(j, null, 2);
+    document.getElementById('ul-status').textContent = r.ok ? '✓ Done — see response below' : ('✗ HTTP ' + r.status);
+    if (action === 'mark-unique-leads' && r.ok) {
+      // After sync, reload the page so the table reflects fresh state.
+      setTimeout(function() { location.reload(); }, 1500);
+    }
+  } catch (e) {
+    document.getElementById('ul-status').textContent = '✗ ' + e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prev;
+  }
+}
+function ulStep1() {
+  if (!confirm('Create the Is_Unique_Lead boolean field on the Zoho Leads module? (Safe: idempotent — already-exists is a no-op.)')) return;
+  ulCall('zoho-create-unique-lead-field', document.getElementById('step1-btn'), 'Creating…');
+}
+function ulStep2() {
+  if (!confirm('Sync Is_Unique_Lead flags on all Zoho leads now? (Up to ~30s for 5000 leads. Idempotent — only PATCHes records where the value differs.)')) return;
+  ulCall('mark-unique-leads', document.getElementById('step2-btn'), 'Syncing…');
 }
 uniqFilter();
 </script>
@@ -1489,6 +1546,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "save-prompt", "reset-prompt", "save-facts", "delete-doc", "toggle-bot",
       "refresh-inventory", "set-pdf-extracts", "upload-sign", "upload-finalize",
       "upload-kb", "upload-doc", "approve-user", "reject-user",
+      "mark-unique-leads", "zoho-create-unique-lead-field",
     ]);
     const ADMIN_ONLY = new Set(["audit", "users", "approve-user", "reject-user"]);
 
@@ -1599,6 +1657,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).send(html);
     } catch (err: any) {
       return res.status(500).send(`<pre>Unique-Leads error: ${err.message}</pre>`);
+    }
+  }
+
+  // mark-unique-leads — full sweep that sets Is_Unique_Lead=true on the
+  // most-recently-modified record per phone and false on the rest. Driven
+  // both by manual admin trigger (this endpoint) and the hourly cron task
+  // (/api/cron/followup?task=mark-unique-leads). Idempotent.
+  //
+  // GET  ?action=mark-unique-leads&secret=<INHOUSE_POSTHOOK_SECRET>     (dashboard button via JS fetch)
+  // POST ?action=mark-unique-leads&secret=<INHOUSE_POSTHOOK_SECRET>     (same body)
+  if ((req.method === "GET" || req.method === "POST") && req.query.action === "mark-unique-leads") {
+    // Auth via session (dashboard) OR shared secret (curl / cron).
+    const session = (req as any)._session;
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    const authedBySecret = !!expectedSecret && incomingSecret === expectedSecret;
+    if (!session && !authedBySecret) {
+      return res.status(401).json({ error: "Unauthorized — log in OR pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    try {
+      const { syncUniqueLeadFlags } = await import("./_utils/unique_leads");
+      const r = await syncUniqueLeadFlags();
+      return res.status(200).json({ ok: true, ...r });
+    } catch (err: any) {
+      return res.status(500).json({ ok: false, error: err.message });
     }
   }
 
@@ -3746,6 +3829,57 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   //   Creates Resubmission_Count / Resubmission_History / Last_Resubmission_At /
   //   Last_Resubmission_Source so the resubmission tracking system can stamp
   //   leads on every form re-fill. Idempotent — skips fields that exist.
+  // zoho-create-unique-lead-field — standalone (session-or-secret auth) so the
+  // dashboard "Step 1" button can call it via cookie. Idempotent: skips if
+  // Is_Unique_Lead already exists.
+  if (req.method === "GET" && req.query.action === "zoho-create-unique-lead-field") {
+    const session = (req as any)._session;
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    const authedBySecret = !!expectedSecret && incomingSecret === expectedSecret;
+    if (!session && !authedBySecret) {
+      return res.status(401).json({ error: "Unauthorized — log in OR pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+      const fr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+        headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      });
+      if (!fr.ok) {
+        return res.status(fr.status).json({ error: "field-list failed", body: (await fr.text()).slice(0, 500) });
+      }
+      const fj = await fr.json() as any;
+      const allFields = (fj?.fields || []) as any[];
+      const hasIt = allFields.some((f: any) => f.api_name === "Is_Unique_Lead");
+      if (hasIt) {
+        return res.status(200).json({
+          status: "already_exists",
+          existing: allFields
+            .filter((f: any) => f.api_name === "Is_Unique_Lead")
+            .map((f: any) => ({ api_name: f.api_name, field_label: f.field_label, data_type: f.data_type, custom_field: f.custom_field })),
+          next_step: "Run Step 2 (Sync flags) to populate Is_Unique_Lead, then create the Zoho Custom View: Leads → All Leads dropdown → Create View → name 'Unique Leads' → criterion Is Unique Lead = true → Save.",
+        });
+      }
+      const cr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+        method: "POST",
+        headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ fields: [{ field_label: "Is Unique Lead", data_type: "boolean" }] }),
+      });
+      return res.status(cr.status).json({
+        attempted: true,
+        http_status: cr.status,
+        response: await cr.json().catch(() => ({})),
+        next_step: cr.ok
+          ? "Field created. Now run Step 2 (Sync flags), then create the Zoho Custom View 'Unique Leads' (criterion: Is Unique Lead = true)."
+          : "Field create failed. If 401/403, add the field manually: Setup → Customization → Modules → Leads → Fields → + New Field → Checkbox → name 'Is Unique Lead'.",
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   if (req.method === "GET" && (req.query.action === "zoho-fields" || req.query.action === "zoho-create-inhouse-field" || req.query.action === "zoho-create-recording-field" || req.query.action === "zoho-create-resubmission-fields")) {
     const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
     const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
