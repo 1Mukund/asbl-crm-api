@@ -601,6 +601,7 @@ ${SHARED_STYLE}
   <div class="brand"><a href="?view=dashboard">ASBL CRM</a></div>
   <nav>
     <a href="?view=dashboard">Dashboard</a>
+    <a href="?view=unique-leads">Unique Leads</a>
     <a href="?view=edit-prompt">Bot Prompt</a>
     <a href="?view=users">Users</a>
     <a href="?view=audit">Audit Log</a>
@@ -1007,6 +1008,240 @@ _fileInput.addEventListener('change', async (e) => {
 </body></html>`;
 }
 
+// ── Unique-Leads view ─────────────────────────────────────────────────────
+//
+// Same person can exist as multiple Zoho lead records — one per project
+// they enquired about. This page dedupes by phone (Mobile) and shows the
+// most-recently-modified record per phone, plus chips for every project
+// that phone appears in.
+//
+// Cap at 5000 leads (25 × 200) to stay inside Vercel's serverless time
+// budget. Sort=Modified_Time desc so the latest activity is always
+// covered; the tail that gets dropped is long-dormant only.
+async function fetchRecentLeadsForDedup(maxRecords = 5000): Promise<any[]> {
+  const { getAccessToken } = await import("./_utils/zoho");
+  const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+  const token = await getAccessToken();
+  const fields = [
+    "id", "First_Name", "Last_Name", "Mobile", "Email",
+    "ASBL_Project", "Lead_Status", "Lead_Source",
+    "PRD_Stage", "PRD_Status", "PRD_Last_Action_Time",
+    "Created_Time", "Modified_Time",
+    "Master_Lead_ID", "Project_Lead_ID",
+  ].join(",");
+
+  const out: any[] = [];
+  const perPage = 200;
+  let page = 1;
+  while (out.length < maxRecords) {
+    const r = await fetch(
+      `${ZOHO_API_BASE}/Leads?fields=${fields}&per_page=${perPage}&page=${page}&sort_by=Modified_Time&sort_order=desc`,
+      { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
+    );
+    if (r.status === 204) break;
+    if (!r.ok) {
+      const text = await r.text();
+      throw new Error(`Zoho list page ${page} failed: ${r.status} ${text.slice(0, 200)}`);
+    }
+    const j = await r.json() as any;
+    const arr: any[] = j?.data || [];
+    if (!arr.length) break;
+    out.push(...arr);
+    if (!j?.info?.more_records) break;
+    page++;
+  }
+  return out.slice(0, maxRecords);
+}
+
+async function renderUniqueLeadsPage(): Promise<string> {
+  let leads: any[] = [];
+  let fetchError = "";
+  try {
+    leads = await fetchRecentLeadsForDedup(5000);
+  } catch (err: any) {
+    fetchError = err.message;
+  }
+
+  // Group by normalized phone (digits only) so +91-, +91 with-spaces, etc.
+  // collapse together.
+  const byPhone = new Map<string, any[]>();
+  let withoutPhone = 0;
+  for (const l of leads) {
+    const phone = String(l.Mobile || "").replace(/\D/g, "");
+    if (!phone) { withoutPhone++; continue; }
+    let arr = byPhone.get(phone);
+    if (!arr) { arr = []; byPhone.set(phone, arr); }
+    arr.push(l);
+  }
+
+  type UniqRow = {
+    phone: string; canonical: any; name: string; email: string;
+    projects: string[]; duplicateCount: number;
+    lastModifiedMs: number; lastModifiedStr: string;
+  };
+  const rows: UniqRow[] = [];
+  byPhone.forEach((arr, phone) => {
+    arr.sort((a, b) =>
+      new Date(b.Modified_Time || 0).getTime() - new Date(a.Modified_Time || 0).getTime()
+    );
+    const canonical = arr[0];
+    const projects = Array.from(new Set(
+      arr.map(x => String(x.ASBL_Project || "").trim()).filter(Boolean),
+    ));
+    const last = canonical.Modified_Time || canonical.Created_Time || null;
+    rows.push({
+      phone,
+      canonical,
+      name: [canonical.First_Name, canonical.Last_Name].filter(Boolean).join(" ").trim() || "—",
+      email: String(canonical.Email || "").trim(),
+      projects,
+      duplicateCount: arr.length,
+      lastModifiedMs: last ? new Date(last).getTime() : 0,
+      lastModifiedStr: last ? new Date(last).toLocaleString("en-IN") : "—",
+    });
+  });
+  rows.sort((a, b) => b.lastModifiedMs - a.lastModifiedMs);
+
+  const allProjects = Array.from(new Set(rows.flatMap(r => r.projects))).sort();
+  const totalRecords = leads.length;
+  const uniquePhones = rows.length;
+  const duplicatePhones = rows.filter(r => r.duplicateCount > 1).length;
+  const totalDuplicateRecords = rows
+    .filter(r => r.duplicateCount > 1)
+    .reduce((s, r) => s + r.duplicateCount, 0);
+
+  const ZOHO_BASE = "https://crm.zoho.in";
+  const projectChip = (p: string) =>
+    `<span class="proj-chip">${esc(p)}</span>`;
+
+  const tableRows = rows.map(r => {
+    const dupBadge = r.duplicateCount > 1
+      ? `<span class="dup-badge">${r.duplicateCount}×</span>`
+      : "";
+    const stage = String(r.canonical.PRD_Stage || "").trim() || "—";
+    const status = String(r.canonical.PRD_Status || "").trim() || "—";
+    const leadStatus = String(r.canonical.Lead_Status || "").trim() || "—";
+    const canonicalLink = `${ZOHO_BASE}/crm/tab/Leads/${esc(r.canonical.id)}`;
+    const projChips = r.projects.map(projectChip).join(" ");
+    const projectsLower = r.projects.map(p => p.toLowerCase()).join("|");
+    const hayBlob = `${r.phone} ${r.name.toLowerCase()} ${r.email.toLowerCase()} ${projectsLower}`;
+    return `<tr class="uniq-row"
+      data-hay="${esc(hayBlob)}"
+      data-projects="${esc(projectsLower)}"
+      data-dup="${r.duplicateCount > 1 ? "1" : "0"}">
+      <td><code>${esc(r.phone)}</code></td>
+      <td>${esc(r.name)} ${dupBadge}</td>
+      <td>${esc(r.email || "—")}</td>
+      <td>${projChips || "—"}</td>
+      <td><strong>${esc(stage)}</strong> · ${esc(status)}<br><span style="color:#888;font-size:12px">${esc(leadStatus)}</span></td>
+      <td style="white-space:nowrap">${esc(r.lastModifiedStr)}<br><span style="color:#888;font-size:12px">${esc(timeAgo(r.canonical.Modified_Time || r.canonical.Created_Time))}</span></td>
+      <td><a href="${canonicalLink}" target="_blank" rel="noopener" class="btn-mini">Open ↗</a></td>
+    </tr>`;
+  }).join("");
+
+  const projectFilterChips = allProjects.map(p =>
+    `<label class="proj-filter-chip"><input type="checkbox" value="${esc(p.toLowerCase())}" onchange="uniqFilter()"/> ${esc(p)}</label>`,
+  ).join(" ");
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Unique Leads — ASBL CRM</title>
+<link rel="preconnect" href="https://rsms.me/">
+<link rel="stylesheet" href="https://rsms.me/inter/inter.css">
+${SHARED_STYLE}
+<style>
+.proj-chip{display:inline-block;padding:2px 8px;border-radius:10px;background:#e8edf3;color:#222;font-size:12px;margin:2px 2px 2px 0;border:1px solid #cdd5dd}
+.dup-badge{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:10px;background:#ffd8d8;color:#a00;font-size:11px;font-weight:600}
+.proj-filter-chip{display:inline-flex;align-items:center;gap:4px;padding:4px 10px;border-radius:14px;background:#f3f5f8;border:1px solid #d6dce3;cursor:pointer;font-size:13px;margin:3px}
+.proj-filter-chip input{margin:0}
+.stat{display:inline-block;padding:8px 12px;border-radius:8px;background:#f3f5f8;margin-right:8px;font-size:14px}
+.stat strong{display:block;font-size:18px}
+</style>
+</head><body>
+<header class="topbar">
+  <div class="brand"><a href="?view=dashboard">ASBL CRM</a></div>
+  <nav>
+    <a href="?view=dashboard">Dashboard</a>
+    <a href="?view=unique-leads" style="color:var(--primary);font-weight:600">Unique Leads</a>
+    <a href="?view=edit-prompt">Bot Prompt</a>
+    <a href="?view=users">Users</a>
+    <a href="?view=audit">Audit Log</a>
+    <a href="?action=logout">Logout</a>
+  </nav>
+  <div class="meta">Loaded: ${new Date().toLocaleString("en-IN")} · <a href="javascript:location.reload()" style="color:var(--primary)">↻ refresh</a></div>
+</header>
+<main class="container">
+  <h1 class="page-title">Unique Leads (deduplicated by phone)</h1>
+  <p class="page-sub">
+    Same person can exist as multiple Zoho lead records — one per project they enquired about.
+    This view picks the <strong>most recently modified</strong> record per phone and chips every
+    project that phone appears in.
+    ${withoutPhone > 0 ? `<em>${withoutPhone} record${withoutPhone === 1 ? "" : "s"} skipped — no phone.</em>` : ""}
+  </p>
+
+  ${fetchError ? `<div class="card full" style="border-color:#d33;color:#a00"><strong>Zoho fetch error:</strong> ${esc(fetchError)}</div>` : ""}
+
+  <div class="card full">
+    <div style="margin-bottom:14px">
+      <span class="stat"><strong>${totalRecords.toLocaleString("en-IN")}</strong> Records pulled</span>
+      <span class="stat"><strong>${uniquePhones.toLocaleString("en-IN")}</strong> Unique phones</span>
+      <span class="stat"><strong>${duplicatePhones.toLocaleString("en-IN")}</strong> With duplicates</span>
+      <span class="stat"><strong>${totalDuplicateRecords.toLocaleString("en-IN")}</strong> Duplicate records (combined)</span>
+    </div>
+
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+      <input type="text" id="uniq-search" placeholder="🔍 search phone / name / email / project" oninput="uniqFilter()" style="flex:1;min-width:280px;padding:8px;border:1px solid var(--border,#ccc);border-radius:6px" />
+      <label style="display:inline-flex;align-items:center;gap:6px;padding:6px 12px;background:#fff5e6;border:1px solid #f0c36d;border-radius:6px;cursor:pointer">
+        <input type="checkbox" id="uniq-dup-only" onchange="uniqFilter()"/> Show only phones with duplicates
+      </label>
+      <span id="uniq-count" style="color:#888;font-size:13px"></span>
+    </div>
+
+    <div style="margin-bottom:14px">
+      <strong style="font-size:13px;color:#555">Filter by project:</strong>
+      ${projectFilterChips || `<span style="color:#888;font-size:13px">No projects found</span>`}
+      <button type="button" class="btn-mini" onclick="uniqClearProjects()" style="margin-left:8px">Clear</button>
+    </div>
+
+    ${rows.length === 0
+      ? `<div class="empty">No leads found.</div>`
+      : `<table id="uniq-table">
+          <tr><th>Phone</th><th>Name</th><th>Email</th><th>Projects</th><th>Latest Stage / Status</th><th>Last modified</th><th></th></tr>
+          ${tableRows}
+        </table>`}
+  </div>
+</main>
+
+<script>
+function uniqFilter() {
+  var q = (document.getElementById('uniq-search').value || '').toLowerCase().trim();
+  var dupOnly = document.getElementById('uniq-dup-only').checked;
+  var checked = Array.prototype.filter.call(
+    document.querySelectorAll('.proj-filter-chip input'),
+    function(c) { return c.checked; }
+  ).map(function(c) { return c.value; });
+  var rows = document.querySelectorAll('#uniq-table tr.uniq-row');
+  var shown = 0;
+  rows.forEach(function(r) {
+    var hay = r.getAttribute('data-hay');
+    var projs = r.getAttribute('data-projects');
+    var matchQ = !q || hay.indexOf(q) !== -1;
+    var matchDup = !dupOnly || r.getAttribute('data-dup') === '1';
+    var matchProj = checked.length === 0 || checked.some(function(p) { return projs.indexOf(p) !== -1; });
+    var show = matchQ && matchDup && matchProj;
+    r.style.display = show ? '' : 'none';
+    if (show) shown++;
+  });
+  document.getElementById('uniq-count').textContent = shown + ' shown';
+}
+function uniqClearProjects() {
+  document.querySelectorAll('.proj-filter-chip input').forEach(function(c) { c.checked = false; });
+  uniqFilter();
+}
+uniqFilter();
+</script>
+</body></html>`;
+}
+
 // ── Render edit-offer-details form ────────────────────────────────────────
 async function renderEditForm(project: string, message: string = ""): Promise<string> {
   const facts = await getProjectFacts(project);
@@ -1249,7 +1484,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const session = auth.getSessionFromCookies(req.headers.cookie as string | undefined);
 
     // Views + actions that make up the dashboard UI surface (session-gated)
-    const DASHBOARD_VIEWS = new Set(["dashboard", "edit-prompt", "edit-facts", "audit", "users"]);
+    const DASHBOARD_VIEWS = new Set(["dashboard", "edit-prompt", "edit-facts", "audit", "users", "unique-leads"]);
     const DASHBOARD_ACTIONS = new Set([
       "save-prompt", "reset-prompt", "save-facts", "delete-doc", "toggle-bot",
       "refresh-inventory", "set-pdf-extracts", "upload-sign", "upload-finalize",
@@ -1349,6 +1584,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).send(html);
     } catch (err: any) {
       return res.status(500).send(`<pre>Dashboard error: ${err.message}</pre>`);
+    }
+  }
+
+  // Unique-Leads view (HTML) — dedupes Zoho leads by phone, shows one
+  // canonical row per phone with chips for every project that phone
+  // appears in. Useful when sales wants to see one human even though we
+  // have N project records for that human.
+  if (req.method === "GET" && req.query.view === "unique-leads") {
+    try {
+      const html = await renderUniqueLeadsPage();
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).send(html);
+    } catch (err: any) {
+      return res.status(500).send(`<pre>Unique-Leads error: ${err.message}</pre>`);
     }
   }
 
