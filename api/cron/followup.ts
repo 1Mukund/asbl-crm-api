@@ -411,9 +411,9 @@ async function runPrdCadenceProcessor(): Promise<{
         //                       posthook hasn't arrived yet. Posthook will
         //                       write the next Next_Call_At when it lands.
         //
-        //    Old SS_Call_Attempt_Count gate (3 calls × 4h, no TZ awareness)
-        //    is fully replaced. ssCallExhausted / SS_CALL_INTERVAL_MS no
-        //    longer drive anything; the call schedule is in Next_Call_At.
+        //    PRD v1 SS-call tree (3 attempts × 4h, no TZ awareness) was
+        //    fully removed 2026-06-18; the call schedule lives entirely in
+        //    Next_Call_At now.
         {
           const nextCallAtMs = lead.Next_Call_At ? new Date(lead.Next_Call_At).getTime() : 0;
           if (nextCallAtMs > 0 && nextCallAtMs <= now) {

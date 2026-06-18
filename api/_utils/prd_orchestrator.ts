@@ -25,12 +25,9 @@ import {
 } from "./prd_state_machine";
 import {
   CFG,
-  bothChannelsExhausted,
   chatbotExhausted,
-  ssCallExhausted,
   incrementChatbotAttempt,
   incrementChatbotFollowup,
-  incrementSsCallAttempt,
 } from "./prd_cadence";
 
 const PERISKOPE_API_KEY = process.env.PERISKOPE_API_KEY || "";
@@ -110,15 +107,12 @@ async function fireChatbotMessage(phone: string, message: string, project?: stri
 /** Fire an outbound AI call via our self-deployed relay → in-house voice-bot
  *  (Plivo for +91 India, Telnyx for everything else; voice-bot picks).
  *
- *  No calling-hours gate on our side anymore — per 2026-06-04 product call,
- *  every new lead gets an immediate AI call regardless of time-of-day.
- *  The earlier 9-22 IST gate was tied to the old voice.asbl.in bot's 403
- *  behaviour; the new angad-bot dials anytime. (`isWithinCallingHours`
- *  helper still exists in prd_cadence for any future caller that wants
- *  the check explicitly.) */
-/** Public alias for the PRD-v2 cron — same fn, exported so cron can call
- *  fireAiCall directly without going through handleSsCallTick (which is
- *  unused under v2.0 since the state machine lives in the posthook). */
+ *  No calling-hours gate on our side. T=0 calls fire immediately; follow-up
+ *  calls are scheduled by call_scheduling.ts using the customer's timezone
+ *  (8 AM-9 PM customer-local for pickup follow-up, 7 AM-9 PM customer-local
+ *  for the not-picked aggressive retry tree). */
+/** Public alias for the cron — call_scheduling.ts decides WHEN to fire;
+ *  this just dispatches. */
 export async function fireAiCallDirect(opts: {
   zoho_lead_id: string;
   phone: string;
@@ -225,11 +219,10 @@ export async function handleLeadCreated(input: OnLeadCreatedInput): Promise<{
     }),
   ]);
 
-  // 3. Bump counters (per channel)
+  // 3. Bump chatbot counter. Voice-call attempts under PRD v2.0 are
+  //    tracked entirely in the posthook (Consecutive_Missed_Count +
+  //    Aggressive_Tree_Start_At), so no SS-side counter to bump here.
   await incrementChatbotAttempt(input.zoho_lead_id, input.lead || {});
-  if (ai_call.ok) {
-    await incrementSsCallAttempt(input.zoho_lead_id, input.lead || {});
-  }
 
   console.log(
     `[PRD Orch] T=0 fanout for lead ${input.zoho_lead_id} — ` +
@@ -283,12 +276,7 @@ export async function handleChatbotReply(opts: {
 /** Chatbot no-reply window expired → SF, schedule follow-up. */
 export async function handleChatbotNoReplyTimer(opts: { zoho_lead_id: string; lead: any }): Promise<void> {
   // If chatbot already exhausted, don't continue
-  if (chatbotExhausted(opts.lead)) {
-    if (bothChannelsExhausted(opts.lead)) {
-      await onSsTreeExhausted(opts.zoho_lead_id, opts.lead);
-    }
-    return;
-  }
+  if (chatbotExhausted(opts.lead)) return;
   await onChatbotNoReply(opts.zoho_lead_id, opts.lead);
   // The follow-up message will be dispatched by the cron processor
   // (Phase 7 wiring) — we just transitioned status here.
@@ -304,12 +292,7 @@ export async function handleChatbotFollowupTick(opts: {
   customer_name: string;
   project?: string;
 }): Promise<void> {
-  if (chatbotExhausted(opts.lead)) {
-    if (bothChannelsExhausted(opts.lead)) {
-      await onSsTreeExhausted(opts.zoho_lead_id, opts.lead);
-    }
-    return;
-  }
+  if (chatbotExhausted(opts.lead)) return;
   const followupIdx = (opts.lead.Chatbot_Follow_up_Count ?? 0) + 1;
   const msg = buildFollowupMessage(opts.customer_name, opts.project, followupIdx);
   const r = await fireChatbotMessage(opts.phone, msg, opts.project);
@@ -331,12 +314,7 @@ export async function handleChatbotReengagementTick(opts: {
   project?: string;
   hours_since_last_reply: number;
 }): Promise<void> {
-  if (chatbotExhausted(opts.lead)) {
-    if (bothChannelsExhausted(opts.lead)) {
-      await onSsTreeExhausted(opts.zoho_lead_id, opts.lead);
-    }
-    return;
-  }
+  if (chatbotExhausted(opts.lead)) return;
   const followupIdx = (opts.lead.Chatbot_Follow_up_Count ?? 0) + 1;
   const msg = buildReengagementMessage(
     opts.customer_name,
@@ -347,31 +325,6 @@ export async function handleChatbotReengagementTick(opts: {
   const r = await fireChatbotMessage(opts.phone, msg, opts.project);
   if (r.ok) {
     await incrementChatbotFollowup(opts.zoho_lead_id, opts.lead);
-  }
-}
-
-/** SS call tree tick fires → place next call + increment. */
-export async function handleSsCallTick(opts: {
-  zoho_lead_id: string;
-  lead: any;
-  phone: string;
-  customer_name: string;
-  project?: string;
-}): Promise<void> {
-  if (ssCallExhausted(opts.lead)) {
-    if (bothChannelsExhausted(opts.lead)) {
-      await onSsTreeExhausted(opts.zoho_lead_id, opts.lead);
-    }
-    return;
-  }
-  const r = await fireAiCall({
-    zoho_lead_id: opts.zoho_lead_id,
-    phone: opts.phone,
-    customer_name: opts.customer_name,
-    project: opts.project,
-  });
-  if (r.ok) {
-    await incrementSsCallAttempt(opts.zoho_lead_id, opts.lead);
   }
 }
 
