@@ -1753,6 +1753,83 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         new Date(b.Modified_Time || 0).getTime() - new Date(a.Modified_Time || 0).getTime(),
       );
 
+      // ── Fetch ACCURATE status-change time per lead ─────────────────────
+      // Modified_Time is useless for this report — cron jobs (mark-unique-leads,
+      // prd-cadence) touch every lead daily, so every Modified_Time is "today".
+      // The real "kab mark hua" lives in Zoho's modification_history API.
+      // We walk the history newest-first and look for the latest entry where
+      // Lead_Status OR PRD_Stage flipped to one of our target keywords.
+      //
+      // 1 API call per matched lead → cap at 400 leads and run batches of
+      // 5 in parallel to stay under Vercel's 60s budget. Leads outside the
+      // cap fall back to Modified_Time (flagged with "~" in the CSV).
+      const MAX_DETAIL = 400;
+      const BATCH_SIZE = 5;
+      const detailScope = out.slice(0, MAX_DETAIL);
+      const droppedFromDetail = Math.max(0, out.length - MAX_DETAIL);
+      const actualChangeTimes = new Map<string, string>();
+      let historyApiOk = true; // toggles false if endpoint 4xx-es on first probe
+
+      const fetchStatusChangeTime = async (leadId: string): Promise<string | null> => {
+        try {
+          const r = await fetch(
+            `${ZOHO_API_BASE}/Leads/${leadId}/_modification_history?per_page=200`,
+            { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
+          );
+          if (r.status === 401 || r.status === 403 || r.status === 404) {
+            historyApiOk = false;
+            return null;
+          }
+          if (r.status === 204 || !r.ok) return null;
+          const j = await r.json() as any;
+          const entries = (j?.data || []) as any[];
+          // Walk newest-first; first hit on Lead_Status or Stage wins.
+          for (const entry of entries) {
+            const fields = (entry?.field_history || entry?.fields_changed || []) as any[];
+            for (const f of fields) {
+              const apiName = f?.api_name || f?.field || "";
+              if (apiName === "Lead_Status" || apiName === "Stage" || apiName === "PRD_Stage") {
+                const t = entry?.modified_time || entry?.time || entry?.changed_at;
+                if (t) return t;
+              }
+            }
+          }
+          return null;
+        } catch {
+          return null;
+        }
+      };
+
+      for (let i = 0; i < detailScope.length; i += BATCH_SIZE) {
+        const batch = detailScope.slice(i, i + BATCH_SIZE);
+        const results = await Promise.allSettled(
+          batch.map(async (l) => ({ id: l.id, t: await fetchStatusChangeTime(l.id) })),
+        );
+        for (const r of results) {
+          if (r.status === "fulfilled" && r.value.t) {
+            actualChangeTimes.set(r.value.id, r.value.t);
+          }
+        }
+        // Early-exit if first batch hit auth — endpoint not available on plan
+        if (!historyApiOk && i === 0) break;
+      }
+
+      // Re-filter detailScope by ACCURATE time against the lookback window.
+      // Leads where we got a real change time: keep only if within window.
+      // Leads where we have no real change time: keep with fallback flag.
+      const enriched = detailScope
+        .map((l) => {
+          const actual = actualChangeTimes.get(l.id) || null;
+          const ts = actual || l.Modified_Time || null;
+          const tsMs = ts ? new Date(ts).getTime() : 0;
+          return { lead: l, actual, ts, tsMs };
+        })
+        .filter((e) => {
+          if (e.actual) return e.tsMs >= cutoffMs;
+          return true; // keep without real change time — flagged in row
+        })
+        .sort((a, b) => b.tsMs - a.tsMs);
+
       // ── Build rows ────────────────────────────────────────────────────
       const ZOHO_BASE = "https://crm.zoho.in";
       const fmtIstDate = (iso: string | null) => {
@@ -1771,12 +1848,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return { date: dateFmt, time: timeFmt };
       };
 
-      const rows = out.map((l) => {
-        const mod = fmtIstDate(l.Modified_Time) as any;
+      const rows = enriched.map((e) => {
+        const l = e.lead;
+        const mod = fmtIstDate(e.ts) as any;
         const name = [l.First_Name, l.Last_Name].filter(Boolean).join(" ").trim() || "—";
         const sv = fmtIstDate(l.Site_Visit_Date) as any;
+        const dateSuffix = e.actual ? "" : " (approx)";
         return {
-          "Marked Date (IST)": mod?.date || "",
+          "Marked Date (IST)": (mod?.date || "") + dateSuffix,
           "Marked Time (IST)": mod?.time || "",
           "Lead Name": name,
           "Phone": String(l.Mobile || ""),
@@ -1837,8 +1916,15 @@ ${SHARED_STYLE}
 <main class="container">
   <h1 class="page-title">Pre Site / Virtual Tour / Post Site marks (last ${daysBack} days)</h1>
   <p class="page-sub">
-    ${rows.length} leads matched. <a href="${downloadHref}" class="btn-primary" style="text-decoration:none;display:inline-block;padding:6px 14px;border-radius:6px">⬇ Download CSV</a>
-    <span style="color:#888;font-size:13px;margin-left:14px">Caveat: "Marked Date" = Zoho Modified_Time. Accurate for recent marks; may drift if a lead got edited after status change.</span>
+    ${rows.length} leads shown. <a href="${downloadHref}" class="btn-primary" style="text-decoration:none;display:inline-block;padding:6px 14px;border-radius:6px">⬇ Download CSV</a>
+    <span style="color:#888;font-size:13px;margin-left:14px">
+      Marked Date = actual Lead_Status / Stage change time from Zoho's
+      modification history. Rows tagged "<em>(approx)</em>" fell back to
+      Modified_Time because we couldn't get the precise change time
+      (history beyond ${MAX_DETAIL} leads OR history-API unavailable).
+      ${droppedFromDetail > 0 ? `<br>Note: ${droppedFromDetail} match${droppedFromDetail === 1 ? "" : "es"} beyond the ${MAX_DETAIL}-lead detail cap were dropped — bump &days=N down to a tighter window if you need them.` : ""}
+      ${!historyApiOk ? `<br><strong style="color:#a00">⚠ Modification-history API returned 401/403/404 — falling back to Modified_Time for all rows. Likely a Zoho plan / scope issue.</strong>` : ""}
+    </span>
   </p>
   ${rows.length ? sections : `<div class="empty">No leads matched in the last ${daysBack} days.</div>`}
 </main></body></html>`;
