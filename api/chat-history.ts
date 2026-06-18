@@ -1548,6 +1548,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "upload-kb", "upload-doc", "approve-user", "reject-user",
       "mark-unique-leads", "zoho-create-unique-lead-field",
       "zoho-create-call-scheduling-fields",
+      "site-visit-leads-csv",
     ]);
     const ADMIN_ONLY = new Set(["audit", "users", "approve-user", "reject-user"]);
 
@@ -1658,6 +1659,223 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).send(html);
     } catch (err: any) {
       return res.status(500).send(`<pre>Unique-Leads error: ${err.message}</pre>`);
+    }
+  }
+
+  // site-visit-leads-csv — CSV download of every lead currently marked as
+  // Pre Site / Virtual Tour / Post Site / Site Visit Done. Approximates
+  // "konse din mark kia" using Modified_Time (caveat: any modification
+  // after the status change shifts Modified_Time forward — accurate for
+  // recent marks, drifts for old leads that got resubmitted/edited).
+  //
+  // GET /api/chat-history?action=site-visit-leads-csv             (90 days lookback)
+  // GET /api/chat-history?action=site-visit-leads-csv&days=30     (custom range)
+  // GET /api/chat-history?action=site-visit-leads-csv&format=html (browser preview)
+  if (req.method === "GET" && req.query.action === "site-visit-leads-csv") {
+    const session = (req as any)._session;
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    const authedBySecret = !!expectedSecret && incomingSecret === expectedSecret;
+    if (!session && !authedBySecret) {
+      return res.status(401).json({ error: "Unauthorized — log in OR pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+
+      const daysBack = Math.max(1, Math.min(365, Number(req.query.days) || 90));
+      const cutoffMs = Date.now() - daysBack * 24 * 60 * 60 * 1000;
+
+      // Status values that count as "Pre Site / Virtual Tour / Post Site".
+      // Match case-insensitively against Lead_Status AND PRD_Stage so a
+      // lead in either column gets caught.
+      const TARGET_KEYWORDS = [
+        "pre site",
+        "pre site visit",
+        "virtual tour",
+        "post site",
+        "site visit done",
+        "site visited",
+        "site visit booked",
+      ];
+      const matches = (s: any): string => {
+        const v = String(s || "").trim().toLowerCase();
+        return TARGET_KEYWORDS.find((k) => v.includes(k)) || "";
+      };
+
+      const fields = [
+        "id", "First_Name", "Last_Name", "Mobile", "Email",
+        "ASBL_Project", "Lead_Status", "Lead_Source",
+        "PRD_Stage", "PRD_Status", "PRD_Last_Action_Time", "PRD_Last_Action",
+        "Site_Visit_Date",
+        "Created_Time", "Modified_Time",
+        "Master_Lead_ID", "Project_Lead_ID",
+      ].join(",");
+
+      // Paginate Zoho (sort Modified_Time desc so we hit the recent ones
+      // first; stop when we cross cutoff).
+      const out: any[] = [];
+      const perPage = 200;
+      const MAX_PAGES = 25;
+      for (let page = 1; page <= MAX_PAGES; page++) {
+        const r = await fetch(
+          `${ZOHO_API_BASE}/Leads?fields=${fields}&per_page=${perPage}&page=${page}&sort_by=Modified_Time&sort_order=desc`,
+          { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
+        );
+        if (r.status === 204) break;
+        if (!r.ok) {
+          const text = (await r.text()).slice(0, 200);
+          return res.status(r.status).json({ error: "zoho-list failed", page, body: text });
+        }
+        const j = await r.json() as any;
+        const arr: any[] = j?.data || [];
+        if (!arr.length) break;
+        // Check if oldest in this page is past cutoff — stop pagination
+        const oldestMs = arr.reduce((acc, l) => {
+          const t = new Date(l.Modified_Time || 0).getTime();
+          return Math.min(acc, t);
+        }, Date.now());
+        for (const l of arr) {
+          const matched = matches(l.Lead_Status) || matches(l.PRD_Stage);
+          if (!matched) continue;
+          const modMs = new Date(l.Modified_Time || 0).getTime();
+          if (modMs < cutoffMs) continue;
+          out.push({ ...l, _matched_keyword: matched });
+        }
+        if (!j?.info?.more_records) break;
+        if (oldestMs < cutoffMs) break; // no point pulling older pages
+      }
+
+      // Sort matched results: newest Modified_Time first.
+      out.sort((a, b) =>
+        new Date(b.Modified_Time || 0).getTime() - new Date(a.Modified_Time || 0).getTime(),
+      );
+
+      // ── Build rows ────────────────────────────────────────────────────
+      const ZOHO_BASE = "https://crm.zoho.in";
+      const fmtIstDate = (iso: string | null) => {
+        if (!iso) return "";
+        const d = new Date(iso);
+        if (isNaN(d.getTime())) return "";
+        // Use Intl to get IST date + time
+        const dateFmt = new Intl.DateTimeFormat("en-CA", {
+          timeZone: "Asia/Kolkata",
+          year: "numeric", month: "2-digit", day: "2-digit",
+        }).format(d);
+        const timeFmt = new Intl.DateTimeFormat("en-GB", {
+          timeZone: "Asia/Kolkata",
+          hour: "2-digit", minute: "2-digit", hour12: false,
+        }).format(d);
+        return { date: dateFmt, time: timeFmt };
+      };
+
+      const rows = out.map((l) => {
+        const mod = fmtIstDate(l.Modified_Time) as any;
+        const name = [l.First_Name, l.Last_Name].filter(Boolean).join(" ").trim() || "—";
+        const sv = fmtIstDate(l.Site_Visit_Date) as any;
+        return {
+          "Marked Date (IST)": mod?.date || "",
+          "Marked Time (IST)": mod?.time || "",
+          "Lead Name": name,
+          "Phone": String(l.Mobile || ""),
+          "Email": String(l.Email || ""),
+          "Project": String(l.ASBL_Project || ""),
+          "Lead Status": String(l.Lead_Status || ""),
+          "PRD Stage": String(l.PRD_Stage || ""),
+          "PRD Status": String(l.PRD_Status || ""),
+          "Site Visit Date": sv?.date || "",
+          "Last Action": String(l.PRD_Last_Action || ""),
+          "Lead Source": String(l.Lead_Source || ""),
+          "Zoho URL": `${ZOHO_BASE}/crm/tab/Leads/${l.id}`,
+        };
+      });
+
+      const wantHtml = String(req.query.format || "").toLowerCase() === "html";
+      const todayIst = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Kolkata",
+        year: "numeric", month: "2-digit", day: "2-digit",
+      }).format(new Date());
+
+      if (wantHtml) {
+        // Browser preview — table grouped by date
+        const byDate = new Map<string, any[]>();
+        for (const r of rows) {
+          const k = r["Marked Date (IST)"] || "(unknown)";
+          let arr = byDate.get(k);
+          if (!arr) { arr = []; byDate.set(k, arr); }
+          arr.push(r);
+        }
+        const sortedDates = Array.from(byDate.keys()).sort().reverse();
+        const sections = sortedDates.map((dk) => {
+          const arr = byDate.get(dk)!;
+          const trs = arr.map((r) => `<tr>
+            <td>${esc(r["Marked Time (IST)"])}</td>
+            <td>${esc(r["Lead Name"])}</td>
+            <td><code>${esc(r["Phone"])}</code></td>
+            <td>${esc(r["Project"])}</td>
+            <td><strong>${esc(r["Lead Status"])}</strong></td>
+            <td>${esc(r["PRD Stage"])} / ${esc(r["PRD Status"])}</td>
+            <td>${esc(r["Site Visit Date"])}</td>
+            <td><a href="${r["Zoho URL"]}" target="_blank" rel="noopener">Open ↗</a></td>
+          </tr>`).join("");
+          return `<h2 style="margin-top:24px">${esc(dk)} <span style="color:#888;font-weight:normal;font-size:14px">(${arr.length} marked)</span></h2>
+            <table>
+              <tr><th>Time</th><th>Name</th><th>Phone</th><th>Project</th><th>Lead Status</th><th>PRD</th><th>Site Visit Date</th><th></th></tr>
+              ${trs}
+            </table>`;
+        }).join("");
+        const downloadHref = `?action=site-visit-leads-csv&days=${daysBack}`;
+        const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Pre Site / Virtual Tour / Post Site Leads</title>
+${SHARED_STYLE}
+</head><body>
+<header class="topbar">
+  <div class="brand"><a href="?view=dashboard">ASBL CRM</a></div>
+  <nav><a href="?view=dashboard">← Dashboard</a></nav>
+</header>
+<main class="container">
+  <h1 class="page-title">Pre Site / Virtual Tour / Post Site marks (last ${daysBack} days)</h1>
+  <p class="page-sub">
+    ${rows.length} leads matched. <a href="${downloadHref}" class="btn-primary" style="text-decoration:none;display:inline-block;padding:6px 14px;border-radius:6px">⬇ Download CSV</a>
+    <span style="color:#888;font-size:13px;margin-left:14px">Caveat: "Marked Date" = Zoho Modified_Time. Accurate for recent marks; may drift if a lead got edited after status change.</span>
+  </p>
+  ${rows.length ? sections : `<div class="empty">No leads matched in the last ${daysBack} days.</div>`}
+</main></body></html>`;
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.setHeader("Cache-Control", "no-store");
+        return res.status(200).send(html);
+      }
+
+      // ── CSV mode ───────────────────────────────────────────────────────
+      const cols = [
+        "Marked Date (IST)", "Marked Time (IST)", "Lead Name", "Phone", "Email",
+        "Project", "Lead Status", "PRD Stage", "PRD Status",
+        "Site Visit Date", "Last Action", "Lead Source", "Zoho URL",
+      ];
+      const csvEscape = (v: any): string => {
+        const s = String(v ?? "");
+        if (s.includes(",") || s.includes("\"") || s.includes("\n")) {
+          return `"${s.replace(/"/g, '""')}"`;
+        }
+        return s;
+      };
+      const headerLine = cols.map(csvEscape).join(",");
+      const bodyLines = rows.map((r) =>
+        cols.map((c) => csvEscape((r as any)[c])).join(","),
+      );
+      const csv = [headerLine, ...bodyLines].join("\n");
+
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="site-visit-leads-${todayIst}-${daysBack}d.csv"`,
+      );
+      res.setHeader("Cache-Control", "no-store");
+      // Excel sniffs the BOM for UTF-8 detection
+      return res.status(200).send("﻿" + csv);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
     }
   }
 
