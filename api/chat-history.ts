@@ -1547,6 +1547,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "refresh-inventory", "set-pdf-extracts", "upload-sign", "upload-finalize",
       "upload-kb", "upload-doc", "approve-user", "reject-user",
       "mark-unique-leads", "zoho-create-unique-lead-field",
+      "zoho-create-call-scheduling-fields",
     ]);
     const ADMIN_ONLY = new Set(["audit", "users", "approve-user", "reject-user"]);
 
@@ -3829,6 +3830,80 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   //   Creates Resubmission_Count / Resubmission_History / Last_Resubmission_At /
   //   Last_Resubmission_Source so the resubmission tracking system can stamp
   //   leads on every form re-fill. Idempotent — skips fields that exist.
+  // zoho-create-call-scheduling-fields — adds the 3 custom fields the
+  // PRD v2.0 calling state machine writes:
+  //   Next_Call_At              (datetime)  — when cron should fire next
+  //   Consecutive_Missed_Count  (integer)   — miss streak since last pickup
+  //   Aggressive_Tree_Start_At  (datetime)  — when 3-day retry tree began
+  // Idempotent: any field that already exists is skipped.
+  if (req.method === "GET" && req.query.action === "zoho-create-call-scheduling-fields") {
+    const session = (req as any)._session;
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    const authedBySecret = !!expectedSecret && incomingSecret === expectedSecret;
+    if (!session && !authedBySecret) {
+      return res.status(401).json({ error: "Unauthorized — log in OR pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+      const fr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+        headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      });
+      if (!fr.ok) {
+        return res.status(fr.status).json({ error: "field-list failed", body: (await fr.text()).slice(0, 500) });
+      }
+      const fj = await fr.json() as any;
+      const allFields = (fj?.fields || []) as any[];
+      const existingApis = new Set(allFields.map((f: any) => f.api_name));
+
+      const desired: Array<{ api: string; spec: Record<string, any> }> = [
+        { api: "Next_Call_At",             spec: { field_label: "Next Call At",             data_type: "datetime" } },
+        { api: "Consecutive_Missed_Count", spec: { field_label: "Consecutive Missed Count", data_type: "integer" } },
+        { api: "Aggressive_Tree_Start_At", spec: { field_label: "Aggressive Tree Start At", data_type: "datetime" } },
+      ];
+      const toCreate = desired.filter((d) => !existingApis.has(d.api));
+      const skipped = desired.filter((d) => existingApis.has(d.api)).map((d) => d.api);
+
+      if (!toCreate.length) {
+        return res.status(200).json({
+          status: "all_already_exist",
+          existing: skipped,
+          next_step: "Fields ready. The posthook will populate them on every call completion. No further setup required.",
+        });
+      }
+
+      const results: any[] = [];
+      for (const d of toCreate) {
+        const cr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+          method: "POST",
+          headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ fields: [d.spec] }),
+        });
+        const j = await cr.json().catch(() => ({}));
+        results.push({ api_name: d.api, http_status: cr.status, response: j });
+      }
+      const created = results
+        .filter((r) => r.http_status >= 200 && r.http_status < 300)
+        .map((r) => r.api_name);
+      const failedAuth = results.some((r) => r.http_status === 401 || r.http_status === 403);
+      return res.status(200).json({
+        status: "attempted",
+        created,
+        skipped,
+        results,
+        next_step: created.length
+          ? "Fields created. The posthook will populate them on every call completion from now."
+          : failedAuth
+          ? "Zoho refresh token likely lacks ZohoCRM.settings.fields.CREATE scope. Add the 3 fields manually: Setup → Customization → Modules → Leads → Fields → + New Field → DateTime (for Next_Call_At & Aggressive_Tree_Start_At) / Integer (for Consecutive_Missed_Count)."
+          : "Create attempt completed but no field was added — check `results` for details.",
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // zoho-create-unique-lead-field — standalone (session-or-secret auth) so the
   // dashboard "Step 1" button can call it via cookie. Idempotent: skips if
   // Is_Unique_Lead already exists.

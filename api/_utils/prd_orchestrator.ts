@@ -116,6 +116,18 @@ async function fireChatbotMessage(phone: string, message: string, project?: stri
  *  behaviour; the new angad-bot dials anytime. (`isWithinCallingHours`
  *  helper still exists in prd_cadence for any future caller that wants
  *  the check explicitly.) */
+/** Public alias for the PRD-v2 cron — same fn, exported so cron can call
+ *  fireAiCall directly without going through handleSsCallTick (which is
+ *  unused under v2.0 since the state machine lives in the posthook). */
+export async function fireAiCallDirect(opts: {
+  zoho_lead_id: string;
+  phone: string;
+  customer_name: string;
+  project?: string;
+}): Promise<{ ok: boolean; error?: string; response?: any }> {
+  return fireAiCall(opts);
+}
+
 async function fireAiCall(opts: {
   zoho_lead_id: string;
   phone: string;

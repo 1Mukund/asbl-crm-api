@@ -240,12 +240,70 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const leadName = [lead.First_Name, lead.Last_Name].filter(Boolean).join(" ") || "Unknown";
     const callStatus = deriveCallStatus(rawSlug, durationSecs);
 
-    // ── 2. Update lead-level fields (latest call status + accumulate duration) ──
+    // ── 2. Update lead-level fields (latest call status + accumulate duration
+    //      + the next-call schedule decided by the v2 calling state machine).
+    //
+    // Calling rules (PRD v2.0 2026-06-18 product call):
+    //   PICKED:
+    //     - Customer gave a callback time → schedule that time (customer TZ).
+    //     - No time → schedule next day 8 AM-9 PM customer TZ (random slot).
+    //   NOT PICKED:
+    //     - 1st consecutive miss → retry 10 min later.
+    //     - 2nd+ miss → 3-day aggressive tree, every 3 h between 7 AM-9 PM
+    //       customer TZ. 3 days from tree-start → exhausted.
+    //
+    // We persist the entire next-action contract on the lead so the
+    // cron is a one-liner: "is Next_Call_At due and not exhausted?".
+    // Categorise the call outcome for scheduling:
+    //   STOP   — customer answered + declined ("Not Interested"). No more
+    //            calls ever (Next_Call_At cleared).
+    //   PICKUP — customer engaged (Connected/Pre Site/Virtual Tour).
+    //            Schedule via nextCallAfterPickup (customer's preferred
+    //            time, else tomorrow 8 AM-9 PM in customer's TZ).
+    //   MISS   — didn't pick up (Not Connected/Busy/Switched Off, etc.).
+    //            Schedule via nextCallAfterMiss (10-min retry → 3-day
+    //            aggressive tree, every 3 h, 7 AM-9 PM customer TZ).
+    const PICKUP_STATUSES = new Set(["Connected", "Pre Site", "Virtual Tour"]);
+    const STOP_STATUSES = new Set(["Not Interested"]);
+    const isPickup = PICKUP_STATUSES.has(callStatus);
+    const isStop = STOP_STATUSES.has(callStatus);
+
+    const phone = String(lead.Mobile || phoneRaw || "");
+    const extractedSlots = (body.extracted_slots || {}) as any;
+    const preferredCallbackTime: string | null =
+      extractedSlots.preferred_callback_time || null;
+    const { nextCallAfterPickup, nextCallAfterMiss, zohoIso: schedZohoIso } =
+      await import("../_utils/call_scheduling");
+    const schedule = isStop
+      ? {
+          nextCallAt: null,
+          phase: "EXHAUSTED" as const,
+          consecutiveMissedCount: 0,
+          aggressiveTreeStartAt: null,
+          reason: "customer declined — no further calls",
+        }
+      : isPickup
+      ? nextCallAfterPickup({ phone, preferredCallbackTime })
+      : nextCallAfterMiss({
+          phone,
+          currentConsecutiveMissed: Number(lead.Consecutive_Missed_Count ?? 0),
+          currentAggressiveTreeStartAt: lead.Aggressive_Tree_Start_At || null,
+        });
+    console.log(
+      `[InHouse Posthook] Call scheduling — phone=${phone} status=${callStatus} ` +
+      `isPickup=${isPickup} isStop=${isStop} phase=${schedule.phase} reason=${schedule.reason}`,
+    );
+
     const prevDuration = Number(lead.Total_Call_Duration_Secs ?? 0);
-    const callOutcomeFields = {
+    const callOutcomeFields: Record<string, any> = {
       Call_Status: callStatus,
       Call_Duration: durationSecs,
       Total_Call_Duration_Secs: prevDuration + durationSecs,
+      Consecutive_Missed_Count: schedule.consecutiveMissedCount,
+      Next_Call_At: schedule.nextCallAt ? schedZohoIso(schedule.nextCallAt) : null,
+      Aggressive_Tree_Start_At: schedule.aggressiveTreeStartAt
+        ? schedZohoIso(schedule.aggressiveTreeStartAt)
+        : null,
     };
     await updateLead(lead.id, callOutcomeFields);
     // Mirror to Mongo so downstream readers see the same state.

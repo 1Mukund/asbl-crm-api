@@ -192,20 +192,28 @@ async function runPrdCadenceProcessor(): Promise<{
   let exhaustionCloses = 0;
 
   try {
-    const { getAccessToken } = await import("../_utils/zoho");
+    const { getAccessToken, updateLead } = await import("../_utils/zoho");
+    const { mirrorLeadStateToMongo } = await import("../_utils/supabase");
     const {
       handleChatbotFollowupTick,
-      handleSsCallTick,
       handleChatbotNoReplyTimer,
     } = await import("../_utils/prd_orchestrator");
     const {
       CFG,
-      bothChannelsExhausted,
       chatbotExhausted,
-      ssCallExhausted,
       isWithinChatbotHours,
     } = await import("../_utils/prd_cadence");
     const { onSsTreeExhausted } = await import("../_utils/prd_state_machine");
+
+    // PRD v2.0 (2026-06-18) — voice exhaustion derived from the 3-day
+    // aggressive-tree timer. If the tree started more than 3 days ago,
+    // voice channel is done.
+    const AGGRESSIVE_TREE_MS = 3 * 24 * 60 * 60 * 1000;
+    const voiceExhausted = (lead: any): boolean => {
+      if (!lead.Aggressive_Tree_Start_At) return false;
+      const startMs = new Date(lead.Aggressive_Tree_Start_At).getTime();
+      return Number.isFinite(startMs) && (now - startMs) >= AGGRESSIVE_TREE_MS;
+    };
 
     const token = await getAccessToken();
     const now = Date.now();
@@ -223,6 +231,7 @@ async function runPrdCadenceProcessor(): Promise<{
       `PRD_Stage,PRD_Status,PRD_Last_Action_Time,PRD_Last_Action,` +
       `Chatbot_Attempt_Count,Chatbot_Follow_up_Count,SS_Call_Attempt_Count,` +
       `Total_Call_Duration_Secs,` +  // needed for 7-day silence check
+      `Next_Call_At,Consecutive_Missed_Count,Aggressive_Tree_Start_At,` +  // PRD v2.0 call gate
       `Site_Visit_Date,Last_Customer_Response,Intent_Captured,` +
       `Last_Resubmission_At`;
     const leads: any[] = [];
@@ -380,7 +389,7 @@ async function runPrdCadenceProcessor(): Promise<{
             } else if (!withinWindow) {
               // 7-day window expired. If voice channel also done, mark as
               // Not Interested via the existing exhaustion handler.
-              if (ssCallExhausted(lead)) {
+              if (voiceExhausted(lead)) {
                 await onSsTreeExhausted(lead.id, lead);
                 exhaustionCloses++;
               }
@@ -390,26 +399,43 @@ async function runPrdCadenceProcessor(): Promise<{
           }
         }
 
-        // 2. SS call tick: SS state, due for next call attempt.
-        //    SS_Call_Attempt_Count includes the T=0 call (set by
-        //    handleLeadCreated). Cap is 3 total attempts.
-        if (lead.PRD_Status === "SS" && !ssCallExhausted(lead)) {
-          if (lastActionTime > 0 && now - lastActionTime >= CFG.SS_CALL_INTERVAL_MS) {
-            await handleSsCallTick({
-              zoho_lead_id: lead.id,
-              lead,
-              phone,
-              customer_name: fullName,
-              project: lead.ASBL_Project,
-            });
-            ssCallTicks++;
+        // 2. CALL FOLLOW-UP TICK (PRD v2.0 — 2026-06-18).
+        //    State machine fully owned by the posthook:
+        //      - T=0:          handleLeadCreated fires the initial call.
+        //      - posthook:     computes the next-call schedule and writes
+        //                       Next_Call_At + Consecutive_Missed_Count +
+        //                       Aggressive_Tree_Start_At onto the lead.
+        //      - this cron:    fires the call when now >= Next_Call_At,
+        //                       then clears Next_Call_At so we don't
+        //                       re-fire within the same cron tick if the
+        //                       posthook hasn't arrived yet. Posthook will
+        //                       write the next Next_Call_At when it lands.
+        //
+        //    Old SS_Call_Attempt_Count gate (3 calls × 4h, no TZ awareness)
+        //    is fully replaced. ssCallExhausted / SS_CALL_INTERVAL_MS no
+        //    longer drive anything; the call schedule is in Next_Call_At.
+        {
+          const nextCallAtMs = lead.Next_Call_At ? new Date(lead.Next_Call_At).getTime() : 0;
+          if (nextCallAtMs > 0 && nextCallAtMs <= now) {
+            try {
+              // Clear Next_Call_At up front so we don't re-fire if the
+              // posthook is slow (same call would otherwise fire every
+              // 15 min). Posthook will set the next slot when it arrives.
+              await updateLead(lead.id, { Next_Call_At: null });
+              await mirrorLeadStateToMongo(lead.id, { Next_Call_At: null });
+              // Fire the actual call via the same relay that T=0 uses.
+              const { fireAiCallDirect } = await import("../_utils/prd_orchestrator");
+              await fireAiCallDirect({
+                zoho_lead_id: lead.id,
+                phone,
+                customer_name: fullName,
+                project: lead.ASBL_Project,
+              });
+              ssCallTicks++;
+            } catch (err: any) {
+              console.error(`[PRD cron] call fire failed for ${lead.id}: ${err.message}`);
+            }
           }
-        }
-
-        // 4. Both exhausted check (Option Y): close as User Not Responding
-        if (bothChannelsExhausted(lead)) {
-          await onSsTreeExhausted(lead.id, lead);
-          exhaustionCloses++;
         }
       } catch (err: any) {
         errors.push({ lead_id: lead.id, error: err.message });
