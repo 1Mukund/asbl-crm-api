@@ -194,10 +194,9 @@ async function runPrdCadenceProcessor(): Promise<{
   try {
     const { getAccessToken, updateLead } = await import("../_utils/zoho");
     const { mirrorLeadStateToMongo } = await import("../_utils/supabase");
-    const {
-      handleChatbotFollowupTick,
-      handleChatbotNoReplyTimer,
-    } = await import("../_utils/prd_orchestrator");
+    // PRD orchestrator's chatbot tick handlers are no longer called from
+    // the cron (chatbot follow-ups disabled 2026-06-18). The functions
+    // remain exported in prd_orchestrator.ts as dead code for fast revival.
     const {
       CFG,
       chatbotExhausted,
@@ -360,32 +359,19 @@ async function runPrdCadenceProcessor(): Promise<{
             const withinWindow = now - windowAnchor <= CFG.CHATBOT_FOLLOWUP_WINDOW_MS;
 
             if (dueByInterval && withinWindow) {
-              if (!everReplied) {
-                // COLD branch — customer has never replied. Cron-driven
-                // 2h follow-up cadence (with 9 AM-9 PM IST gate already
-                // applied above via isWithinChatbotHours).
-                await handleChatbotFollowupTick({
-                  zoho_lead_id: lead.id,
-                  lead,
-                  phone,
-                  customer_name: fullName,
-                  project: lead.ASBL_Project,
-                });
-                chatbotTicks++;
-              } else {
-                // GHOST branch DISABLED 2026-06-18: per product call,
-                // once a customer replies even ONCE, the bot stops all
-                // follow-ups for that lead — sales takes over from the
-                // first reply onwards. Reasons (from sales feedback):
-                //   - replied customers were getting bot pings days
-                //     after their human conversation ended
-                //   - those pings sometimes used a different sender
-                //     number, confusing the customer about who they
-                //     were dealing with
-                // handleChatbotReengagementTick + buildReengagementMessage
-                // helpers are preserved in prd_orchestrator.ts in case the
-                // policy reverses; just don't invoke them here.
-              }
+              // ALL CHATBOT FOLLOW-UPS DISABLED 2026-06-18 (product call).
+              //   - COLD branch (never-replied 2h cadence) — OFF
+              //   - GHOST branch (12h-silent-after-reply re-engagement) — OFF
+              // Cron no longer sends ANY outbound WhatsApp nudge. The only
+              // bot-driven WhatsApp messages are:
+              //   (a) T=0 greeting in handleLeadCreated (initial contact)
+              //   (b) Inbound bot replies via /api/relay/periskope-webhook
+              //       (Gemini handles incoming customer messages)
+              //   (c) Resubmission notifications (resubmission.ts)
+              // handleChatbotFollowupTick + handleChatbotReengagementTick +
+              // buildFollowupMessage + buildReengagementMessage all stay in
+              // prd_orchestrator.ts as dead code so revival is a one-line
+              // un-comment if/when policy reverses.
             } else if (!withinWindow) {
               // 7-day window expired. If voice channel also done, mark as
               // Not Interested via the existing exhaustion handler.
