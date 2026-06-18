@@ -87,10 +87,18 @@ function nowZohoIso(): string {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "+00:00");
 }
 
-/** Round-robin sender pick (Phase 8: Mongo _counters.sender_idx). */
-async function pickSender(): Promise<string> {
+/** Phone-sticky sender pick (Phase 8: Mongo whatsapp_sender_map).
+ *  Mirrors prd_orchestrator.pickSender — if the phone is already mapped
+ *  to a sender (initial greeting or any prior outbound), reuse it. Only
+ *  call the round-robin counter for truly new phones. Otherwise the
+ *  resubmission path silently rotates senders across multiple form-fills
+ *  by the same person and the customer sees messages from 2-3 different
+ *  numbers (bug observed 2026-06-18). */
+async function pickSender(phone: string): Promise<string> {
   try {
-    const { getNextSenderIndex } = await import("./ops_collections");
+    const { getSenderForPhone, getNextSenderIndex } = await import("./ops_collections");
+    const existing = await getSenderForPhone(phone);
+    if (existing) return existing;
     const idx = await getNextSenderIndex(SENDER_NUMBERS.length);
     return SENDER_NUMBERS[idx] || SENDER_NUMBERS[0];
   } catch {
@@ -211,7 +219,7 @@ async function fireWhatsApp(lead: NormalizedLead, count: number): Promise<void> 
     return;
   }
   const phone = lead.mobile.replace(/^\+/, "");
-  const sender = await pickSender();
+  const sender = await pickSender(phone);
   const message = buildWhatsAppMessage(lead, count);
 
   try {

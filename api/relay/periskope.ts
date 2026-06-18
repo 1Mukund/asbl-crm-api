@@ -35,14 +35,21 @@ const SENDER_NUMBERS = [
   "917995284040", // Anandita
 ];
 
-// Get next sender via atomic Mongo counter (Phase 8: was Supabase RPC).
-async function getNextSender(): Promise<string> {
+// Phone-sticky sender pick — if this phone already has a sender mapped
+// (any prior outbound from PRD orchestrator / resubmission / this endpoint),
+// reuse it so the customer always sees messages from the SAME number.
+// Only round-robin for truly new phones. Bug observed 2026-06-18: without
+// stickiness this endpoint silently rotated senders across follow-ups +
+// overwrote the map, so customers saw 2-3 different ASBL numbers.
+async function pickStickySender(phone: string): Promise<string> {
   try {
-    const { getNextSenderIndex } = await import("../_utils/ops_collections");
+    const { getSenderForPhone, getNextSenderIndex } = await import("../_utils/ops_collections");
+    const existing = await getSenderForPhone(phone);
+    if (existing) return existing;
     const idx = await getNextSenderIndex(SENDER_NUMBERS.length);
     return SENDER_NUMBERS[idx] || SENDER_NUMBERS[0];
   } catch (err) {
-    console.error("[Periskope] Sender index fetch failed, using random:", err);
+    console.error("[Periskope] Sender pick failed, using random:", err);
     return SENDER_NUMBERS[Math.floor(Math.random() * SENDER_NUMBERS.length)];
   }
 }
@@ -136,8 +143,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (!phone) return res.status(400).json({ error: "phone required" });
 
-    // 1. Get next sender (round-robin via Supabase)
-    const sender = await getNextSender();
+    // 1. Pick sender — sticky-per-phone (re-uses existing mapping if present,
+    //    falls through to round-robin only for new phones).
+    const sender = await pickStickySender(phone);
 
     console.log(`[Periskope] Generating message for ${phone} (${first_name}, ${project}) via ${sender}`);
 

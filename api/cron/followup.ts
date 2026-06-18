@@ -195,7 +195,6 @@ async function runPrdCadenceProcessor(): Promise<{
     const { getAccessToken } = await import("../_utils/zoho");
     const {
       handleChatbotFollowupTick,
-      handleChatbotReengagementTick,
       handleSsCallTick,
       handleChatbotNoReplyTimer,
     } = await import("../_utils/prd_orchestrator");
@@ -353,7 +352,9 @@ async function runPrdCadenceProcessor(): Promise<{
 
             if (dueByInterval && withinWindow) {
               if (!everReplied) {
-                // COLD branch
+                // COLD branch — customer has never replied. Cron-driven
+                // 2h follow-up cadence (with 9 AM-9 PM IST gate already
+                // applied above via isWithinChatbotHours).
                 await handleChatbotFollowupTick({
                   zoho_lead_id: lead.id,
                   lead,
@@ -363,20 +364,18 @@ async function runPrdCadenceProcessor(): Promise<{
                 });
                 chatbotTicks++;
               } else {
-                // GHOST branch — only fire if customer has actually been
-                // silent past the ghost threshold (avoid pinging in mid-chat).
-                const sinceLastInbound = now - lastInboundMs;
-                if (sinceLastInbound >= CFG.GHOST_THRESHOLD_MS) {
-                  await handleChatbotReengagementTick({
-                    zoho_lead_id: lead.id,
-                    lead,
-                    phone,
-                    customer_name: fullName,
-                    project: lead.ASBL_Project,
-                    hours_since_last_reply: sinceLastInbound / 3_600_000,
-                  });
-                  chatbotTicks++;
-                }
+                // GHOST branch DISABLED 2026-06-18: per product call,
+                // once a customer replies even ONCE, the bot stops all
+                // follow-ups for that lead — sales takes over from the
+                // first reply onwards. Reasons (from sales feedback):
+                //   - replied customers were getting bot pings days
+                //     after their human conversation ended
+                //   - those pings sometimes used a different sender
+                //     number, confusing the customer about who they
+                //     were dealing with
+                // handleChatbotReengagementTick + buildReengagementMessage
+                // helpers are preserved in prd_orchestrator.ts in case the
+                // policy reverses; just don't invoke them here.
               }
             } else if (!withinWindow) {
               // 7-day window expired. If voice channel also done, mark as
