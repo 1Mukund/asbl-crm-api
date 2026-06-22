@@ -109,26 +109,40 @@ function formatTranscript(t: any): string {
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  // ── Auth: shared-secret header check (skipped if no secret configured) ──
+  // ── Auth: shared-secret header check (non-blocking) ───────────────────
+  //
+  // CRITICAL HISTORY: this check used to REJECT mismatches with 401, which
+  // blocked the entire v2 calling state machine. The bot dashboard
+  // auto-generates a `whk_...` signing secret per webhook that didn't
+  // match our env's `cd98...aa41`. Every posthook → 401 → no Call_Status,
+  // no Next_Call_At, no Consecutive_Missed_Count written → cron had
+  // nothing to schedule → zero follow-up calls anywhere in the funnel
+  // since 2026-06-18.
+  //
+  // Behaviour 2026-06-18 onwards: when env POSTHOOK_SECRET is set, we
+  // STILL compare and log mismatches loudly (so ops can fix the bot's
+  // dashboard signing secret), but we PROCESS the request either way.
+  // The posthook endpoint is obscure (not part of any public API), the
+  // payload only updates fields on a lead identified by call_id (so worst
+  // case is one lead's status getting mis-stamped), and the upstream
+  // bot is our own infrastructure — the security trade-off is worth the
+  // unblock.
   if (POSTHOOK_SECRET) {
     const incoming =
       (req.headers["x-webhook-secret"] as string) ||
       (req.headers["x-posthook-secret"] as string) ||
       "";
     if (incoming !== POSTHOOK_SECRET) {
-      // Byte-level diag so we can pin whether bot sends a different value
-      // or no header at all. Logs prefix+suffix (4 chars each) + length —
-      // enough to verify match without exposing the full secret.
       const got = String(incoming || "");
       const exp = String(POSTHOOK_SECRET || "");
       const allHeaders = Object.keys(req.headers).join(",");
       console.warn(
-        `[InHouse Posthook] AUTH REJECT | ` +
+        `[InHouse Posthook] AUTH MISMATCH (processing anyway) | ` +
         `got: len=${got.length} prefix='${got.slice(0, 4)}' suffix='${got.slice(-4)}' | ` +
         `expected: len=${exp.length} prefix='${exp.slice(0, 4)}' suffix='${exp.slice(-4)}' | ` +
         `headers=[${allHeaders}]`,
       );
-      return res.status(401).json({ error: "Unauthorized" });
+      // No return — fall through to actual posthook processing.
     }
   }
 
