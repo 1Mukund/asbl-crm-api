@@ -103,24 +103,72 @@ async function storeSenderMapping(phone: string, sender: string): Promise<void> 
   }
 }
 
-// ── Step 2: Send via Periskope ────────────────────────────────────────────────
-async function sendViaPeriskope(phone: string, sender: string, message: string): Promise<any> {
-  const r = await fetch(PERISKOPE_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type":  "application/json",
-      "Authorization": `Bearer ${PERISKOPE_API_KEY}`,
-      "x-phone":       sender,
-    },
-    body: JSON.stringify({ chat_id: phone, message }),
-  });
+// Same dead-sender detector as prd_orchestrator. Periskope flags an offline
+// WhatsApp server as 401 + "phone server instance is switched off" + a
+// /phone/restart hint. We treat those as "this sender is dead, try the next
+// one" instead of failing the whole request.
+function isDeadSenderResponse(status: number, body: string): boolean {
+  const b = body.toLowerCase();
+  if (b.includes("phone server") && b.includes("switched off")) return true;
+  if (b.includes("/phone/restart")) return true;
+  if (b.includes("unauthorized_error")) return true;
+  if (status === 401) return true;
+  return false;
+}
 
-  const text = await r.text();
-  let data: any = {};
-  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+// ── Step 2: Send via Periskope, with pool-wide fallback on dead senders. ──
+async function sendViaPeriskopeWithFallback(
+  phone: string, startingSender: string, message: string,
+): Promise<{ data: any; sender: string }> {
+  const { markSenderDead, getDeadSenders } = await import("../_utils/ops_collections");
+  const deadSet = await getDeadSenders().catch(() => new Set<string>());
 
-  if (!r.ok) throw new Error(`Periskope error ${r.status}: ${text}`);
-  return data;
+  const ordered: string[] = [];
+  if (!deadSet.has(startingSender)) ordered.push(startingSender);
+  for (const s of SENDER_NUMBERS) {
+    if (s === startingSender) continue;
+    if (deadSet.has(s)) continue;
+    ordered.push(s);
+  }
+  // If everyone known-dead, still try the full pool — TTL might be stale.
+  if (!ordered.length) ordered.push(...SENDER_NUMBERS);
+
+  let lastErr = "";
+  let tried = 0;
+  for (const sender of ordered) {
+    tried++;
+    const r = await fetch(PERISKOPE_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "Authorization": `Bearer ${PERISKOPE_API_KEY}`,
+        "x-phone":       sender,
+      },
+      body: JSON.stringify({ chat_id: phone, message }),
+    });
+
+    const text = await r.text();
+    let data: any = {};
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+    if (r.ok) {
+      if (tried > 1) {
+        console.log(`[Periskope] Sent ${phone} via ${sender} (after ${tried - 1} dead-sender fallback${tried > 2 ? "s" : ""})`);
+      }
+      return { data, sender };
+    }
+
+    lastErr = `${r.status}:${text}`;
+    if (isDeadSenderResponse(r.status, text)) {
+      console.warn(`[Periskope] Sender ${sender} dead (${r.status}) — marking + trying next`);
+      await markSenderDead(sender).catch(() => {});
+      continue;
+    }
+    // Non-sender error (4xx on bad payload / blocked recipient / etc.)
+    throw new Error(`Periskope error ${r.status}: ${text}`);
+  }
+
+  throw new Error(`Periskope all senders exhausted (${tried} tried). Last: ${lastErr}`);
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -144,27 +192,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!phone) return res.status(400).json({ error: "phone required" });
 
     // 1. Pick sender — sticky-per-phone (re-uses existing mapping if present,
-    //    falls through to round-robin only for new phones).
-    const sender = await pickStickySender(phone);
+    //    falls through to round-robin only for new phones). The send call
+    //    will fall through to other pool members if this sender is dead.
+    const startingSender = await pickStickySender(phone);
 
-    console.log(`[Periskope] Generating message for ${phone} (${first_name}, ${project}) via ${sender}`);
+    console.log(`[Periskope] Generating message for ${phone} (${first_name}, ${project}) via ${startingSender}`);
 
     // 2. Build personalised first message
     const message = generateMessage(first_name, project, budget, size_preference);
 
     console.log(`[Periskope] Message: ${message.slice(0, 100)}...`);
 
-    // 3. Send via Periskope
-    const result = await sendViaPeriskope(phone, sender, message);
+    // 3. Send via Periskope (with dead-sender fallback)
+    const { data: result, sender: actualSender } = await sendViaPeriskopeWithFallback(
+      phone, startingSender, message,
+    );
 
-    // Store sender mapping so replies use the same number
-    await storeSenderMapping(phone, sender);
+    // Store sender mapping so replies use the SENDER THAT ACTUALLY DELIVERED,
+    // not the originally-picked one that might've been dead.
+    await storeSenderMapping(phone, actualSender);
 
-    // Save outbound message to Supabase for chat history
-    await saveMessage(phone, "outbound", message, sender);
+    // Save outbound message to Mongo for chat history
+    await saveMessage(phone, "outbound", message, actualSender);
 
-    console.log(`[Periskope] Sent to ${phone} via ${sender}`);
-    return res.status(200).json({ success: true, phone, sender, message, ...result });
+    console.log(`[Periskope] Sent to ${phone} via ${actualSender}`);
+    return res.status(200).json({ success: true, phone, sender: actualSender, message, ...result });
 
   } catch (err: any) {
     console.error("[Periskope] Error:", err.message);

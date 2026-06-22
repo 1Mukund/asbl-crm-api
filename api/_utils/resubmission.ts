@@ -213,38 +213,80 @@ async function storeSenderMapping(phone: string, sender: string): Promise<void> 
 
 // ─── Side-effect 2: WhatsApp via Periskope ──────────────────────────────────
 
+function isDeadSenderResponse(status: number, body: string): boolean {
+  const b = body.toLowerCase();
+  if (b.includes("phone server") && b.includes("switched off")) return true;
+  if (b.includes("/phone/restart")) return true;
+  if (b.includes("unauthorized_error")) return true;
+  if (status === 401) return true;
+  return false;
+}
+
 async function fireWhatsApp(lead: NormalizedLead, count: number): Promise<void> {
   if (!PERISKOPE_API_KEY) {
     console.warn("[Resubmission] PERISKOPE_API_KEY missing — skipping WhatsApp");
     return;
   }
   const phone = lead.mobile.replace(/^\+/, "");
-  const sender = await pickSender(phone);
+  const startingSender = await pickSender(phone);
   const message = buildWhatsAppMessage(lead, count);
 
-  try {
-    const r = await fetch(PERISKOPE_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${PERISKOPE_API_KEY}`,
-        "x-phone": sender,
-      },
-      body: JSON.stringify({ chat_id: phone, message }),
-    });
-    if (!r.ok) {
-      const txt = (await r.text()).slice(0, 200);
-      console.error(`[Resubmission] WhatsApp send failed (${r.status}): ${txt}`);
-      return;
-    }
-    await Promise.all([
-      saveWhatsAppMessage(phone, message, sender),
-      storeSenderMapping(phone, sender),
-    ]);
-    console.log(`[Resubmission] WhatsApp sent to ${phone} via ${sender} (count=${count})`);
-  } catch (err: any) {
-    console.error(`[Resubmission] WhatsApp throw: ${err.message}`);
+  // Build send order: sticky-picked first, then everything else in the pool,
+  // skipping recently-dead senders. Falls through pool-wide on 401 / "phone
+  // server switched off" so a single dead sender doesn't block the send.
+  const { markSenderDead, getDeadSenders } = await import("./ops_collections");
+  const deadSet = await getDeadSenders().catch(() => new Set<string>());
+  const ordered: string[] = [];
+  if (!deadSet.has(startingSender)) ordered.push(startingSender);
+  for (const s of SENDER_NUMBERS) {
+    if (s === startingSender) continue;
+    if (deadSet.has(s)) continue;
+    ordered.push(s);
   }
+  if (!ordered.length) ordered.push(...SENDER_NUMBERS);
+
+  let lastErr = "";
+  let tried = 0;
+  for (const sender of ordered) {
+    tried++;
+    try {
+      const r = await fetch(PERISKOPE_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${PERISKOPE_API_KEY}`,
+          "x-phone": sender,
+        },
+        body: JSON.stringify({ chat_id: phone, message }),
+      });
+      if (r.ok) {
+        await Promise.all([
+          saveWhatsAppMessage(phone, message, sender),
+          storeSenderMapping(phone, sender),
+        ]);
+        console.log(
+          `[Resubmission] WhatsApp sent to ${phone} via ${sender} (count=${count})` +
+          (tried > 1 ? ` after ${tried - 1} dead-sender fallback${tried > 2 ? "s" : ""}` : ""),
+        );
+        return;
+      }
+      const txt = (await r.text()).slice(0, 200);
+      lastErr = `${r.status}:${txt}`;
+      if (isDeadSenderResponse(r.status, txt)) {
+        console.warn(`[Resubmission] Sender ${sender} dead (${r.status}) — marking + trying next`);
+        await markSenderDead(sender).catch(() => {});
+        continue;
+      }
+      // Non-sender 4xx (bad recipient / blocked etc.) — won't be fixed by another sender.
+      console.error(`[Resubmission] WhatsApp send failed via ${sender} (${r.status}): ${txt}`);
+      return;
+    } catch (err: any) {
+      lastErr = err.message;
+      console.warn(`[Resubmission] Sender ${sender} threw — trying next: ${err.message}`);
+      continue;
+    }
+  }
+  console.error(`[Resubmission] WhatsApp EXHAUSTED — all ${tried} senders failed for ${phone}. Last: ${lastErr}`);
 }
 
 // ─── Side-effect 3: Outbound voice call via in-house bot ────────────────────

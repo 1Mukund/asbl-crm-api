@@ -810,6 +810,23 @@ async function sendReply(phone: string, sender: string, message: string): Promis
 
   if (!r.ok) {
     const text = await r.text();
+    // Flag dead senders so OTHER conversations / T=0 / cron don't try this
+    // sender for the next hour. We don't switch sender mid-conversation
+    // (would confuse the customer), so this reply itself still fails — but
+    // future routes will skip the dead number.
+    const lower = (text || "").toLowerCase();
+    const looksDead =
+      r.status === 401 ||
+      lower.includes("unauthorized_error") ||
+      (lower.includes("phone server") && lower.includes("switched off")) ||
+      lower.includes("/phone/restart");
+    if (looksDead) {
+      try {
+        const { markSenderDead } = await import("../_utils/ops_collections");
+        await markSenderDead(sender);
+        console.warn(`[Periskope] Inbound-reply sender ${sender} flagged dead (${r.status})`);
+      } catch {}
+    }
     throw new Error(`Periskope send error ${r.status}: ${text}`);
   }
 }

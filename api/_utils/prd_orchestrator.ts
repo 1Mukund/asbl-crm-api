@@ -65,43 +65,104 @@ async function pickSender(phone: string): Promise<string> {
 
 // ─── Action triggers ─────────────────────────────────────────────────────
 
+/** Detect a "this sender's WhatsApp phone is dead" response from Periskope.
+ *  Covers their UNAUTHORIZED_ERROR + "phone server instance is switched off"
+ *  message + generic 401/403/500 + the "/phone/restart" hint. When this hits
+ *  we don't fail the send — we mark the sender dead and fall through to the
+ *  next pool member. */
+function isDeadSenderResponse(status: number, body: string): boolean {
+  const b = body.toLowerCase();
+  if (b.includes("phone server") && b.includes("switched off")) return true;
+  if (b.includes("/phone/restart")) return true;
+  if (b.includes("unauthorized_error")) return true;
+  // 401 from Periskope on a per-x-phone send almost always means the phone
+  // is offline (not the API key — we'd see that on every request, not one).
+  if (status === 401) return true;
+  return false;
+}
+
 /** Fire a WhatsApp message via Periskope (initial or follow-up).
- *  Saves the outbound row to Supabase for chat-history visibility. */
+ *
+ *  Pool-wide fallback: if the sticky-mapped sender is dead (Periskope 401
+ *  / "phone server switched off"), iterate through the full SENDER_POOL
+ *  until one succeeds. On success, re-stick the phone to the winning
+ *  sender. Dead senders are recorded in Mongo with a 1-hour TTL so other
+ *  phones routed during this hour also skip them.
+ *
+ *  Before this fix (bug observed 2026-06-18 for lead 919951382116 / Range):
+ *  a dead sticky-sender would permanently block the lead — no greeting,
+ *  no follow-up, no callback. Customer goes silent in our funnel.
+ */
 async function fireChatbotMessage(phone: string, message: string, project?: string): Promise<{ ok: boolean; error?: string }> {
-  const sender = await pickSender(phone);
-  try {
-    const r = await fetch(PERISKOPE_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${PERISKOPE_API_KEY}`,
-        "x-phone": sender,
-      },
-      body: JSON.stringify({ chat_id: phone, message }),
-    });
-    if (!r.ok) {
-      const txt = (await r.text()).slice(0, 200);
-      console.error(`[PRD Orch] WhatsApp send failed (${r.status}): ${txt}`);
-      return { ok: false, error: txt };
-    }
-    // Save to whatsapp_messages so it shows in dashboard + LLM history
-    // (Phase 4: migrated from Supabase to Mongo.)
-    try {
-      const { insertMessage } = await import("./whatsapp_messages");
-      await insertMessage({
-        phone, direction: "outbound", message, sender,
-        project: project || null, intent: null,
-        created_at: new Date().toISOString(),
-      });
-      // Phase 8: Mongo
-      const { setSenderForPhone } = await import("./ops_collections");
-      await setSenderForPhone(phone, sender);
-    } catch {}
-    return { ok: true };
-  } catch (err: any) {
-    console.error(`[PRD Orch] WhatsApp throw: ${err.message}`);
-    return { ok: false, error: err.message };
+  // Build send order: sticky first, then everything else in pool order.
+  // Skip senders we already know are dead (within the 1h TTL).
+  const ops = await import("./ops_collections");
+  const stickySender = await ops.getSenderForPhone(phone);
+  const deadSet = await ops.getDeadSenders().catch(() => new Set<string>());
+
+  const ordered: string[] = [];
+  if (stickySender && !deadSet.has(stickySender)) ordered.push(stickySender);
+  for (const s of SENDER_POOL) {
+    if (s === stickySender) continue;
+    if (deadSet.has(s)) continue;
+    ordered.push(s);
   }
+  // If everyone known-dead, still try the full pool — TTL might be stale.
+  if (!ordered.length) ordered.push(...SENDER_POOL);
+
+  let lastErr = "";
+  let tried = 0;
+  for (const sender of ordered) {
+    tried++;
+    try {
+      const r = await fetch(PERISKOPE_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${PERISKOPE_API_KEY}`,
+          "x-phone": sender,
+        },
+        body: JSON.stringify({ chat_id: phone, message }),
+      });
+
+      if (r.ok) {
+        // Save to whatsapp_messages so it shows in dashboard + LLM history.
+        try {
+          const { insertMessage } = await import("./whatsapp_messages");
+          await insertMessage({
+            phone, direction: "outbound", message, sender,
+            project: project || null, intent: null,
+            created_at: new Date().toISOString(),
+          });
+          // Re-stick phone to the sender that actually delivered.
+          await ops.setSenderForPhone(phone, sender);
+        } catch {}
+        if (tried > 1) {
+          console.log(`[PRD Orch] WhatsApp sent to ${phone} via ${sender} (after ${tried - 1} dead-sender fallback${tried > 2 ? "s" : ""})`);
+        }
+        return { ok: true };
+      }
+
+      const txt = (await r.text()).slice(0, 200);
+      lastErr = `${r.status}:${txt}`;
+      if (isDeadSenderResponse(r.status, txt)) {
+        console.warn(`[PRD Orch] Sender ${sender} dead (${r.status}) — marking + trying next`);
+        await ops.markSenderDead(sender).catch(() => {});
+        continue;
+      }
+      // Non-sender error (4xx for bad payload, customer blocked us, etc.)
+      // — won't be fixed by trying another sender. Stop here.
+      console.error(`[PRD Orch] WhatsApp send failed via ${sender} (${r.status}): ${txt}`);
+      return { ok: false, error: txt };
+    } catch (err: any) {
+      lastErr = err.message;
+      console.warn(`[PRD Orch] Sender ${sender} threw — trying next: ${err.message}`);
+      continue;
+    }
+  }
+
+  console.error(`[PRD Orch] WhatsApp send EXHAUSTED — all ${tried} senders failed for ${phone}. Last error: ${lastErr}`);
+  return { ok: false, error: `all senders exhausted: ${lastErr}` };
 }
 
 /** Fire an outbound AI call via our self-deployed relay → in-house voice-bot

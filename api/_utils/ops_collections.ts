@@ -64,6 +64,59 @@ export async function setSenderForPhone(phone: string, sender: string): Promise<
   }
 }
 
+// ─── dead_senders ─────────────────────────────────────────────────────────
+// Senders we recently saw 401 / "phone server switched off" from. TTL 1h
+// so a flapping sender doesn't get auto-tried again every minute, but
+// also doesn't get banned forever if ops restarts it. Periskope's manual
+// /phone/restart usually fixes within minutes.
+
+const DEAD_SENDER_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+interface DeadSenderDoc {
+  _id: string;
+  dead_at: string;
+}
+
+/** Mark a sender as dead. Idempotent — refreshes the timestamp. */
+export async function markSenderDead(sender: string): Promise<void> {
+  if (!sender) return;
+  try {
+    const col = await getCollection<DeadSenderDoc>(COL.DEAD_SENDERS);
+    await col.updateOne(
+      { _id: sender as any },
+      { $set: { dead_at: new Date().toISOString() } },
+      { upsert: true },
+    );
+  } catch (err: any) {
+    console.error(`[ops] markSenderDead failed: ${err.message}`);
+  }
+}
+
+/** Set of senders dead within the last TTL window. Caller uses this to
+ *  filter the SENDER_POOL before picking. */
+export async function getDeadSenders(): Promise<Set<string>> {
+  try {
+    const col = await getCollection<DeadSenderDoc>(COL.DEAD_SENDERS);
+    const cutoffIso = new Date(Date.now() - DEAD_SENDER_TTL_MS).toISOString();
+    const docs = await col.find({ dead_at: { $gte: cutoffIso } as any }).toArray();
+    return new Set(docs.map((d) => String(d._id)));
+  } catch (err: any) {
+    console.error(`[ops] getDeadSenders failed: ${err.message}`);
+    return new Set();
+  }
+}
+
+/** Manual clear (e.g. after ops confirms /phone/restart succeeded). */
+export async function clearDeadSender(sender: string): Promise<void> {
+  if (!sender) return;
+  try {
+    const col = await getCollection<DeadSenderDoc>(COL.DEAD_SENDERS);
+    await col.deleteOne({ _id: sender as any });
+  } catch (err: any) {
+    console.error(`[ops] clearDeadSender failed: ${err.message}`);
+  }
+}
+
 // ─── Round-robin sender index (replaces Postgres get_next_sender_index) ───
 
 /** Atomic monotonic counter, modded by numSenders to pick the next index. */

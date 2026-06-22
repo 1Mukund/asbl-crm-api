@@ -48,6 +48,9 @@ export const COL = {
   PLID_REGISTRY:      "plid_registry",
   PRD_STATE:          "prd_state",
   WHATSAPP_SENDER_MAP: "whatsapp_sender_map",
+  /** Senders Periskope rejected with 401/"phone server switched off" — TTL
+   *  ~1h so we skip them for the entire pool without retrying immediately. */
+  DEAD_SENDERS:       "dead_senders",
   FOLLOW_UP_LOG:      "follow_up_log",
   CRON_LOG:           "cron_log",
   /** Internal: monotonic counters used by getNextSequence() to mimic
