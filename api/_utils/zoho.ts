@@ -61,7 +61,7 @@ export async function findLeadByArrowheadCallId(callId: string): Promise<any | n
       headers: { Authorization: `Zoho-oauthtoken ${token}` },
       params: {
         criteria: `(Last_Arrowhead_Call_ID:equals:${callId})`,
-        fields: "id,First_Name,Last_Name,Mobile,Master_Lead_ID,Project_Lead_ID,ASBL_Project,Total_Call_Duration_Secs",
+        fields: LEAD_LOOKUP_FIELDS,
       },
     });
     return res.data?.data?.[0] ?? null;
@@ -81,7 +81,7 @@ export async function findLeadByInhouseCallId(callId: string): Promise<any | nul
       headers: { Authorization: `Zoho-oauthtoken ${token}` },
       params: {
         criteria: `(Last_Inhouse_Call_ID:equals:${callId})`,
-        fields: "id,First_Name,Last_Name,Mobile,Master_Lead_ID,Project_Lead_ID,ASBL_Project,Total_Call_Duration_Secs",
+        fields: LEAD_LOOKUP_FIELDS,
       },
     });
     return res.data?.data?.[0] ?? null;
@@ -99,9 +99,17 @@ export async function findLeadByInhouseCallId(callId: string): Promise<any | nul
 // recordResubmission() to increment + prepend; if the fields don't exist yet
 // in Zoho schema, Zoho silently drops them from the response and our reader
 // defensively defaults to 0/"".
+//
+// CRITICAL: include the v2 calling state machine fields
+// (Consecutive_Missed_Count + Aggressive_Tree_Start_At). The posthook reads
+// these to decide which retry phase to schedule next; if they're missing
+// from the lookup response, every miss is treated as "first miss" and the
+// lead loops on a 10-min retry forever (= cron fires every 15 min).
+// Bug observed 2026-06-18, fixed by extending the field list.
 const LEAD_LOOKUP_FIELDS =
   "id,First_Name,Last_Name,Mobile,Master_Lead_ID,Project_Lead_ID,ASBL_Project," +
-  "Resubmission_Count,Resubmission_History,Last_Resubmission_At,Last_Resubmission_Source";
+  "Resubmission_Count,Resubmission_History,Last_Resubmission_At,Last_Resubmission_Source," +
+  "Consecutive_Missed_Count,Aggressive_Tree_Start_At,Next_Call_At,Call_Status,Total_Call_Duration_Secs";
 
 /** Direct-by-ID lookup — no search index lag. Returns the same fields
  *  as findLeadByPhone* so callers can use them interchangeably. */
