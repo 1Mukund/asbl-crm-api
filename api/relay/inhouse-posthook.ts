@@ -268,15 +268,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     //
     // We persist the entire next-action contract on the lead so the
     // cron is a one-liner: "is Next_Call_At due and not exhausted?".
-    // Categorise the call outcome for scheduling:
+    // Categorise the call outcome for scheduling (v3 — slot-based per the
+    // 2026-06-18 product note):
     //   STOP   — customer answered + declined ("Not Interested"). No more
-    //            calls ever (Next_Call_At cleared).
+    //            calls ever (Next_Call_At cleared forever).
     //   PICKUP — customer engaged (Connected/Pre Site/Virtual Tour).
-    //            Schedule via nextCallAfterPickup (customer's preferred
-    //            time, else tomorrow 8 AM-9 PM in customer's TZ).
+    //            nextCallAfterPickup → customer's preferred time if given,
+    //            else next slot in [10am, 11am, 1pm, 2pm, 4pm, 5pm, 7pm,
+    //            8pm] customer-TZ.
     //   MISS   — didn't pick up (Not Connected/Busy/Switched Off, etc.).
-    //            Schedule via nextCallAfterMiss (10-min retry → 3-day
-    //            aggressive tree, every 3 h, 7 AM-9 PM customer TZ).
+    //            nextCallAfterMiss → next slot in [9am, 10am, 11am, 1pm,
+    //            2pm, 4pm, 5pm, 7pm, 8pm] customer-TZ. Loops until pickup.
+    //            (No more miss-counter / aggressive tree / 3-day exhaustion.)
     const PICKUP_STATUSES = new Set(["Connected", "Pre Site", "Virtual Tour"]);
     const STOP_STATUSES = new Set(["Not Interested"]);
     const isPickup = PICKUP_STATUSES.has(callStatus);
@@ -291,18 +294,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const schedule = isStop
       ? {
           nextCallAt: null,
-          phase: "EXHAUSTED" as const,
-          consecutiveMissedCount: 0,
-          aggressiveTreeStartAt: null,
+          phase: "STOPPED" as const,
           reason: "customer declined — no further calls",
         }
       : isPickup
       ? nextCallAfterPickup({ phone, preferredCallbackTime })
-      : nextCallAfterMiss({
-          phone,
-          currentConsecutiveMissed: Number(lead.Consecutive_Missed_Count ?? 0),
-          currentAggressiveTreeStartAt: lead.Aggressive_Tree_Start_At || null,
-        });
+      : nextCallAfterMiss({ phone });
     console.log(
       `[InHouse Posthook] Call scheduling — phone=${phone} status=${callStatus} ` +
       `isPickup=${isPickup} isStop=${isStop} phase=${schedule.phase} reason=${schedule.reason}`,
@@ -313,11 +310,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       Call_Status: callStatus,
       Call_Duration: durationSecs,
       Total_Call_Duration_Secs: prevDuration + durationSecs,
-      Consecutive_Missed_Count: schedule.consecutiveMissedCount,
       Next_Call_At: schedule.nextCallAt ? schedZohoIso(schedule.nextCallAt) : null,
-      Aggressive_Tree_Start_At: schedule.aggressiveTreeStartAt
-        ? schedZohoIso(schedule.aggressiveTreeStartAt)
-        : null,
     };
     await updateLead(lead.id, callOutcomeFields);
     // Mirror to Mongo so downstream readers see the same state.

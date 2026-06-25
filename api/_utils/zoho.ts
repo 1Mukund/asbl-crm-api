@@ -96,20 +96,14 @@ export async function findLeadByInhouseCallId(callId: string): Promise<any | nul
 
 // Common field list — kept in one place so resubmission tracking stays in
 // sync across both lookup helpers. Resubmission_Count/History are read by
-// recordResubmission() to increment + prepend; if the fields don't exist yet
-// in Zoho schema, Zoho silently drops them from the response and our reader
-// defensively defaults to 0/"".
-//
-// CRITICAL: include the v2 calling state machine fields
-// (Consecutive_Missed_Count + Aggressive_Tree_Start_At). The posthook reads
-// these to decide which retry phase to schedule next; if they're missing
-// from the lookup response, every miss is treated as "first miss" and the
-// lead loops on a 10-min retry forever (= cron fires every 15 min).
-// Bug observed 2026-06-18, fixed by extending the field list.
+// recordResubmission(); Next_Call_At + Call_Status are read by the v3
+// posthook scheduler. Consecutive_Missed_Count + Aggressive_Tree_Start_At
+// were used by v2 (removed 2026-06-18) — fields still exist in Zoho but
+// the scheduler no longer touches them.
 const LEAD_LOOKUP_FIELDS =
   "id,First_Name,Last_Name,Mobile,Master_Lead_ID,Project_Lead_ID,ASBL_Project," +
   "Resubmission_Count,Resubmission_History,Last_Resubmission_At,Last_Resubmission_Source," +
-  "Consecutive_Missed_Count,Aggressive_Tree_Start_At,Next_Call_At,Call_Status,Total_Call_Duration_Secs";
+  "Next_Call_At,Call_Status,Total_Call_Duration_Secs";
 
 /** Direct-by-ID lookup — no search index lag. Returns the same fields
  *  as findLeadByPhone* so callers can use them interchangeably. */

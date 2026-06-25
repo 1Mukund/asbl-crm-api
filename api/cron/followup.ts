@@ -204,15 +204,12 @@ async function runPrdCadenceProcessor(): Promise<{
     } = await import("../_utils/prd_cadence");
     const { onSsTreeExhausted } = await import("../_utils/prd_state_machine");
 
-    // PRD v2.0 (2026-06-18) — voice exhaustion derived from the 3-day
-    // aggressive-tree timer. If the tree started more than 3 days ago,
-    // voice channel is done.
-    const AGGRESSIVE_TREE_MS = 3 * 24 * 60 * 60 * 1000;
-    const voiceExhausted = (lead: any): boolean => {
-      if (!lead.Aggressive_Tree_Start_At) return false;
-      const startMs = new Date(lead.Aggressive_Tree_Start_At).getTime();
-      return Number.isFinite(startMs) && (now - startMs) >= AGGRESSIVE_TREE_MS;
-    };
+    // v3 calling (2026-06-18 product note) has no time-bound voice exhaustion —
+    // calls loop on fixed slot hours until pickup OR manual stop (Lead_Status
+    // = "Not Interested" / PRD_Stage = "Spam" / Next_Call_At cleared). The
+    // chatbot 7-day window auto-close path used to use voiceExhausted(); now
+    // it's a no-op stub since chatbot follow-ups are also off.
+    const voiceExhausted = (_lead: any): boolean => false;
 
     const token = await getAccessToken();
     const now = Date.now();
@@ -228,9 +225,9 @@ async function runPrdCadenceProcessor(): Promise<{
     const FIELDS =
       `id,First_Name,Last_Name,Mobile,Phone,ASBL_Project,Created_Time,` +
       `PRD_Stage,PRD_Status,PRD_Last_Action_Time,PRD_Last_Action,` +
-      `Chatbot_Attempt_Count,Chatbot_Follow_up_Count,SS_Call_Attempt_Count,` +
+      `Chatbot_Attempt_Count,Chatbot_Follow_up_Count,` +
       `Total_Call_Duration_Secs,` +  // needed for 7-day silence check
-      `Next_Call_At,Consecutive_Missed_Count,Aggressive_Tree_Start_At,` +  // PRD v2.0 call gate
+      `Next_Call_At,` +              // v3 call gate — slot-based scheduling
       `Site_Visit_Date,Last_Customer_Response,Intent_Captured,` +
       `Last_Resubmission_At`;
     const leads: any[] = [];
