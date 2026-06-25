@@ -382,21 +382,22 @@ async function runPrdCadenceProcessor(): Promise<{
           }
         }
 
-        // 2. CALL FOLLOW-UP TICK (PRD v2.0 — 2026-06-18).
+        // 2. CALL FOLLOW-UP TICK (v3 — 2026-06-18, slot-based per product note).
         //    State machine fully owned by the posthook:
         //      - T=0:          handleLeadCreated fires the initial call.
-        //      - posthook:     computes the next-call schedule and writes
-        //                       Next_Call_At + Consecutive_Missed_Count +
-        //                       Aggressive_Tree_Start_At onto the lead.
+        //      - posthook:     computes the next-call schedule (next slot
+        //                       from the picked / not-picked hour grid in
+        //                       customer TZ, capped at 7 days from born)
+        //                       and writes Next_Call_At onto the lead.
         //      - this cron:    fires the call when now >= Next_Call_At,
         //                       then clears Next_Call_At so we don't
         //                       re-fire within the same cron tick if the
-        //                       posthook hasn't arrived yet. Posthook will
-        //                       write the next Next_Call_At when it lands.
+        //                       posthook hasn't arrived yet. Posthook
+        //                       writes the next Next_Call_At when it lands.
         //
-        //    PRD v1 SS-call tree (3 attempts × 4h, no TZ awareness) was
-        //    fully removed 2026-06-18; the call schedule lives entirely in
-        //    Next_Call_At now.
+        //    Removed (2026-06-18): v1 SS-call tree (3 × 4h), v2 retry
+        //    tree (10-min + 3h aggressive + 3-day exhaustion). v3 is just
+        //    slot hours + 7-day lifetime cap.
         {
           const nextCallAtMs = lead.Next_Call_At ? new Date(lead.Next_Call_At).getTime() : 0;
           if (nextCallAtMs > 0 && nextCallAtMs <= now) {

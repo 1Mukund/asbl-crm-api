@@ -4134,12 +4134,14 @@ ${SHARED_STYLE}
   //   Creates Resubmission_Count / Resubmission_History / Last_Resubmission_At /
   //   Last_Resubmission_Source so the resubmission tracking system can stamp
   //   leads on every form re-fill. Idempotent — skips fields that exist.
-  // zoho-create-call-scheduling-fields — adds the 3 custom fields the
-  // PRD v2.0 calling state machine writes:
-  //   Next_Call_At              (datetime)  — when cron should fire next
-  //   Consecutive_Missed_Count  (integer)   — miss streak since last pickup
-  //   Aggressive_Tree_Start_At  (datetime)  — when 3-day retry tree began
-  // Idempotent: any field that already exists is skipped.
+  // zoho-create-call-scheduling-fields — adds the Zoho field the v3 calling
+  // state machine writes:
+  //   Next_Call_At  (datetime)  — when cron should fire next call
+  //
+  // Idempotent: skipped if already exists. Used during fresh Zoho setup.
+  // (v2's Consecutive_Missed_Count + Aggressive_Tree_Start_At fields are
+  //  still present on existing leads from earlier setup; v3 doesn't read
+  //  or write them, but they're harmless legacy columns.)
   if (req.method === "GET" && req.query.action === "zoho-create-call-scheduling-fields") {
     const session = (req as any)._session;
     const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
@@ -4162,10 +4164,9 @@ ${SHARED_STYLE}
       const allFields = (fj?.fields || []) as any[];
       const existingApis = new Set(allFields.map((f: any) => f.api_name));
 
+      // v3 only needs Next_Call_At. (v2 had 3 fields; legacy 2 are no-op now.)
       const desired: Array<{ api: string; spec: Record<string, any> }> = [
-        { api: "Next_Call_At",             spec: { field_label: "Next Call At",             data_type: "datetime" } },
-        { api: "Consecutive_Missed_Count", spec: { field_label: "Consecutive Missed Count", data_type: "integer" } },
-        { api: "Aggressive_Tree_Start_At", spec: { field_label: "Aggressive Tree Start At", data_type: "datetime" } },
+        { api: "Next_Call_At", spec: { field_label: "Next Call At", data_type: "datetime" } },
       ];
       const toCreate = desired.filter((d) => !existingApis.has(d.api));
       const skipped = desired.filter((d) => existingApis.has(d.api)).map((d) => d.api);
@@ -4198,9 +4199,9 @@ ${SHARED_STYLE}
         skipped,
         results,
         next_step: created.length
-          ? "Fields created. The posthook will populate them on every call completion from now."
+          ? "Field created. Posthook will populate Next_Call_At on every call completion."
           : failedAuth
-          ? "Zoho refresh token likely lacks ZohoCRM.settings.fields.CREATE scope. Add the 3 fields manually: Setup → Customization → Modules → Leads → Fields → + New Field → DateTime (for Next_Call_At & Aggressive_Tree_Start_At) / Integer (for Consecutive_Missed_Count)."
+          ? "Zoho refresh token likely lacks ZohoCRM.settings.fields.CREATE scope. Add manually: Setup → Customization → Modules → Leads → Fields → + New Field → DateTime → name 'Next Call At'."
           : "Create attempt completed but no field was added — check `results` for details.",
       });
     } catch (err: any) {

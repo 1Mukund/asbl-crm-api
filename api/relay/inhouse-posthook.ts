@@ -291,6 +291,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       extractedSlots.preferred_callback_time || null;
     const { nextCallAfterPickup, nextCallAfterMiss, zohoIso: schedZohoIso } =
       await import("../_utils/call_scheduling");
+    const createdAt: string | null = lead.Created_Time || null;
     const schedule = isStop
       ? {
           nextCallAt: null,
@@ -298,8 +299,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           reason: "customer declined — no further calls",
         }
       : isPickup
-      ? nextCallAfterPickup({ phone, preferredCallbackTime })
-      : nextCallAfterMiss({ phone });
+      ? nextCallAfterPickup({ phone, preferredCallbackTime, createdAt })
+      : nextCallAfterMiss({ phone, createdAt });
     console.log(
       `[InHouse Posthook] Call scheduling — phone=${phone} status=${callStatus} ` +
       `isPickup=${isPickup} isStop=${isStop} phase=${schedule.phase} reason=${schedule.reason}`,

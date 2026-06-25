@@ -280,9 +280,9 @@ export async function handleLeadCreated(input: OnLeadCreatedInput): Promise<{
     }),
   ]);
 
-  // 3. Bump chatbot counter. Voice-call attempts under PRD v2.0 are
-  //    tracked entirely in the posthook (Consecutive_Missed_Count +
-  //    Aggressive_Tree_Start_At), so no SS-side counter to bump here.
+  // 3. Bump chatbot counter. Voice-call scheduling under v3 is owned
+  //    entirely by the posthook (writes Next_Call_At + Call_Status), so
+  //    no SS-side counter to bump here.
   await incrementChatbotAttempt(input.zoho_lead_id, input.lead || {});
 
   console.log(

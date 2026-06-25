@@ -1,42 +1,38 @@
 /**
  * Call-scheduling state machine (v3 — 2026-06-18, per the handwritten
- * note from product).
+ * product note).
  *
- * Simplified rules:
+ * Rules:
  *   T=0 (lead born):
  *     Trigger call immediately, no time-of-day gate.
  *
  *   PICKED branch:
- *     (a) Customer told a callback time → call at that exact time.
+ *     (a) Customer told a callback time → call at that exact time
+ *         (overrides the 7-day lifetime cap — strongest signal).
  *     (b) No time given → call at the next slot from the PICKED hour set
  *         in the customer's timezone. Slots: 10am, 11am, 1pm, 2pm,
- *         4pm, 5pm, 7pm, 8pm.
+ *         4pm, 5pm, 7pm, 8pm. Capped at 7 days from born.
  *
  *   NOT PICKED branch:
  *     Call at the next slot from the NOT_PICKED hour set in the
  *     customer's timezone. Slots: 9am, 10am, 11am, 1pm, 2pm, 4pm,
- *     5pm, 7pm, 8pm. Loops until customer picks up — no max attempts,
- *     no 3-day exhaustion. Stop conditions handled outside scheduler:
- *       - bot_enabled = false  (cron skips lead)
- *       - PRD_Stage in {Not Interested, Spam, Pre Site Visit} (cron skips)
- *       - Lead_Status = "Not Interested" (posthook clears Next_Call_At)
- *       - Sales clears Next_Call_At manually
+ *     5pm, 7pm, 8pm. Loops until customer picks up OR 7 days from
+ *     born — whichever comes first.
  *
  *   STOP:
  *     "Not Interested" call outcome → Next_Call_At = null permanently.
+ *     Lead past 7-day lifetime → Next_Call_At = null permanently.
  *
- * What changed from v2 (replaced):
- *   - Removed: 10-min retry, 3-hour aggressive tree, 3-day exhaustion,
- *     Consecutive_Missed_Count, Aggressive_Tree_Start_At usage.
- *   - Cadence is now slot-based on fixed wall-clock hours instead of
- *     interval-based.
+ *   Other stop conditions enforced outside the scheduler:
+ *     - bot_enabled = false  (cron skips lead)
+ *     - PRD_Stage in {Not Interested, Spam, Pre Site Visit} (cron skips)
+ *     - Sales clears Next_Call_At manually
  *
- * Storage on each Zoho lead:
- *   - Next_Call_At  datetime  when cron should fire next
- *   - Call_Status   text      latest call's outcome
+ * Storage on each Zoho lead (the only field the scheduler writes):
+ *   Next_Call_At  datetime  when cron should fire next
  *
- * (Consecutive_Missed_Count + Aggressive_Tree_Start_At Zoho fields
- *  still exist for backward compat but are not read or written by v3.)
+ * Legacy Zoho fields kept for back-compat (not read or written by v3):
+ *   Consecutive_Missed_Count, Aggressive_Tree_Start_At (from v2 retry tree)
  */
 
 // ─── Country code → IANA timezone (unchanged from v2) ────────────────────
@@ -159,6 +155,12 @@ const PICKED_NO_TIME_HOURS = [10, 11, 13, 14, 16, 17, 19, 20];
  *  9am, 10am, 11am, 1pm, 2pm, 4pm, 5pm, 7pm, 8pm — same as picked plus 9am. */
 const NOT_PICKED_HOURS = [9, 10, 11, 13, 14, 16, 17, 19, 20];
 
+/** Hard cap (per product 2026-06-18): stop calling 7 days after lead's
+ *  born time. Applies to picked-with-no-time and not-picked branches. A
+ *  customer-supplied callback time always wins (overrides the cap) since
+ *  it's the strongest engagement signal we have. */
+const LEAD_CALL_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;
+
 /** Find the next "from"-relative slot in the customer's local timezone.
  *  Walks today's remaining slots; if none, jumps to tomorrow's first slot.
  *  Adds a small random jitter (0-10 min) so 100 leads scheduled for "10am"
@@ -193,10 +195,24 @@ export interface NextCallSchedule {
   reason: string;
 }
 
-/** Compute next call after a PICKED call. */
+/** True when `slot` is past the 7-day call lifetime measured from the
+ *  lead's born time. Returns false if createdAt is missing/invalid (i.e.
+ *  no cap can be applied — let the call go through). */
+function isPastLifetime(slot: Date, createdAt?: string | Date | null): boolean {
+  if (!createdAt) return false;
+  const born = createdAt instanceof Date ? createdAt : new Date(createdAt);
+  if (isNaN(born.getTime())) return false;
+  const cap = born.getTime() + LEAD_CALL_LIFETIME_MS;
+  return slot.getTime() >= cap;
+}
+
+/** Compute next call after a PICKED call. Customer-specified callback time
+ *  always wins (overrides the 7-day lifetime cap — strongest engagement
+ *  signal). No-time-given falls into the slot grid + lifetime cap. */
 export function nextCallAfterPickup(opts: {
   phone: string;
   preferredCallbackTime?: string | Date | null;
+  createdAt?: string | Date | null;
   now?: Date;
 }): NextCallSchedule {
   const now = opts.now ?? new Date();
@@ -210,12 +226,19 @@ export function nextCallAfterPickup(opts: {
       return {
         nextCallAt: t,
         phase: "FOLLOWUP_AT_TIME",
-        reason: `customer-specified callback @ ${t.toISOString()} (${tz})`,
+        reason: `customer-specified callback @ ${t.toISOString()} (${tz}) — overrides 7-day cap`,
       };
     }
   }
 
   const slot = nextSlot(PICKED_NO_TIME_HOURS, now, tz);
+  if (isPastLifetime(slot, opts.createdAt)) {
+    return {
+      nextCallAt: null,
+      phase: "STOPPED",
+      reason: `picked + no time → next slot past 7-day cap from born`,
+    };
+  }
   return {
     nextCallAt: slot,
     phase: "FOLLOWUP_SLOT",
@@ -223,14 +246,23 @@ export function nextCallAfterPickup(opts: {
   };
 }
 
-/** Compute next call after a MISSED call. Loops until pickup. */
+/** Compute next call after a MISSED call. Loops on slot hours until pickup
+ *  OR until 7 days from lead's born time elapse — whichever comes first. */
 export function nextCallAfterMiss(opts: {
   phone: string;
+  createdAt?: string | Date | null;
   now?: Date;
 }): NextCallSchedule {
   const now = opts.now ?? new Date();
   const tz = lookupTimezone(opts.phone);
   const slot = nextSlot(NOT_PICKED_HOURS, now, tz);
+  if (isPastLifetime(slot, opts.createdAt)) {
+    return {
+      nextCallAt: null,
+      phase: "STOPPED",
+      reason: `not picked → next slot past 7-day cap from born`,
+    };
+  }
   return {
     nextCallAt: slot,
     phase: "MISSED_SLOT",

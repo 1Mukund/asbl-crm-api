@@ -103,7 +103,7 @@ export async function findLeadByInhouseCallId(callId: string): Promise<any | nul
 const LEAD_LOOKUP_FIELDS =
   "id,First_Name,Last_Name,Mobile,Master_Lead_ID,Project_Lead_ID,ASBL_Project," +
   "Resubmission_Count,Resubmission_History,Last_Resubmission_At,Last_Resubmission_Source," +
-  "Next_Call_At,Call_Status,Total_Call_Duration_Secs";
+  "Next_Call_At,Call_Status,Total_Call_Duration_Secs,Created_Time";
 
 /** Direct-by-ID lookup — no search index lag. Returns the same fields
  *  as findLeadByPhone* so callers can use them interchangeably. */
