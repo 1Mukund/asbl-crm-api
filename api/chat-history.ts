@@ -5614,6 +5614,13 @@ ${SHARED_STYLE}
       return res.status(400).send("Prompt is too short (must be > 200 chars).");
     }
     const result = await setBotSetting("system_prompt", prompt);
+    // Stamp the current prompt version so a dashboard edit STICKS (otherwise
+    // resolveSystemPrompt would see a stale/missing version and overwrite the
+    // edit with the hardcoded prompt on the next message).
+    try {
+      const { PROMPT_VERSION } = await import("./_utils/gemini_chat");
+      await setBotSetting("system_prompt_version", PROMPT_VERSION);
+    } catch {}
     if (!result.ok) {
       res.setHeader("Location", `?view=edit-prompt&msg=${encodeURIComponent("Save failed: " + result.error)}`);
     } else {
@@ -7246,9 +7253,10 @@ ${SHARED_STYLE}
       return res.status(401).json({ error: "Unauthorized — log in OR pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
     }
     try {
-      const { ANANDITA_SYSTEM_PROMPT } = await import("./_utils/gemini_chat");
+      const { ANANDITA_SYSTEM_PROMPT, PROMPT_VERSION } = await import("./_utils/gemini_chat");
       const { setBotSetting } = await import("./_utils/bot_settings");
       const result = await setBotSetting("system_prompt", ANANDITA_SYSTEM_PROMPT);
+      await setBotSetting("system_prompt_version", PROMPT_VERSION);
       return res.status(200).json({
         ok: result.ok,
         error: result.error,
