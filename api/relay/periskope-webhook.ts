@@ -1306,8 +1306,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const hasHistory =
       conversation.totalMessages > 0 &&
       /\byou:\s/.test(conversation.formatted || "");
-    let reply = stripReintroduction(sanitizeReply(geminiOutput.reply), hasHistory);
-    console.log(`[Periskope Webhook] Gemini reply (sanitized, history=${hasHistory}): ${reply.slice(0, 120)}`);
+    // Detect bare-greeting intent so the sanitizer's stripReintroduction
+    // doesn't murder the intentional Case B greeting line from RULE 1.
+    // Two signals: Gemini's structured intent === GREETING, OR the
+    // customer's raw message is a one-word greeting. Either is enough.
+    const isGreetingByGemini = String(geminiOutput.intent || "").toUpperCase() === "GREETING";
+    const isGreetingByRegex = /^(hi+|hello+|hey+|namaste|namaskar|hola|yo)[\s\.,!?]*$/i.test(
+      String(message || "").trim(),
+    );
+    const isGreetingIntent = isGreetingByGemini || isGreetingByRegex;
+    let reply = stripReintroduction(
+      sanitizeReply(geminiOutput.reply),
+      hasHistory,
+      isGreetingIntent,
+    );
+    console.log(`[Periskope Webhook] Gemini reply (sanitized, history=${hasHistory}, greeting=${isGreetingIntent}): ${reply.slice(0, 120)}`);
 
     // 10. Save outbound IMMEDIATELY so a fast follow-up message from the
     //     customer sees the bot's reply in CONVERSATION_HISTORY, even if

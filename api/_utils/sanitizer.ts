@@ -36,15 +36,29 @@ const BANNED_PATTERNS: Array<RegExp> = [
 
 /**
  * Strip mid-conversation re-introduction prefixes. Gemini consistently
- * starts replies with "Hi <name>, picking up on <project> —" even when
+ * starts replies with "Hi <name>, picking up on <project>" even when
  * the prompt forbids it. This post-processor removes that pattern so the
  * customer never sees the bot-y greeting on the 2nd, 3rd, Nth message.
  *
  * Pass `hasHistory = true` only when CONVERSATION_HISTORY had a prior
  * Anandita reply. On the very first turn the greeting stays.
+ *
+ * Pass `isGreetingIntent = true` when the customer's CURRENT message is
+ * itself a bare greeting ("Hi" / "Hello" / "Namaste"). In that case the
+ * re-introduction is INTENDED — RULE 1 Case B requires the bot to
+ * respond with "Hi <Name>, Anandita here. Picking up from earlier on X,
+ * want me to send Y?". We must NOT strip it. (Bug observed 2026-06-19:
+ * the sanitizer was murdering the greeting half of correct Case B
+ * responses, leaving customers with a bare "want me to block a site
+ * visit?" reply.)
  */
-export function stripReintroduction(text: string, hasHistory: boolean): string {
+export function stripReintroduction(
+  text: string,
+  hasHistory: boolean,
+  isGreetingIntent: boolean = false,
+): string {
   if (!text || !hasHistory) return text;
+  if (isGreetingIntent) return text;
   let out = text.trimStart();
 
   // Patterns Gemini emits — order matters (longest first to catch combos)
