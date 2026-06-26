@@ -1550,6 +1550,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "zoho-create-call-scheduling-fields",
       "site-visit-leads-csv",
       "sync-prompt-to-hardcoded",
+      "audit-project-docs",
     ]);
     const ADMIN_ONLY = new Set(["audit", "users", "approve-user", "reject-user"]);
 
@@ -6665,6 +6666,88 @@ ${SHARED_STYLE}
         },
         results: results.slice(0, 200),  // cap response size
         truncated_to: results.length > 200 ? 200 : null,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── audit-project-docs — admin sanity check on project_documents coverage.
+  //
+  //   Returns per-project a doc_type matrix:
+  //     for each project, how many rows of each doc_type exist + whether
+  //     multi-slot rows have size_label / tower / unit_size_sft populated.
+  //   Used after a "send all 4 towers" test fails: did Spectra actually
+  //   have 4 floor_plan rows uploaded with size_label set?
+  //
+  //   GET /api/chat-history?action=audit-project-docs&project=Spectra
+  //   GET /api/chat-history?action=audit-project-docs    (all projects)
+  if (req.method === "GET" && req.query.action === "audit-project-docs") {
+    const session = (req as any)._session;
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!session && (!expectedSecret || incomingSecret !== expectedSecret)) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    try {
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const col = await getCollection(COL.PROJECT_DOCUMENTS);
+      const projectFilter = (req.query.project as string || "").trim();
+      const query: any = {};
+      if (projectFilter) {
+        query.project = { $regex: new RegExp(`^${projectFilter}$`, "i") };
+      }
+      const rows = await col.find(query).limit(500).toArray();
+      type ByProject = {
+        project: string;
+        total: number;
+        by_doc_type: Record<string, {
+          count: number;
+          rows: Array<{ size_label: string; tower: string; facing: string; unit_size_sft: number | null; has_url: boolean; filename: string }>;
+        }>;
+        coverage: { multi_slot_with_label: number; multi_slot_missing_label: number; single_slot_count: number };
+      };
+      const byProject = new Map<string, ByProject>();
+      const MULTI_SLOT_TYPES = new Set(["unit_plan", "floor_plan", "price_sheet"]);
+      for (const r of rows as any[]) {
+        const proj = String(r.project || "(none)");
+        if (!byProject.has(proj)) {
+          byProject.set(proj, {
+            project: proj, total: 0, by_doc_type: {},
+            coverage: { multi_slot_with_label: 0, multi_slot_missing_label: 0, single_slot_count: 0 },
+          });
+        }
+        const entry = byProject.get(proj)!;
+        entry.total++;
+        const dt = String(r.doc_type || "(unknown)");
+        if (!entry.by_doc_type[dt]) entry.by_doc_type[dt] = { count: 0, rows: [] };
+        entry.by_doc_type[dt].count++;
+        entry.by_doc_type[dt].rows.push({
+          size_label: String(r.size_label || ""),
+          tower: String(r.tower || ""),
+          facing: String(r.facing || ""),
+          unit_size_sft: r.unit_size_sft ?? null,
+          has_url: !!r.url,
+          filename: String(r.filename || ""),
+        });
+        if (MULTI_SLOT_TYPES.has(dt)) {
+          const hasMeta = !!r.size_label || !!r.tower || !!r.unit_size_sft;
+          if (hasMeta) entry.coverage.multi_slot_with_label++;
+          else entry.coverage.multi_slot_missing_label++;
+        } else {
+          entry.coverage.single_slot_count++;
+        }
+      }
+      const projects = Array.from(byProject.values()).sort((a, b) =>
+        a.project.localeCompare(b.project),
+      );
+      return res.status(200).json({
+        ok: true,
+        scanned_rows: rows.length,
+        projects,
+        suggested_actions: projects
+          .filter((p) => p.coverage.multi_slot_missing_label > 0)
+          .map((p) => `${p.project}: ${p.coverage.multi_slot_missing_label} multi-slot row(s) missing size_label / tower / unit_size_sft. Bot's "send all variants" will work but each row will be untaggable in the inline list.`),
       });
     } catch (err: any) {
       return res.status(500).json({ error: err.message });
