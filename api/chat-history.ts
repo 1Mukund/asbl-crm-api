@@ -1552,6 +1552,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "sync-prompt-to-hardcoded",
       "audit-project-docs",
       "send-doc-test",
+      "export-all-kb",
     ]);
     const ADMIN_ONLY = new Set(["audit", "users", "approve-user", "reject-user"]);
 
@@ -6667,6 +6668,75 @@ ${SHARED_STYLE}
         },
         results: results.slice(0, 200),  // cap response size
         truncated_to: results.length > 200 ? 200 : null,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── export-all-kb — full handoff snapshot for migrating the bot to
+  //     another codebase / vendor. Returns kb_text + facts_text + every
+  //     project_documents row (with public Supabase URLs) for every
+  //     project we have. Pair this with scripts/export-kb-to-disk.js to
+  //     materialise the data onto local disk as a folder tree.
+  //
+  //   GET /api/chat-history?action=export-all-kb
+  //
+  //   Response (one JSON object):
+  //     {
+  //       projects: [
+  //         {
+  //           project: "SPECTRA",
+  //           kb_text: "<full curated KB text>",
+  //           facts_text: "<offer details text>",
+  //           kb_pdf_url: "<storage url if uploaded as a PDF>",
+  //           documents: [{ doc_type, size_label, tower, facing,
+  //                          unit_size_sft, filename, url, text_extract }],
+  //         },
+  //         ...
+  //       ],
+  //       generated_at: "2026-06-19T...Z",
+  //     }
+  if (req.method === "GET" && req.query.action === "export-all-kb") {
+    const session = (req as any)._session;
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!session && (!expectedSecret || incomingSecret !== expectedSecret)) {
+      return res.status(401).json({ error: "Unauthorized — log in OR pass ?secret=..." });
+    }
+    try {
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const facts = await listAllProjectFacts();
+      const docsCol = await getCollection(COL.PROJECT_DOCUMENTS);
+      const docRows = await docsCol.find({}).limit(5000).toArray();
+      const projects = facts.map((f: any) => {
+        const projDocs = (docRows as any[]).filter((r) =>
+          String(r.project || "").toUpperCase() === String(f.project || "").toUpperCase(),
+        ).map((r) => ({
+          doc_type: String(r.doc_type || ""),
+          size_label: String(r.size_label || ""),
+          tower: String(r.tower || ""),
+          facing: String(r.facing || ""),
+          unit_size_sft: r.unit_size_sft ?? null,
+          filename: String(r.filename || ""),
+          url: String(r.url || ""),
+          applies_to_all: !!r.applies_to_all,
+          text_extract: String(r.text_extract || "").slice(0, 6000),
+        }));
+        return {
+          project: f.project,
+          kb_text: String(f.kb_text || ""),
+          facts_text: String(f.facts_text || ""),
+          kb_pdf_url: String(f.kb_pdf_url || ""),
+          kb_updated_at: f.kb_updated_at || null,
+          documents: projDocs,
+        };
+      });
+      return res.status(200).json({
+        ok: true,
+        generated_at: new Date().toISOString(),
+        project_count: projects.length,
+        projects,
       });
     } catch (err: any) {
       return res.status(500).json({ error: err.message });
