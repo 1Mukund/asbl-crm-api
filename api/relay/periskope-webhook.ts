@@ -92,6 +92,39 @@ export interface IntentClassification {
 }
 
 // Regex-based fallback classifier — fast, used when LLM classifier times out
+/** Regex-extract which document type the customer is asking for. Only used
+ *  when Gemini fails — primary path is Gemini's structured docToSend slot.
+ *
+ *  Returns one of the supported doc_type slugs, OR null if no doc keyword
+ *  matched. Order matters: more specific phrases first so "price sheet"
+ *  doesn't get classified as "brochure" because "details" appeared too.
+ *
+ *  Multi-slot doc types (floor_plan, unit_plan) are returned as the bare
+ *  slug. The dispatcher will then ask for tower / size if size/facing isn't
+ *  inferable from the same message — same behaviour as the Gemini path.
+ *
+ *  Why this exists: Gemini fallback used to hardcode docToSend = null,
+ *  which meant a Gemini 503 turned every document request into a chatty
+ *  "I'll confirm with project team" message with NO actual file send.
+ *  Sales reported this as the bot promising and never delivering (QA bugs
+ *  #1 / #2 / #3 / #5 from 2026-06-18 review).
+ */
+function extractDocTypeFromMessage(message: string): string | null {
+  const m = message.toLowerCase();
+  if (/\bprice\s*sheet|cost\s*sheet|pricing\s*sheet|all\s*inclusive\s*price|price\s*list/i.test(m)) return "price_sheet";
+  if (/\bbrochure|pamphlet/i.test(m)) return "brochure";
+  if (/\bfloor\s*plan/i.test(m)) return "floor_plan";
+  if (/\bunit\s*plan/i.test(m)) return "unit_plan";
+  if (/\bmaster\s*plan|site\s*plan|layout/i.test(m)) return "master_plan";
+  if (/\bspecifications?\b|spec\s*sheet/i.test(m)) return "specifications";
+  if (/\bamenities/i.test(m)) return "amenities";
+  if (/\bpayment\s*structure|payment\s*plan|payment\s*schedule|milestone\s*plan|construction\s*linked/i.test(m)) return "payment_structure";
+  // Generic doc keywords with no specific type → default to brochure
+  // (most comprehensive single doc; sales agreed this is the right fallback).
+  if (/\b(pdf|documents?|information|info|details|paperwork|catalogue|catalog)\b/i.test(m)) return "brochure";
+  return null;
+}
+
 function regexFallbackClassify(message: string): IntentClassification {
   const m = message.toLowerCase();
   const flags: string[] = [];
@@ -1132,15 +1165,36 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       console.error(`[Periskope Webhook] Gemini failed (${err.message}) — falling back to local Anandita + regex classifier`);
       const fallbackReply = await callAnandita(phone, structuredMsg);
       const regexResult = regexFallbackClassify(message);
+      // BUG FIX 2026-06-18: previously hardcoded docToSend: null which meant
+      // every Gemini failure silently dropped document requests, leaving the
+      // bot promising "I'll send it" with no actual file fired. Now we
+      // regex-extract the doc_type from the customer's message so DOCUMENT_
+      // REQUEST intent still triggers a real send through the dispatcher.
+      // Also pull size/facing flags so multi-slot docs (floor_plan, unit_plan)
+      // get correctly disambiguated.
+      const fallbackDocType = regexResult.intent === "DOCUMENT_REQUEST"
+        ? extractDocTypeFromMessage(message)
+        : null;
+      // Crude size/facing extraction for multi-slot lookups. These mirror
+      // what Gemini would extract via its structured output.
+      const sizeMatch = message.match(/\b(\d{3,4})\s*(?:sft|sqft|sq\.\s*ft)\b/i);
+      const facingMatch = message.match(/\b(east|west|north|south)\b/i);
       geminiOutput = {
         intent: regexResult.intent,
         flags: regexResult.flags,
         project: regexResult.project,
-        docToSend: null,
-        docMeta: { unit_size_sft: null, facing: null, tower: null },
+        docToSend: fallbackDocType,
+        docMeta: {
+          unit_size_sft: sizeMatch ? Number(sizeMatch[1]) : null,
+          facing: facingMatch ? facingMatch[1].toLowerCase() : null,
+          tower: null,
+        },
         extractedFacts: {},
         reply: fallbackReply,
       };
+      if (fallbackDocType) {
+        console.log(`[Periskope Webhook] Fallback regex-extracted docToSend=${fallbackDocType} (rescued from Gemini failure)`);
+      }
     }
 
     const classification = {

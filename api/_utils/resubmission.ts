@@ -228,13 +228,16 @@ async function fireWhatsApp(lead: NormalizedLead, count: number): Promise<void> 
     return;
   }
   const phone = lead.mobile.replace(/^\+/, "");
+  // Capture prior sticky BEFORE pickSender (which would round-robin if none).
+  // This lets us tell "first send for this phone" vs "sticky existed".
+  const { markSenderDead, getDeadSenders, getSenderForPhone } = await import("./ops_collections");
+  const priorSticky = await getSenderForPhone(phone);
   const startingSender = await pickSender(phone);
   const message = buildWhatsAppMessage(lead, count);
 
   // Build send order: sticky-picked first, then everything else in the pool,
   // skipping recently-dead senders. Falls through pool-wide on 401 / "phone
   // server switched off" so a single dead sender doesn't block the send.
-  const { markSenderDead, getDeadSenders } = await import("./ops_collections");
   const deadSet = await getDeadSenders().catch(() => new Set<string>());
   const ordered: string[] = [];
   if (!deadSet.has(startingSender)) ordered.push(startingSender);
@@ -260,13 +263,21 @@ async function fireWhatsApp(lead: NormalizedLead, count: number): Promise<void> 
         body: JSON.stringify({ chat_id: phone, message }),
       });
       if (r.ok) {
-        await Promise.all([
-          saveWhatsAppMessage(phone, message, sender),
-          storeSenderMapping(phone, sender),
-        ]);
+        // Sticky update policy: only promote if no prior sticky OR we used
+        // the existing sticky. Don't replace sticky with a temporary
+        // substitute when the original is dead — customer should return
+        // to the original sender once ops restarts it.
+        const isFirstStick = !priorSticky;
+        const usedSticky = priorSticky === sender;
+        const writes: Promise<any>[] = [saveWhatsAppMessage(phone, message, sender)];
+        if (isFirstStick || usedSticky) {
+          writes.push(storeSenderMapping(phone, sender));
+        }
+        await Promise.all(writes);
         console.log(
           `[Resubmission] WhatsApp sent to ${phone} via ${sender} (count=${count})` +
-          (tried > 1 ? ` after ${tried - 1} dead-sender fallback${tried > 2 ? "s" : ""}` : ""),
+          (tried > 1 ? ` after ${tried - 1} dead-sender fallback${tried > 2 ? "s" : ""}` : "") +
+          ` sticky=${priorSticky || sender}`,
         );
         return;
       }

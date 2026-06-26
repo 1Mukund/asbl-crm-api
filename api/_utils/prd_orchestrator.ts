@@ -94,8 +94,8 @@ function isDeadSenderResponse(status: number, body: string): boolean {
  *  no follow-up, no callback. Customer goes silent in our funnel.
  */
 async function fireChatbotMessage(phone: string, message: string, project?: string): Promise<{ ok: boolean; error?: string }> {
-  // Build send order: sticky first, then everything else in pool order.
-  // Skip senders we already know are dead (within the 1h TTL).
+  // Build send order: sticky first (if alive), then everything else in pool
+  // order. Skip senders we already know are dead within the 1h TTL.
   const ops = await import("./ops_collections");
   const stickySender = await ops.getSenderForPhone(phone);
   const deadSet = await ops.getDeadSenders().catch(() => new Set<string>());
@@ -134,11 +134,22 @@ async function fireChatbotMessage(phone: string, message: string, project?: stri
             project: project || null, intent: null,
             created_at: new Date().toISOString(),
           });
-          // Re-stick phone to the sender that actually delivered.
-          await ops.setSenderForPhone(phone, sender);
+          // Sticky update policy:
+          //   - First-ever send for this phone → set sticky to whoever
+          //     delivered (could be any pool member via round-robin).
+          //   - Sticky alive + we used it → no update needed (same value).
+          //   - Sticky dead + we fell back → DO NOT promote the substitute.
+          //     Keep original sticky so when ops restarts that phone, the
+          //     customer's conversation returns to its original number
+          //     instead of being permanently split across 2 senders.
+          const isFirstStick = !stickySender;
+          const usedSticky = stickySender === sender;
+          if (isFirstStick || usedSticky) {
+            await ops.setSenderForPhone(phone, sender);
+          }
         } catch {}
         if (tried > 1) {
-          console.log(`[PRD Orch] WhatsApp sent to ${phone} via ${sender} (after ${tried - 1} dead-sender fallback${tried > 2 ? "s" : ""})`);
+          console.log(`[PRD Orch] WhatsApp sent to ${phone} via ${sender} (after ${tried - 1} dead-sender fallback${tried > 2 ? "s" : ""}; sticky preserved at ${stickySender || sender})`);
         }
         return { ok: true };
       }

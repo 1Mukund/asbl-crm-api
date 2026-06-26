@@ -208,14 +208,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       phone, startingSender, message,
     );
 
-    // Store sender mapping so replies use the SENDER THAT ACTUALLY DELIVERED,
-    // not the originally-picked one that might've been dead.
-    await storeSenderMapping(phone, actualSender);
+    // Sticky update policy: only set sticky if (a) no sticky existed yet OR
+    // (b) we used the existing sticky. Don't promote the fallback when the
+    // sticky was just temporarily dead — let the customer's conversation
+    // return to the original sender once ops restarts that phone.
+    const { getSenderForPhone } = await import("../_utils/ops_collections");
+    const priorSticky = await getSenderForPhone(phone);
+    if (!priorSticky || priorSticky === actualSender) {
+      await storeSenderMapping(phone, actualSender);
+    }
 
     // Save outbound message to Mongo for chat history
     await saveMessage(phone, "outbound", message, actualSender);
 
-    console.log(`[Periskope] Sent to ${phone} via ${actualSender}`);
+    console.log(`[Periskope] Sent to ${phone} via ${actualSender} (sticky preserved at ${priorSticky || actualSender})`);
     return res.status(200).json({ success: true, phone, sender: actualSender, message, ...result });
 
   } catch (err: any) {
