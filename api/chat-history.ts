@@ -5410,6 +5410,18 @@ ${SHARED_STYLE}
 
       // Build PROJECT_CONTEXT exactly like the webhook does
       const parts: string[] = [];
+      // Lead with the authoritative cross-project portfolio status, just like
+      // production getProjectContextText() does, so the sandbox mirrors the
+      // real bot (ready-to-move / possession answers, cross-sell).
+      try {
+        const { getPortfolioOverview } = await import("./_utils/project_facts");
+        const po = await getPortfolioOverview();
+        if (po) {
+          parts.push("## ASBL PORTFOLIO STATUS (authoritative — applies to EVERY reply)");
+          parts.push(po);
+          parts.push("");
+        }
+      } catch {}
       const facts = await getProjectFacts(project);
       if ((facts as any)?.kb_text?.trim()) {
         parts.push("## PROJECT KNOWLEDGE BASE");
