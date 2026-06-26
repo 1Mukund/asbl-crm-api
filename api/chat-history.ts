@@ -6748,24 +6748,38 @@ ${SHARED_STYLE}
         media: { type: "document", filename: "test.pdf", mimetype: "application/pdf", url },
       };
 
+      // A/B test per sender: send a PLAIN TEXT and a DOCUMENT from the same
+      // x-phone. Both return 200 "queued" from the API, but on WhatsApp the
+      // user can see which actually lands. This disambiguates:
+      //   - text lands, doc doesn't  -> media/payload problem
+      //   - neither lands            -> sender number not connected (queues
+      //                                  but never delivers)
+      //   - both land                -> everything works
+      const textPayload = { chat_id: chatId, message: `ASBL TEXT-ONLY test from sender ${"{S}"}` };
+      const ep0 = endpoints[0];
       const attempts: any[] = [];
       let delivered = false;
       for (const s of senders) {
+        const hdr = { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, "x-phone": s };
+        // 1. text-only
+        try {
+          const tr = await fetch(ep0, { method: "POST", headers: hdr, body: JSON.stringify({ ...textPayload, message: `ASBL TEXT-ONLY test from sender ${s}` }) });
+          attempts.push({ sender: s, kind: "text", endpoint: ep0, status: tr.status, ok: tr.ok, body: (await tr.text()).slice(0, 220) });
+        } catch (err: any) {
+          attempts.push({ sender: s, kind: "text", endpoint: ep0, status: 0, ok: false, body: `THREW: ${err.message}` });
+        }
+        // 2. document
         for (const ep of endpoints) {
           try {
-            const r = await fetch(ep, {
-              method: "POST",
-              headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, "x-phone": s },
-              body: JSON.stringify(payload),
-            });
-            const txt = (await r.text()).slice(0, 500);
-            attempts.push({ sender: s, endpoint: ep, status: r.status, ok: r.ok, body: txt });
+            const r = await fetch(ep, { method: "POST", headers: hdr, body: JSON.stringify(payload) });
+            const txt = (await r.text()).slice(0, 220);
+            attempts.push({ sender: s, kind: "doc", endpoint: ep, status: r.status, ok: r.ok, body: txt });
             if (r.ok) { delivered = true; break; }
           } catch (err: any) {
-            attempts.push({ sender: s, endpoint: ep, status: 0, ok: false, body: `THREW: ${err.message}` });
+            attempts.push({ sender: s, kind: "doc", endpoint: ep, status: 0, ok: false, body: `THREW: ${err.message}` });
           }
         }
-        if (delivered) break;
+        if (delivered && !body.all_senders) break;
       }
 
       return res.status(200).json({
