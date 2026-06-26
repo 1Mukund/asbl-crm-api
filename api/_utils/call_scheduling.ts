@@ -274,3 +274,20 @@ export function nextCallAfterMiss(opts: {
 export function zohoIso(d: Date): string {
   return d.toISOString().replace(/\.\d{3}Z$/, "+00:00");
 }
+
+/** True when the current moment falls within [startHour, endHour) in the
+ *  customer's local timezone (resolved from phone). Used by the WhatsApp
+ *  follow-up cron to avoid messaging customers at night.
+ *
+ *  Example: isWithinCustomerHours("+919876543210", 7, 21) returns true
+ *  when it's 7AM-9PM in Asia/Kolkata. For +971xxx → 7AM-9PM Dubai time.  */
+export function isWithinCustomerHours(
+  phone: string,
+  startHour: number,
+  endHour: number,
+  now: Date = new Date(),
+): boolean {
+  const tz = lookupTimezone(phone);
+  const p = partsInTz(now, tz);
+  return p.hour >= startHour && p.hour < endHour;
+}

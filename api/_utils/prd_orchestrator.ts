@@ -362,11 +362,12 @@ export async function handleChatbotFollowupTick(opts: {
   }
 }
 
-/** GHOST re-engagement tick fires for warm-then-silent leads (customer replied
- *  at some point but has been quiet for >= GHOST_THRESHOLD_MS).
- *  Uses the context-aware buildReengagementMessage bank instead of cold-pitch
- *  templates. Counter shared with regular chatbot follow-up to enforce the
- *  same 30-attempt safety cap. */
+/** GHOST re-engagement tick fires for warm-then-silent leads.
+ *  Customer replied at some point but has been silent for >= 25h. Message
+ *  references the customer's last reply text (lastInboundText) to feel
+ *  contextual rather than generic. Counter shared with the cold follow-up
+ *  branch to enforce the same 50-attempt safety cap.
+ */
 export async function handleChatbotReengagementTick(opts: {
   zoho_lead_id: string;
   lead: any;
@@ -374,6 +375,7 @@ export async function handleChatbotReengagementTick(opts: {
   customer_name: string;
   project?: string;
   hours_since_last_reply: number;
+  last_inbound_text?: string;
 }): Promise<void> {
   if (chatbotExhausted(opts.lead)) return;
   const followupIdx = (opts.lead.Chatbot_Follow_up_Count ?? 0) + 1;
@@ -382,6 +384,7 @@ export async function handleChatbotReengagementTick(opts: {
     opts.project,
     opts.hours_since_last_reply,
     followupIdx,
+    opts.last_inbound_text || "",
   );
   const r = await fireChatbotMessage(opts.phone, msg, opts.project);
   if (r.ok) {
@@ -458,29 +461,51 @@ function buildFollowupMessage(customerName: string, project: string | undefined,
   return messages[(idx - 1) % messages.length];
 }
 
-/** GHOST RE-ENGAGEMENT — customer ne pehle reply kiya tha but ab silent
- *  ho gaya hai. Context-aware: acknowledges the prior conversation
- *  instead of generic cold-pitch. Rotating bank of 4 messages. */
+/** GHOST RE-ENGAGEMENT — customer replied earlier but went silent for 24h+.
+ *  Context-aware: quotes a short excerpt of the customer's last message so
+ *  the re-engagement reads like a continuation, not a cold pitch. Rotating
+ *  bank of 4 messages.
+ *
+ *  lastInboundText is the customer's most recent reply text. If non-empty,
+ *  we include a trimmed quote in the message. Empty → fallback to generic
+ *  "hamari pichli baat" phrasing. */
 export function buildReengagementMessage(
   customerName: string,
   project: string | undefined,
   hoursSinceLastReply: number,
   idx: number,
+  lastInboundText: string = "",
 ): string {
   const name = (customerName || "").trim() || "Sir/Ma'am";
   const proj = project || "ASBL";
+
+  // Build a context phrase quoting the customer's last message. Trim to
+  // a short readable excerpt + strip media placeholders + escape WhatsApp
+  // formatting that would otherwise mess up the rendered quote.
+  const cleaned = (lastInboundText || "")
+    .replace(/\s+/g, " ")
+    .replace(/[*_~`]/g, "")
+    .trim();
+  const excerpt = cleaned.length > 80 ? cleaned.slice(0, 77) + "..." : cleaned;
+  const ctxPhrase = excerpt
+    ? `Aapne pichli baar likha tha: "${excerpt}".`
+    : `Hamari pichli baat ${proj} ke baare me chal rahi thi.`;
+
   const messages = [
-    `Hi ${name}, hamari pichli baat ${proj} ke baare me chal rahi thi — koi update share karu? ` +
-    `Pricing, inventory, ya site visit slot — jo bhi chahiye, bata dijiye.`,
+    // 1: Quote + soft remind
+    `Hi ${name}, ${ctxPhrase} Usi ke baare me follow karna chahti thi — koi specific question hai jo abhi tak unanswered hai?`,
 
-    `${name}, hope you're doing well. Pichli conversation ke baad agar koi specific question rah gaya ho ${proj} ke baare me, ` +
-    `feel free to ask. Main 5 min me reply kar sakti hu.`,
+    // 2: Quote + offer next step
+    `${name}, ${ctxPhrase} Kya aap ${proj} ki updated pricing / availability dekhna chahenge? ` +
+    `Main 5 min me share kar dungi.`,
 
-    `Hi ${name}, ek quick check-in — ${proj} pe abhi tak final decision liya kya? ` +
-    `Agar koi confusion ya specific detail chahiye to message kar dijiye, main turant respond karungi.`,
+    // 3: Quote + soft site-visit nudge
+    `Hi ${name}, ${ctxPhrase} Aapke convenience ke hisaab se ek 30-min site visit consider karenge? ` +
+    `Project poora samajh aa jata hai aur clarity bhi mil jati hai.`,
 
-    `${name}, hamare pichle chat ke baad ek update — ${proj} me kuch fresh inventory aur payment options confirm hue hain. ` +
-    `Ek 5-min call ya site visit lagaun?`,
+    // 4: Quote + direct ask
+    `${name}, ${ctxPhrase} Bata dijiye kya aapko aage badhne me koi confusion hai — pricing, configuration, ya documentation. ` +
+    `Main resolve kar dungi.`,
   ];
   return messages[(idx - 1) % messages.length];
 }

@@ -9,35 +9,44 @@
 import { updateLead } from "./zoho";
 import { mirrorLeadStateToMongo } from "./supabase";
 
-// ─── CONFIG ────────────────────────────────────────────────────────────────
+// ─── CONFIG (v2 2026-06-18 product call) ───────────────────────────────────
+//
+// COLD branch (customer never replied):
+//   Every 7 hours, gated to 7AM-9PM customer-local, for 15 days from
+//   Created_Time. Same sender as T=0 (sticky-per-phone).
+//
+// GHOST branch (replied once, then silent):
+//   First fire at last-inbound + 25h, every 24h after that, for 7 days
+//   from last inbound. Message includes customer's last reply for context.
+//   Same sender.
 export const CFG = {
   /** X for no chatbot response — time after initial msg before SF status. */
   CHATBOT_NO_REPLY_WINDOW_MS: 24 * 60 * 60 * 1000, // 24h
 
-  /** Hard safety cap on total chatbot messages per lead. */
-  CHATBOT_FOLLOWUP_MAX_ATTEMPTS: 30,
+  /** Hard safety cap on total chatbot messages per lead. Cold (~30 in 15d)
+   *  + ghost (~7 in 7d) worst-case = ~37, with 50 as safety overhead. */
+  CHATBOT_FOLLOWUP_MAX_ATTEMPTS: 50,
 
-  /** Gap between chatbot follow-ups (2h aggressive cadence — 2026-06-09). */
-  CHATBOT_FOLLOWUP_INTERVAL_MS: 2 * 60 * 60 * 1000, // 2h
+  // ─── COLD branch ─────────────────────────────────────────────────────
+  /** Gap between cold follow-ups. */
+  COLD_FOLLOWUP_INTERVAL_MS: 7 * 60 * 60 * 1000, // 7h
+  /** Total window for cold follow-ups from Created_Time. */
+  COLD_FOLLOWUP_WINDOW_MS: 15 * 24 * 60 * 60 * 1000, // 15 days
+  /** Customer-local hour window. */
+  COLD_HOURS_START: 7,   // 7 AM
+  COLD_HOURS_END: 21,    // 9 PM (exclusive)
 
-  /** Total chatbot follow-up window per lead. After 7 days from creation
-   *  (cold lead) → give up and auto-transition the lead to Not Interested. */
-  CHATBOT_FOLLOWUP_WINDOW_MS: 7 * 24 * 60 * 60 * 1000, // 7 days
-
-  /** Calling-hours gate for chatbot follow-ups (IST hour-of-day range).
-   *  Customer ko aadhi raat ko WhatsApp ping nahi jana chahiye. */
-  CHATBOT_HOURS_START_IST: 9,  // 9 AM IST
-  CHATBOT_HOURS_END_IST: 21,   // 9 PM IST (exclusive)
+  // ─── GHOST branch ────────────────────────────────────────────────────
+  /** Delay AFTER customer's last inbound before first re-engagement. */
+  GHOST_INITIAL_DELAY_MS: 25 * 60 * 60 * 1000, // 25h
+  /** Gap between subsequent ghost re-engagement attempts. */
+  GHOST_INTERVAL_MS: 24 * 60 * 60 * 1000, // 24h
+  /** Total window for ghost re-engagement from last inbound. */
+  GHOST_WINDOW_MS: 7 * 24 * 60 * 60 * 1000, // 7 days
+  /** Same customer-local hour window. */
+  GHOST_HOURS_START: 7,
+  GHOST_HOURS_END: 21,
 };
-
-/** True when current IST hour is within the chatbot follow-up window
- *  (CHATBOT_HOURS_START_IST .. CHATBOT_HOURS_END_IST). */
-export function isWithinChatbotHours(now: Date = new Date()): boolean {
-  const utcH = now.getUTCHours();
-  const utcM = now.getUTCMinutes();
-  const istHour = (utcH + 5 + (utcM >= 30 ? 1 : 0)) % 24;
-  return istHour >= CFG.CHATBOT_HOURS_START_IST && istHour < CFG.CHATBOT_HOURS_END_IST;
-}
 
 // ─── Per-lead state ──────────────────────────────────────────────────────
 

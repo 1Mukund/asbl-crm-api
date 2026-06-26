@@ -194,15 +194,16 @@ async function runPrdCadenceProcessor(): Promise<{
   try {
     const { getAccessToken, updateLead } = await import("../_utils/zoho");
     const { mirrorLeadStateToMongo } = await import("../_utils/supabase");
-    // PRD orchestrator's chatbot tick handlers are no longer called from
-    // the cron (chatbot follow-ups disabled 2026-06-18). The functions
-    // remain exported in prd_orchestrator.ts as dead code for fast revival.
+    const {
+      handleChatbotFollowupTick,
+      handleChatbotReengagementTick,
+    } = await import("../_utils/prd_orchestrator");
     const {
       CFG,
       chatbotExhausted,
-      isWithinChatbotHours,
     } = await import("../_utils/prd_cadence");
     const { onSsTreeExhausted } = await import("../_utils/prd_state_machine");
+    const { isWithinCustomerHours } = await import("../_utils/call_scheduling");
 
     // v3 calling (2026-06-18 product note) has no time-bound voice exhaustion —
     // calls loop on fixed slot hours until pickup OR manual stop (Lead_Status
@@ -291,25 +292,30 @@ async function runPrdCadenceProcessor(): Promise<{
         // replied) and CS (preferred call time given) both mean engagement.
         const customerEngaged = lead.PRD_Status === "CF" || lead.PRD_Status === "CS";
 
-        // 1. CHATBOT FOLLOW-UPS — PRD v1.1 2026-06-09 aggressive cadence.
-        //    Two branches share the same interval (2h) + window (7 days):
+        // 1. CHATBOT FOLLOW-UPS (v2 — 2026-06-18 product call).
         //
-        //    COLD branch: customer has NEVER replied. Goal — wake them up
-        //      before they move on. Fire every 2h during 9 AM-9 PM IST for
-        //      up to 7 days from Created_Time, then auto-close.
+        //    COLD branch — customer has NEVER replied to T=0 greeting:
+        //      Every 7h gap (CFG.COLD_FOLLOWUP_INTERVAL_MS), gated to
+        //      [7AM, 9PM) in CUSTOMER timezone, up to 15 days from
+        //      Created_Time. Same sender (sticky-per-phone). Six rotating
+        //      templates so 2-3 messages/day don't feel robotic.
         //
-        //    GHOST branch: customer replied at some point but has been
-        //      silent >= GHOST_THRESHOLD_MS (12h). Goal — re-open the
-        //      conversation with context-aware templates. Same cadence,
-        //      different message tone (acknowledges prior chat).
+        //    GHOST branch — customer replied earlier but went silent:
+        //      First fire at last-inbound + 25h (CFG.GHOST_INITIAL_DELAY_MS),
+        //      every 24h after that, up to 7 days from last inbound.
+        //      Message quotes a short excerpt of the customer's last reply
+        //      so it reads contextual not cold-pitchy. Same sender.
         //
-        //    Common gates: calling-hours, hard 30-attempt safety cap,
-        //    Spam/Not Interested skip, kill-switch via bot_enabled.
+        //    Common gates:
+        //      - chatbotExhausted (50-attempt safety cap)
+        //      - 7AM-9PM CUSTOMER-local hours
+        //      - PRD_Stage in {Not Interested, Spam, Pre Site Visit} → skipped
+        //        upstream
+        //      - bot_enabled = false (per-phone kill-switch via dashboard)
         const followupsSent = lead.Chatbot_Follow_up_Count ?? 0;
-        const hoursStartGate = isWithinChatbotHours();
         const counterUnderCap = followupsSent < CFG.CHATBOT_FOLLOWUP_MAX_ATTEMPTS;
 
-        if (counterUnderCap && hoursStartGate && createdTime > 0) {
+        if (counterUnderCap && createdTime > 0) {
           try {
             const { getCollection, COL } = await import("../_utils/mongo");
             const wmCol = await getCollection(COL.WHATSAPP_MESSAGES);
@@ -317,10 +323,13 @@ async function runPrdCadenceProcessor(): Promise<{
               { _id: phone as any },
               { projection: { by_date: 1 } },
             );
-            // Compute most-recent inbound + outbound times by walking
-            // by_date keys descending. Cheap because we break on first hit.
+            // Walk by_date desc to capture: most-recent outbound time,
+            // most-recent inbound time, and the most-recent inbound TEXT
+            // (used by the ghost re-engagement template to quote what the
+            // customer said).
             let lastOutboundMs = 0;
             let lastInboundMs = 0;
+            let lastInboundText = "";
             if (phoneDoc?.by_date) {
               const dates = Object.keys(phoneDoc.by_date).sort().reverse();
               for (const dk of dates) {
@@ -337,42 +346,76 @@ async function runPrdCadenceProcessor(): Promise<{
                   const inArr = dayBucket.inbound || [];
                   for (let i = inArr.length - 1; i >= 0; i--) {
                     const t = new Date(inArr[i]?.time || 0).getTime();
-                    if (t > lastInboundMs) lastInboundMs = t;
+                    if (t > lastInboundMs) {
+                      lastInboundMs = t;
+                      lastInboundText = String(inArr[i]?.message || "");
+                    }
                     if (lastInboundMs > 0) break;
                   }
                 }
                 if (lastOutboundMs > 0 && lastInboundMs > 0) break;
               }
             }
+
             const everReplied = lastInboundMs > 0;
-            const lastSendMs = lastOutboundMs > 0 ? lastOutboundMs : createdTime;
-            const sinceLastOutbound = now - lastSendMs;
-            const dueByInterval = sinceLastOutbound >= CFG.CHATBOT_FOLLOWUP_INTERVAL_MS;
+            const inCustomerHours = isWithinCustomerHours(phone, 7, 21);
 
-            // Anchor for the 7-day total-window check:
-            //   cold     → Created_Time
-            //   ghosted  → last inbound (clock restarts each time customer replies)
-            const windowAnchor = everReplied ? lastInboundMs : createdTime;
-            const withinWindow = now - windowAnchor <= CFG.CHATBOT_FOLLOWUP_WINDOW_MS;
+            if (!everReplied) {
+              // ── COLD branch ──────────────────────────────────────────
+              const sinceCreated = now - createdTime;
+              const withinColdWindow = sinceCreated <= CFG.COLD_FOLLOWUP_WINDOW_MS;
+              // Anchor the 7h gap on last outbound (T=0 greeting or last
+              // follow-up). If we've never sent anything, anchor on
+              // Created_Time so the first follow-up fires 7h after birth.
+              const lastSendMs = lastOutboundMs > 0 ? lastOutboundMs : createdTime;
+              const dueByInterval = (now - lastSendMs) >= CFG.COLD_FOLLOWUP_INTERVAL_MS;
 
-            if (dueByInterval && withinWindow) {
-              // ALL CHATBOT FOLLOW-UPS DISABLED 2026-06-18 (product call).
-              //   - COLD branch (never-replied 2h cadence) — OFF
-              //   - GHOST branch (12h-silent-after-reply re-engagement) — OFF
-              // Cron no longer sends ANY outbound WhatsApp nudge. The only
-              // bot-driven WhatsApp messages are:
-              //   (a) T=0 greeting in handleLeadCreated (initial contact)
-              //   (b) Inbound bot replies via /api/relay/periskope-webhook
-              //       (Gemini handles incoming customer messages)
-              //   (c) Resubmission notifications (resubmission.ts)
-              // handleChatbotFollowupTick + handleChatbotReengagementTick +
-              // buildFollowupMessage + buildReengagementMessage all stay in
-              // prd_orchestrator.ts as dead code so revival is a one-line
-              // un-comment if/when policy reverses.
-            } else if (!withinWindow) {
-              // 7-day window expired. If voice channel also done, mark as
-              // Not Interested via the existing exhaustion handler.
-              if (voiceExhausted(lead)) {
+              if (withinColdWindow && dueByInterval && inCustomerHours) {
+                await handleChatbotFollowupTick({
+                  zoho_lead_id: lead.id,
+                  lead,
+                  phone,
+                  customer_name: fullName,
+                  project: lead.ASBL_Project,
+                });
+                chatbotTicks++;
+              } else if (!withinColdWindow) {
+                // 15-day cold window expired with zero engagement → close.
+                await onSsTreeExhausted(lead.id, lead);
+                exhaustionCloses++;
+              }
+            } else {
+              // ── GHOST branch ─────────────────────────────────────────
+              const sinceLastInbound = now - lastInboundMs;
+              const withinGhostWindow = sinceLastInbound <= CFG.GHOST_WINDOW_MS;
+              const pastInitialDelay = sinceLastInbound >= CFG.GHOST_INITIAL_DELAY_MS;
+              // After the first ghost fire, anchor the 24h cadence on the
+              // bot's last outbound. If outbound is null (no bot reply yet
+              // since the customer's last inbound), the initial-delay check
+              // alone gates the first fire.
+              const lastSendMs = lastOutboundMs;
+              const dueByInterval =
+                lastSendMs === 0 || (now - lastSendMs) >= CFG.GHOST_INTERVAL_MS;
+              // Don't ping mid-conversation: lastSendMs > lastInboundMs means
+              // we already replied to the customer's last message (probably
+              // the inbound bot reply) — they may yet respond. Wait for
+              // the INITIAL_DELAY past their inbound, not since our reply.
+              const realDueByInterval =
+                lastSendMs <= lastInboundMs ? true : (now - lastSendMs) >= CFG.GHOST_INTERVAL_MS;
+
+              if (withinGhostWindow && pastInitialDelay && dueByInterval && realDueByInterval && inCustomerHours) {
+                await handleChatbotReengagementTick({
+                  zoho_lead_id: lead.id,
+                  lead,
+                  phone,
+                  customer_name: fullName,
+                  project: lead.ASBL_Project,
+                  hours_since_last_reply: sinceLastInbound / 3_600_000,
+                  last_inbound_text: lastInboundText,
+                });
+                chatbotTicks++;
+              } else if (!withinGhostWindow) {
+                // Ghost window expired with no further reply → close.
                 await onSsTreeExhausted(lead.id, lead);
                 exhaustionCloses++;
               }
