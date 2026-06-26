@@ -193,8 +193,8 @@ export async function getDocumentFor(
 
     if (rows?.length) {
       // For multi-slot doc types (unit_plan / floor_plan / price_sheet),
-      // try to match size_label fuzzily using the customer's message
-      // as a hint. Single-slot types just return the most recent row.
+      // try to match size_label fuzzily using the customer's message as
+      // a hint. Single-slot types just return the most recent row.
       const isMulti = isMultiSlotDocType(docType);
       if (isMulti) {
         const hint = normSize(sizeHint);
@@ -205,8 +205,13 @@ export async function getDocumentFor(
           });
           if (matched) return { ...matched, source: "table" };
         }
-        // No hint or no match → fall back to the most recently uploaded one
-        return { ...rows[0], source: "table" };
+        // No hint OR hint didn't match any row → return NULL. The old
+        // behaviour fell back to rows[0] (the most-recent upload), which
+        // shipped the WRONG file when the customer's actual size wasn't
+        // available — sales reported as "kabhi mango kuch aur, jata kuch
+        // aur" (2026-06-18). Caller is expected to handle null by asking
+        // a clarifying question instead of guessing.
+        return null;
       }
       return { ...rows[0], source: "table" };
     }

@@ -1448,10 +1448,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           if (isMultiSlot) {
             const labels = await listAvailableMetaLabels(project, docTypeFromMsg);
             if (labels.length) {
+              // buildClarificationMessage signature is options: string[]. We
+              // used to wrap each label into { size_label } and the template
+              // literal rendered "[object Object]" — fixed 2026-06-18 by
+              // passing plain strings as the signature actually wants.
               const clarif = buildClarificationMessage(
                 project,
                 docTypeFromMsg as any,
-                labels.map((label) => ({ size_label: label } as any)),
+                labels,
               );
               await saveMessage(phone, "outbound", clarif, sender, project);
               try {
@@ -1575,7 +1579,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             return parts.length ? parts.join(" ") : (c.size_label || "");
           }).filter(Boolean);
           const clarif = labels.length
-            ? buildClarificationMessage(project, docTypeFromMsg as any, labels.map((l) => ({ size_label: l } as any)))
+            ? buildClarificationMessage(project, docTypeFromMsg as any, labels)
             : SAFE_FALLBACK_REPLY;
           await saveMessage(phone, "outbound", clarif, sender, project);
           try { await sendReply(phone, sender, clarif); } catch {}

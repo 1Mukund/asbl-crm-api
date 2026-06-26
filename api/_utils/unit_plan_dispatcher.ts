@@ -261,18 +261,33 @@ export async function dispatchUnitPlan(
 }
 
 /** Build a friendly clarification message to send to the customer when
- *  decision = "ambiguous". Kept Anandita-style (Sir/Ma'am, conversational). */
+ *  decision = "ambiguous". Kept Anandita-style (Sir/Ma'am, conversational).
+ *
+ *  DEFENSIVE NORMALISATION: callers historically passed objects like
+ *  { size_label: "..." } here, which template-literal-stringified as
+ *  "[object Object]" in the bullet list. We now normalise each option to a
+ *  string (favouring size_label) before rendering so that bug can never
+ *  resurface even if a future caller passes the wrong shape. */
 export function buildClarificationMessage(
   project: string,
   docType: "unit_plan" | "floor_plan" | "price_sheet",
-  options: string[],
+  options: Array<string | { size_label?: string | null; label?: string | null } | null | undefined>,
 ): string {
   const docLabel =
     docType === "unit_plan"   ? "unit plan"   :
     docType === "floor_plan"  ? "floor plan"  :
     docType === "price_sheet" ? "price sheet" :
     "document";
-  const list = options.map((o) => `• ${o}`).join("\n");
+  const normalised = options
+    .map((o) => {
+      if (o == null) return "";
+      if (typeof o === "string") return o.trim();
+      // Object — favour size_label, then label, then fall back to JSON
+      const obj = o as { size_label?: string | null; label?: string | null };
+      return String(obj.size_label || obj.label || "").trim();
+    })
+    .filter((s) => s.length > 0);
+  const list = normalised.map((o) => `• ${o}`).join("\n");
   return (
     `Sure Sir, just to send the right one — we have a few ${docLabel}s for ${project}:\n\n` +
     `${list}\n\n` +
