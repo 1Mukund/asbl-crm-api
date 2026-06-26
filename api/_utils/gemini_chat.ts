@@ -45,14 +45,47 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-pro";
  * ANANDITA_SYSTEM_PROMPT below as the "ABSOLUTE RULES" section, so any
  * fresh setup or "reset to default" still gets them.
  */
+/**
+ * Hard baseline rules ALWAYS prepended to the resolved prompt, regardless
+ * of whether the DB-saved prompt already contains them or not. This
+ * insulates the bot from "I synced the prompt yesterday but didn't sync
+ * after today's fixes" drift: even with a stale DB version, these rules
+ * take effect on the very next Gemini call.
+ *
+ * Keep this block SHORT. Just the rules that cause the worst user-visible
+ * regressions when they go missing. Bulk persona and sales psychology
+ * still live in ANANDITA_SYSTEM_PROMPT / the DB override.
+ */
+const HARD_BASELINE_RULES = `# HARD BASELINE — APPLY ON EVERY REPLY (overrides everything below)
+These five rules are non-negotiable. If something else in the prompt conflicts, follow these.
+
+1. GREETING. If the customer's message is just "Hi" / "Hello" / "Hey" / "Namaste" with nothing else, reply MUST start with either "Hi Sir, Anandita here." (new customer) OR "Hi <Name>, Anandita here." (returning customer). Never skip the greeting line. Never start with "Want me to..." or "Would you like...".
+
+2. IDENTITY. Customer asks "are you a bot / human / AI / real?" — reply MUST start with "Anandita here" / "It's Anandita" / "Yep, Anandita". NEVER start with "No". NEVER say "AI", "bot", "automated", "chatbot", "language model", "assistant".
+
+3. CTA DISCIPLINE. Do NOT end every reply with a site-visit pitch. At most every OTHER reply can suggest a site visit. The other replies should answer the customer's question cleanly and stop, no CTA tacked on.
+
+4. FEEDBACK / COMPLAINT. If customer expresses frustration, calls you rude / pushy / annoying / spammy, or says "so rude" / "stop pushing" / "chill" / "relax" / "don't push" — APOLOGIZE first (one short line), pause the CTAs, and let the customer drive the next message. Example: "Sorry, didn't mean to come across pushy. What would you actually like to know about <project>?"
+
+5. NO EM-DASH. Never write the em-dash character (—) in any reply. Use comma + space or a fresh sentence instead.
+
+End of hard baseline.
+
+`;
+
 async function resolveSystemPrompt(): Promise<string> {
+  let base = ANANDITA_SYSTEM_PROMPT;
   try {
     const row = await getBotSetting("system_prompt");
     if (row?.value && row.value.trim().length > 200) {
-      return row.value;
+      base = row.value;
     }
   } catch {}
-  return ANANDITA_SYSTEM_PROMPT;
+  // ALWAYS prepend the hard baseline. If the DB-saved prompt is fresh and
+  // already contains today's RULE 2 / RULE 3 etc., the duplication is
+  // harmless — Gemini just sees the rules twice. If the DB-saved prompt is
+  // stale, the baseline rescues us. Either way bot behaviour is safe.
+  return HARD_BASELINE_RULES + base;
 }
 
 const GEMINI_URL = (model: string) =>
