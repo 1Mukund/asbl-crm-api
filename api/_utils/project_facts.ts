@@ -162,14 +162,17 @@ export async function saveProjectKb(
 export const DEFAULT_PORTFOLIO_OVERVIEW = `ASBL PROJECT PORTFOLIO — AUTHORITATIVE STATUS (ground truth; use this for ANY ready-to-move / possession / "which project" question; NEVER contradict it; NEVER state a possession date that is not listed here):
 
 - SPECTRA — READY TO MOVE IN. This is THE project to offer when a customer wants ready-to-move / ready possession / immediate move-in.
-- BROADWAY — Under construction, possession December 2029. NOT ready-to-move.
-- LOFT — Under construction. (Confirm the exact possession quarter before quoting a date.)
-- LANDMARK — Under construction. (Confirm the exact possession quarter before quoting a date.)
+- LOFT — Under construction, possession December 2026.
+- LANDMARK — Under construction, possession March 2028.
+- BROADWAY — Under construction, possession December 2029.
 
 HARD RULES:
 - If the customer asks for "ready to move", "ready to move in", "ready possession", or "immediate possession", LEAD WITH SPECTRA by name and offer it. Do NOT say "all our projects are under construction" — that is FALSE.
-- Only ever state a possession date that appears above. If a project's exact date is not listed, say you'll confirm and revert rather than guessing.
-- Never claim Spectra is under construction. Spectra is ready-to-move.`;
+- Only ever state a possession date that appears above. Never invent a date.
+- Never claim Spectra is under construction. Spectra is ready-to-move.
+
+DOCUMENT RULE — SPECTRA PAYMENT STRUCTURE:
+- There is NO separate Spectra payment-structure PDF. If a customer asks for Spectra's payment structure, send the Spectra PRICE SHEET instead (set doc_to_send to price_sheet) and tell them the sales executive will walk them through the payment structure at the site. Do not say "we don't have it".`;
 
 let _portfolioCache: { val: string; at: number } | null = null;
 const PORTFOLIO_TTL_MS = 60_000;

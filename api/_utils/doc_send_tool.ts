@@ -163,7 +163,17 @@ export async function sendDocumentTool(opts: {
 }): Promise<SendDocResult> {
   const t0 = Date.now();
   const cleanProject = String(opts.request.project || "").trim();
-  const docType = String(opts.request.doc_type || "").trim().toLowerCase();
+  let docType = String(opts.request.doc_type || "").trim().toLowerCase();
+
+  // SPECTRA has no separate payment-structure PDF. Per business rule, a
+  // request for it is served with the Spectra PRICE SHEET; the reply (from
+  // Gemini, guided by the portfolio DOCUMENT RULE) tells the customer the
+  // sales executive will walk them through payment structure at the site.
+  // This is a hard safety net so we never return NOT_FOUND for that case.
+  if (/spectra/i.test(cleanProject) && docType === "payment_structure") {
+    docType = "price_sheet";
+  }
+
   const isMulti = MULTI_SLOT_TYPES.has(docType);
 
   let rows: ProjectDocumentRow[] = [];
