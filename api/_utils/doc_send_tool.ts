@@ -120,13 +120,36 @@ function scoreRow(row: ProjectDocumentRow, hint: SendDocRequest): number {
   let score = 0;
   if (hint.unit_size_sft && (row as any).unit_size_sft === hint.unit_size_sft) score += 4;
   if (hint.facing && String(row.facing || "").toLowerCase() === hint.facing.toLowerCase()) score += 3;
-  if (hint.tower && String(row.tower || "").toLowerCase() === hint.tower.toLowerCase()) score += 3;
-  if (hint.size_label && String(row.size_label || "").toLowerCase() === hint.size_label.toLowerCase()) score += 5;
-  // Fuzzy: size hint contained in size_label OR vice versa
-  if (hint.size_label && row.size_label) {
+
+  // Tower matching: exact on the dedicated `tower` field OR fuzzy by
+  // looking for "Tower X" / "Tower-X" inside the size_label / filename.
+  // This catches uploads where the tower was encoded into the label
+  // (e.g. size_label = "Tower A-UrbanCorridor") instead of the tower
+  // column. Bug observed 2026-06-19: customer typed "Tower A", strict
+  // lookup with hint.tower = "A" matched nothing because Broadway rows
+  // had tower field empty and the letter was buried in size_label.
+  if (hint.tower) {
+    const hintTower = String(hint.tower).toLowerCase().trim();
+    if (hintTower) {
+      if (String(row.tower || "").toLowerCase() === hintTower) score += 4;
+      const lbl = String(row.size_label || "").toLowerCase();
+      const fname = String(row.filename || "").toLowerCase();
+      const patterns = [
+        `tower ${hintTower}`, `tower-${hintTower}`, `tower_${hintTower}`,
+        `t-${hintTower}`, `t${hintTower}`,
+      ];
+      if (patterns.some((p) => lbl.includes(p) || fname.includes(p))) score += 3;
+    }
+  }
+
+  // size_label matching: exact + fuzzy contains
+  if (hint.size_label) {
     const a = String(hint.size_label).toLowerCase();
-    const b = String(row.size_label).toLowerCase();
-    if (a.includes(b) || b.includes(a)) score += 1;
+    if (String(row.size_label || "").toLowerCase() === a) score += 5;
+    if (row.size_label) {
+      const b = String(row.size_label).toLowerCase();
+      if (a.includes(b) || b.includes(a)) score += 2;
+    }
   }
   return score;
 }

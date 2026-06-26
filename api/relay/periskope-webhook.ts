@@ -1322,9 +1322,109 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     );
     console.log(`[Periskope Webhook] Gemini reply (sanitized, history=${hasHistory}, greeting=${isGreetingIntent}): ${reply.slice(0, 120)}`);
 
-    // 10. Save outbound IMMEDIATELY so a fast follow-up message from the
-    //     customer sees the bot's reply in CONVERSATION_HISTORY, even if
-    //     Periskope's typing-indicator delay hasn't fired the actual send yet.
+    // 10. PRE-FLIGHT DOC TOOL — when Gemini said "Sending the floor plan
+    //     now" but the actual dispatcher can't find the right PDF, we'd
+    //     end up sending TWO messages: Gemini's optimistic "sending now"
+    //     followed by the dispatcher's clarification "which tower?". The
+    //     customer sees a contradictory bot.
+    //
+    //     Fix: run the doc tool FIRST. If it can ship cleanly, keep
+    //     Gemini's accurate "sending now" reply. If it returns AMBIGUOUS
+    //     or NOT_FOUND or ERROR, REPLACE Gemini's reply with the right
+    //     follow-up text BEFORE sending — so customer only sees one
+    //     coherent message.
+    //
+    //     The downstream legacy doc-dispatch block (strict + clarification
+    //     + legacy fallback) is then no-op'd via the docSent flag.
+    type DocSendInfo = { doc_type: string; url: string; source?: string };
+    let docSent: DocSendInfo | null = null;
+    let docBlocked: { reason: string } | null = null;
+    let preflightHandled = false;
+    const isDocRequest = geminiOutput.docToSend !== null;
+
+    if (project && isDocRequest) {
+      const docTypeFromMsg = geminiOutput.docToSend!;
+      const docMeta = geminiOutput.docMeta;
+      const isMultiSlot =
+        docTypeFromMsg === "unit_plan"  ||
+        docTypeFromMsg === "floor_plan" ||
+        docTypeFromMsg === "price_sheet";
+
+      // Detect SEND-ALL (same regex as the downstream block)
+      const ALL_QUANTIFIER = /\b(all|saare|saari|sari|har|sab|sare|every|each|all\s+of\s+them)\b/i;
+      const VARIANT_NOUN = /\b(towers?|sizes?|variants?|options?|units?|wings?|configurations?|configs?|layouts?)\b/i;
+      const NUMERIC_VARIANTS = /\b(\d+|do|teen|char|paanch|six|saat|aath)\s+(towers?|sizes?|variants?|options?|units?|wings?|configurations?|configs?|layouts?)\b/i;
+      const wantsAll = isMultiSlot && (
+        (ALL_QUANTIFIER.test(message) && VARIANT_NOUN.test(message)) ||
+        NUMERIC_VARIANTS.test(message)
+      );
+
+      const { sendDocumentTool } = await import("../_utils/doc_send_tool");
+      const toolResult = await sendDocumentTool({
+        request: {
+          project,
+          doc_type: docTypeFromMsg,
+          unit_size_sft: docMeta?.unit_size_sft ?? null,
+          facing: docMeta?.facing ?? null,
+          tower: docMeta?.tower ?? null,
+          send_all_variants: wantsAll,
+        },
+        phone,
+        sender,
+      });
+
+      console.log(
+        `[Periskope Webhook] DocTool result: outcome=${toolResult.outcome} ` +
+        `sent=${toolResult.sent_count} variants=${toolResult.variants_sent.length} ` +
+        `options=${(toolResult.options || []).length}`,
+      );
+
+      if (toolResult.outcome === "SEND") {
+        // Docs already shipped by the tool. Keep Gemini's "sending now" text
+        // as the ack (it accurately reflects what we did).
+        preflightHandled = true;
+        docSent = {
+          doc_type: docTypeFromMsg,
+          url: toolResult.variants_sent[0]?.url || "(multiple)",
+          source: wantsAll ? "send-all-tool" : "single-tool",
+        };
+      } else if (toolResult.outcome === "AMBIGUOUS") {
+        // Multiple matches but no clear winner. REPLACE Gemini's reply
+        // with a casual clarification listing the options inline.
+        const opts = toolResult.options || [];
+        const inline =
+          opts.length === 0 ? "" :
+          opts.length === 1 ? opts[0] :
+          opts.length === 2 ? `${opts[0]} and ${opts[1]}` :
+          `${opts.slice(0, -1).join(", ")}, and ${opts[opts.length - 1]}`;
+        const docLabel =
+          docTypeFromMsg === "unit_plan"  ? "unit plan"   :
+          docTypeFromMsg === "floor_plan" ? "floor plan"  :
+          docTypeFromMsg === "price_sheet" ? "price sheet" :
+          docTypeFromMsg;
+        reply = `Quick check before I send. We have a few ${docLabel}s for ${project}: ${inline}. Which one do you need?`;
+        preflightHandled = true;
+      } else if (toolResult.outcome === "NOT_FOUND") {
+        // No matching row exists. REPLACE Gemini's "sending now" with a
+        // casual deflection that admits we don't have it yet.
+        const docLabel =
+          docTypeFromMsg === "unit_plan"  ? "unit plan"   :
+          docTypeFromMsg === "floor_plan" ? "floor plan"  :
+          docTypeFromMsg === "price_sheet" ? "price sheet" :
+          docTypeFromMsg.replace(/_/g, " ");
+        reply = `Honestly haven't got the ${docLabel} for ${project} on hand right now. Lemme check with the team and revert. Tab tak kuch aur dekhna ho to bata dijiye.`;
+        preflightHandled = true;
+      } else if (toolResult.outcome === "ERROR") {
+        // Periskope or DB failure. Casual deflection.
+        reply = `Trying to send that to you. Periskope side se thodi dikkat aa rahi hai. Quick retry karke aati hu in a couple mins.`;
+        preflightHandled = true;
+        console.error(`[Periskope Webhook] DocTool ERROR: ${toolResult.error}`);
+      }
+    }
+
+    // 10b. Save outbound IMMEDIATELY so a fast follow-up message from the
+    //      customer sees the bot's reply in CONVERSATION_HISTORY, even if
+    //      Periskope's typing-indicator delay hasn't fired the actual send yet.
     await saveMessage(phone, "outbound", reply, sender, project);
 
     // 11. Send text reply via Periskope (1.5s typing delay + 1 retry inside)
@@ -1350,12 +1450,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     //   + LLM-supplied meta is the v5 contract. Legacy fuzzy lookup is
     //   retained only as a fallback when strict returns NOT_FOUND on a
     //   single-slot doc type (e.g. brochure has no meta to match on).
-    type DocSendInfo = { doc_type: string; url: string; source?: string };
-    let docSent: DocSendInfo | null = null;
-    let docBlocked: { reason: string } | null = null;
-    const isDocRequest = geminiOutput.docToSend !== null;
-
-    if (project && isDocRequest) {
+    if (project && isDocRequest && !preflightHandled) {
       const docTypeFromMsg = geminiOutput.docToSend!;
       const docMeta = geminiOutput.docMeta;
       const isMultiSlot =
