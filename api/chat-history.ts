@@ -6782,6 +6782,36 @@ ${SHARED_STYLE}
         if (delivered && !body.all_senders) break;
       }
 
+      // STATUS POLL — Periskope's response carries a track_by hint:
+      //   "GET /messages/{unique_id}/status". A 200 "queued" only means the
+      //   request was accepted; the document can still fail to deliver. Poll
+      //   the status endpoint for each unique_id so we KNOW the real outcome
+      //   (sent / delivered / failed / pending) instead of guessing.
+      const uniqueIds: string[] = [];
+      for (const a of attempts) {
+        const m = String(a.body || "").match(/"unique_id"\s*:\s*"([^"]+)"/);
+        if (m && a.kind === "doc") uniqueIds.push(m[1]);
+      }
+      const statuses: any[] = [];
+      if (uniqueIds.length) {
+        await new Promise((r) => setTimeout(r, 4000)); // give Periskope a moment
+        for (const uid of uniqueIds) {
+          for (const base of ["https://api.periskope.app/v1/messages", "https://api.periskope.app/messages"]) {
+            try {
+              const sr = await fetch(`${base}/${uid}/status`, {
+                headers: { Authorization: `Bearer ${apiKey}` },
+              });
+              if (sr.status === 404) continue;
+              const sbody = (await sr.text()).slice(0, 400);
+              statuses.push({ unique_id: uid, endpoint: `${base}/${uid}/status`, http: sr.status, body: sbody });
+              break;
+            } catch (err: any) {
+              statuses.push({ unique_id: uid, endpoint: base, http: 0, body: `THREW: ${err.message}` });
+            }
+          }
+        }
+      }
+
       return res.status(200).json({
         ok: true,
         delivered,
@@ -6796,6 +6826,7 @@ ${SHARED_STYLE}
         url_source: urlSource,
         test_url: url,
         attempts,
+        delivery_status: statuses,
       });
     } catch (err: any) {
       return res.status(500).json({ error: err.message });
