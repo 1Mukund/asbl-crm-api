@@ -6695,6 +6695,116 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── import-doc-urls — bulk-set project_documents from a clean URL list.
+  //
+  //   Root cause found 2026-06-26: the Supabase project holding every PDF
+  //   (qexmwffpjawowxqqttec) was DELETED, so every doc URL in
+  //   project_documents was dead and Periskope failed to fetch them. This
+  //   endpoint lets you re-point the whole library to the LIVE Supabase
+  //   project in one POST after re-uploading the PDFs there.
+  //
+  //   POST /api/chat-history?action=import-doc-urls&secret=<...>
+  //     body: {
+  //       wipe_first?: true,            // delete ALL existing rows first
+  //       wipe_projects?: ["SPECTRA"],  // OR delete only these projects' rows
+  //       verify_urls?: true,           // HEAD-check each url, skip dead ones
+  //       docs: [
+  //         { project, doc_type, url, filename,
+  //           size_label?, tower?, facing?, unit_size_sft?, applies_to_all? },
+  //         ...
+  //       ]
+  //     }
+  //   doc_type is one of: brochure / price_sheet / specifications /
+  //   master_plan / floor_plan / unit_plan / payment_structure / amenities.
+  if (req.method === "POST" && req.query.action === "import-doc-urls") {
+    const session = (req as any)._session;
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!session && (!expectedSecret || incomingSecret !== expectedSecret)) {
+      return res.status(401).json({ error: "Unauthorized — log in OR pass ?secret=..." });
+    }
+    try {
+      const body = (req.body || {}) as any;
+      const docs: any[] = Array.isArray(body.docs) ? body.docs : [];
+      if (!docs.length) return res.status(400).json({ error: "docs[] required" });
+
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const { insertDoc } = await import("./_utils/project_documents");
+      const col = await getCollection(COL.PROJECT_DOCUMENTS);
+
+      // Optional wipe
+      let wiped = 0;
+      if (body.wipe_first) {
+        const r = await col.deleteMany({});
+        wiped = r.deletedCount || 0;
+      } else if (Array.isArray(body.wipe_projects) && body.wipe_projects.length) {
+        for (const p of body.wipe_projects) {
+          const r = await col.deleteMany({ project: { $regex: new RegExp(`^${p}$`, "i") } as any });
+          wiped += r.deletedCount || 0;
+        }
+      }
+
+      const results: any[] = [];
+      let inserted = 0, skipped = 0;
+      for (const d of docs) {
+        const project = String(d.project || "").trim().toUpperCase();
+        const doc_type = String(d.doc_type || "").trim().toLowerCase();
+        const url = String(d.url || "").trim();
+        if (!project || !doc_type || !url) {
+          results.push({ ok: false, reason: "missing project/doc_type/url", doc: d });
+          skipped++;
+          continue;
+        }
+        // Optional: verify the URL is publicly fetchable before storing it
+        if (body.verify_urls) {
+          try {
+            const head = await fetch(url, { method: "HEAD" });
+            if (!head.ok) {
+              results.push({ ok: false, reason: `url HEAD ${head.status}`, url });
+              skipped++;
+              continue;
+            }
+          } catch (err: any) {
+            results.push({ ok: false, reason: `url unreachable: ${err.message}`, url });
+            skipped++;
+            continue;
+          }
+        }
+        // Upsert by (project, doc_type, size_label) so re-imports replace
+        // cleanly instead of duplicating.
+        const sizeLabel = d.size_label != null ? String(d.size_label) : null;
+        const matchFilter: any = { project, doc_type };
+        if (sizeLabel != null) matchFilter.size_label = sizeLabel;
+        await col.deleteMany(matchFilter);
+        const id = await insertDoc({
+          project,
+          doc_type,
+          url,
+          filename: d.filename != null ? String(d.filename) : "document.pdf",
+          size_label: sizeLabel,
+          tower: d.tower != null ? String(d.tower) : null,
+          facing: d.facing != null ? String(d.facing).toLowerCase() : null,
+          unit_size_sft: d.unit_size_sft != null ? Number(d.unit_size_sft) : null,
+          applies_to_all: d.applies_to_all === true,
+        } as any);
+        results.push({ ok: true, id, project, doc_type, size_label: sizeLabel, filename: d.filename });
+        inserted++;
+      }
+
+      return res.status(200).json({
+        ok: true,
+        wiped,
+        inserted,
+        skipped,
+        total_in: docs.length,
+        results,
+        next_step: "Run ?action=audit-project-docs to confirm, then test with ?action=send-doc-test or a real WhatsApp message.",
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── periskope-doc-diag — RAW Periskope doc-send probe. Bypasses ALL bot
   //     logic (no Gemini, no doc tool, no scoring). Hits Periskope directly
   //     and returns the EXACT HTTP status + body per (sender, endpoint) so we
