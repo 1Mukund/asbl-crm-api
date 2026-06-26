@@ -1,0 +1,133 @@
+{
+ "verify_urls": true,
+ "wipe_projects": [
+  "SPECTRA"
+ ],
+ "docs": [
+  {
+   "project": "SPECTRA",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "SpectraTOWER-D.pdf",
+   "size_label": "Tower-D",
+   "tower": "D"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "SpectraTOWER-C.pdf",
+   "size_label": "Tower-C",
+   "tower": "C"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "SpectraTOWER-B.pdf",
+   "size_label": "Tower-B",
+   "tower": "B"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Spectra-TOWER-A.pdf",
+   "size_label": "Tower-A",
+   "tower": "A"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "brochure",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Spectra Brochure.pdf"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "amenities",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Spectra AMENITIES.pdf"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "specifications",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Spectra Flat Specifications.pdf"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2220_3BHK_West_SB_Type-1.pdf",
+   "size_label": "2220-West-SB",
+   "tower": "SB",
+   "facing": "west",
+   "unit_size_sft": 2220
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2220_3BHK_West_NB-Type-1.pdf",
+   "size_label": "2220-West-NB",
+   "tower": "NB",
+   "facing": "west",
+   "unit_size_sft": 2220
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2220_3BHK_East_Type_1.pdf",
+   "size_label": "2220-East",
+   "facing": "east",
+   "unit_size_sft": 2220
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2210_3BHK_East_Type-1.pdf",
+   "size_label": "2210-East",
+   "facing": "east",
+   "unit_size_sft": 2210
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1980_3BHK_West_Type-1.pdf",
+   "size_label": "1980-West",
+   "facing": "west",
+   "unit_size_sft": 1980
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1980_3BHK_East_Type-1.pdf",
+   "size_label": "1980-East",
+   "facing": "east",
+   "unit_size_sft": 1980
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "payment_structure",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Payment Structure 1980 D Spectra.pdf"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "master_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Master+plan+preview.pdf"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "price_sheet",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1980 Spectra Price Sheet.pdf",
+   "size_label": "Spectra"
+  }
+ ]
+}

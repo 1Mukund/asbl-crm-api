@@ -1,0 +1,620 @@
+{
+ "verify_urls": true,
+ "wipe_first": true,
+ "docs": [
+  {
+   "project": "BROADWAY",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Tower-C-UC.pdf",
+   "size_label": "Tower-C Urban Corridor",
+   "tower": "C-UrbanCorridor"
+  },
+  {
+   "project": "BROADWAY",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Tower-B-UC.pdf",
+   "size_label": "Tower-B Urban Corridor",
+   "tower": "B-UrbanCorridor"
+  },
+  {
+   "project": "BROADWAY",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Tower-A-UC.pdf",
+   "size_label": "Tower-A Urban Corridor",
+   "tower": "A-UrbanCorridor"
+  },
+  {
+   "project": "BROADWAY",
+   "doc_type": "brochure",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Broadway Brochure_.pdf"
+  },
+  {
+   "project": "BROADWAY",
+   "doc_type": "brochure",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Broadway Brochure.pdf"
+  },
+  {
+   "project": "BROADWAY",
+   "doc_type": "specifications",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Broadway Specification_compressed.pdf"
+  },
+  {
+   "project": "BROADWAY",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2650-East-U2.pdf",
+   "size_label": "2650-East-U2",
+   "tower": "U2",
+   "facing": "east",
+   "unit_size_sft": 2650
+  },
+  {
+   "project": "BROADWAY",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2650-East-U1.pdf",
+   "size_label": "2650-East-U1",
+   "tower": "U1",
+   "facing": "east",
+   "unit_size_sft": 2650
+  },
+  {
+   "project": "BROADWAY",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2390-North.pdf",
+   "size_label": "2390-North",
+   "facing": "north",
+   "unit_size_sft": 2390
+  },
+  {
+   "project": "BROADWAY",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2340-West.pdf",
+   "size_label": "2340-West",
+   "facing": "west",
+   "unit_size_sft": 2340
+  },
+  {
+   "project": "BROADWAY",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2090-East.pdf",
+   "size_label": "2090-East",
+   "facing": "east",
+   "unit_size_sft": 2090
+  },
+  {
+   "project": "BROADWAY",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2035-West-1.pdf",
+   "size_label": "2035-West",
+   "facing": "west",
+   "unit_size_sft": 2035
+  },
+  {
+   "project": "BROADWAY",
+   "doc_type": "payment_structure",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Broadway_2Feb_Payment_structure.pdf"
+  },
+  {
+   "project": "BROADWAY",
+   "doc_type": "master_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "MasterPlan.pdf"
+  },
+  {
+   "project": "BROADWAY",
+   "doc_type": "price_sheet",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1777628885488-Broadway_2Feb_price_sheet.pdf",
+   "size_label": "Broadway Price Sheet"
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Landmark-TowerD.pdf",
+   "size_label": "Tower-D",
+   "tower": "D"
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Landmark-TowerC.pdf",
+   "size_label": "Tower-C",
+   "tower": "C"
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Landmark-Towerb.pdf",
+   "size_label": "Tower-B",
+   "tower": "B"
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Landmark-TowerA.pdf",
+   "size_label": "Tower-A",
+   "tower": "A"
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "amenities",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Landmark AMENITIES.pdf"
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "brochure",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Landmark Brochure.pdf"
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "specifications",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Landmark Specifications.pdf"
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2560-West.pdf",
+   "size_label": "2560-West",
+   "facing": "west",
+   "unit_size_sft": 2560
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2540-west.pdf",
+   "size_label": "2540-West",
+   "facing": "west",
+   "unit_size_sft": 2540
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2515-West.pdf",
+   "size_label": "2515-West",
+   "facing": "west",
+   "unit_size_sft": 2515
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2505-West.pdf",
+   "size_label": "2505-West",
+   "facing": "west",
+   "unit_size_sft": 2505
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2500-East.pdf",
+   "size_label": "2500-East",
+   "facing": "east",
+   "unit_size_sft": 2500
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2455-West.pdf",
+   "size_label": "2455-West",
+   "facing": "west",
+   "unit_size_sft": 2455
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2455-EastA.pdf",
+   "size_label": "2455-EastA",
+   "unit_size_sft": 2455
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2455-East.pdf",
+   "size_label": "2455-East",
+   "facing": "east",
+   "unit_size_sft": 2455
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2450-North.pdf",
+   "size_label": "2450-North",
+   "facing": "north",
+   "unit_size_sft": 2450
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2065-West.pdf",
+   "size_label": "2065-West",
+   "facing": "west",
+   "unit_size_sft": 2065
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2065-North.pdf",
+   "size_label": "2065-North",
+   "facing": "north",
+   "unit_size_sft": 2065
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1975-East-S1.pdf",
+   "size_label": "1975-East",
+   "facing": "east",
+   "unit_size_sft": 1975
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1805-West.pdf",
+   "size_label": "1805-West",
+   "facing": "west",
+   "unit_size_sft": 1805
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1805-North.pdf",
+   "size_label": "1805-North",
+   "facing": "north",
+   "unit_size_sft": 1805
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1740-West.pdf",
+   "size_label": "1740-West",
+   "facing": "west",
+   "unit_size_sft": 1740
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1645-East.pdf",
+   "size_label": "1645-East",
+   "facing": "east",
+   "unit_size_sft": 1645
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "payment_structure",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Landmark Payment Structure.pdf"
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "master_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Landmark-MasterPlanpdf.pdf"
+  },
+  {
+   "project": "LANDMARK",
+   "doc_type": "price_sheet",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Landmark Price Sheet.pdf",
+   "size_label": "Landmark Price Sheet"
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "price_sheet",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1870 Loft Price Sheet 50-50 offer.pdf",
+   "size_label": "1870",
+   "unit_size_sft": 1870
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "price_sheet",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1695 Loft Price Sheet 50-50 offer.pdf",
+   "size_label": "1695",
+   "unit_size_sft": 1695
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "payment_structure",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Loft Payment Structure 50-50 offer.pdf"
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "payment_structure",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1695 Loft Payment Structure BHFL.pdf"
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "payment_structure",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Loft Payment Structure (BHFL).pdf"
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "TowerB-UC.pdf",
+   "size_label": "Tower-B Urban Corridor",
+   "tower": "B-UrbanCorridor"
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "TowerA-UC.pdf",
+   "size_label": "Tower-A Urban Corridor",
+   "tower": "A-UrbanCorridor"
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "LOFT-TowerB.pdf",
+   "size_label": "Tower-B",
+   "tower": "B"
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "LOFT-TowerA.pdf",
+   "size_label": "Tower-A",
+   "tower": "A"
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1870-SB-West-Web.pdf",
+   "size_label": "1870-SB-West",
+   "tower": "SB",
+   "facing": "west",
+   "unit_size_sft": 1870
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1870-SB-East-Web.pdf",
+   "size_label": "1870-SB-East",
+   "tower": "SB",
+   "facing": "east",
+   "unit_size_sft": 1870
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1870-NB-West-Web.pdf",
+   "size_label": "1870-NB-West",
+   "tower": "NB",
+   "facing": "west",
+   "unit_size_sft": 1870
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1870-NB-East-Web.pdf",
+   "size_label": "1870-NB-East",
+   "tower": "NB",
+   "facing": "east",
+   "unit_size_sft": 1870
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1695-West.pdf",
+   "size_label": "1695-West",
+   "facing": "west",
+   "unit_size_sft": 1695
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1695-East.pdf",
+   "size_label": "1695-East",
+   "facing": "east",
+   "unit_size_sft": 1695
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "master_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "LOFT-MasterPlan.pdf"
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "master_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Master_plan.pdf"
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "amenities",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "LOFT AMENITIES.pdf"
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "specifications",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Loft Specifications.pdf"
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "brochure",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Loft Brochure.pdf"
+  },
+  {
+   "project": "LOFT",
+   "doc_type": "payment_structure_other",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Loft Payment Structure (other banks).pdf"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "SpectraTOWER-D.pdf",
+   "size_label": "Tower-D",
+   "tower": "D"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "SpectraTOWER-C.pdf",
+   "size_label": "Tower-C",
+   "tower": "C"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "SpectraTOWER-B.pdf",
+   "size_label": "Tower-B",
+   "tower": "B"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "floor_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Spectra-TOWER-A.pdf",
+   "size_label": "Tower-A",
+   "tower": "A"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "brochure",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Spectra Brochure.pdf"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "amenities",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Spectra AMENITIES.pdf"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "specifications",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Spectra Flat Specifications.pdf"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2220_3BHK_West_SB_Type-1.pdf",
+   "size_label": "2220-West-SB",
+   "tower": "SB",
+   "facing": "west",
+   "unit_size_sft": 2220
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2220_3BHK_West_NB-Type-1.pdf",
+   "size_label": "2220-West-NB",
+   "tower": "NB",
+   "facing": "west",
+   "unit_size_sft": 2220
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2220_3BHK_East_Type_1.pdf",
+   "size_label": "2220-East",
+   "facing": "east",
+   "unit_size_sft": 2220
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "2210_3BHK_East_Type-1.pdf",
+   "size_label": "2210-East",
+   "facing": "east",
+   "unit_size_sft": 2210
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1980_3BHK_West_Type-1.pdf",
+   "size_label": "1980-West",
+   "facing": "west",
+   "unit_size_sft": 1980
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "unit_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1980_3BHK_East_Type-1.pdf",
+   "size_label": "1980-East",
+   "facing": "east",
+   "unit_size_sft": 1980
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "payment_structure",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Payment Structure 1980 D Spectra.pdf"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "master_plan",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "Master+plan+preview.pdf"
+  },
+  {
+   "project": "SPECTRA",
+   "doc_type": "price_sheet",
+   "url": "<PASTE LIVE SUPABASE URL>",
+   "filename": "1980 Spectra Price Sheet.pdf",
+   "size_label": "Spectra"
+  }
+ ]
+}
