@@ -6883,6 +6883,22 @@ ${SHARED_STYLE}
           wiped += r.deletedCount || 0;
         }
       }
+      // Per-(project, doc_type) wipe — surgical: clears all rows of a doc_type
+      // for a project (every size_label) before the fresh rows are inserted,
+      // so multi-slot re-imports don't leave stale rows behind. Leaves other
+      // doc_types (floor_plan / unit_plan / master_plan) untouched.
+      if (Array.isArray(body.wipe_doc_types)) {
+        for (const w of body.wipe_doc_types) {
+          const p = String(w?.project || "").trim().toUpperCase();
+          const dt = String(w?.doc_type || "").trim().toLowerCase();
+          if (!p || !dt) continue;
+          const r = await col.deleteMany({
+            project: { $regex: new RegExp(`^${p}$`, "i") } as any,
+            doc_type: dt,
+          });
+          wiped += r.deletedCount || 0;
+        }
+      }
 
       const results: any[] = [];
       let inserted = 0, skipped = 0;
