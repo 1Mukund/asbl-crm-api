@@ -6787,28 +6787,35 @@ ${SHARED_STYLE}
       //   request was accepted; the document can still fail to deliver. Poll
       //   the status endpoint for each unique_id so we KNOW the real outcome
       //   (sent / delivered / failed / pending) instead of guessing.
-      const uniqueIds: string[] = [];
+      // Collect (unique_id, sender, kind) so we can poll each message's real
+      // delivery state. The status endpoint REQUIRES the x-phone header of
+      // the SENDING number (422 "Missing Header: {x-phone}" otherwise).
+      const toPoll: Array<{ uid: string; sender: string; kind: string }> = [];
       for (const a of attempts) {
         const m = String(a.body || "").match(/"unique_id"\s*:\s*"([^"]+)"/);
-        if (m && a.kind === "doc") uniqueIds.push(m[1]);
+        if (m) toPoll.push({ uid: m[1], sender: a.sender, kind: a.kind });
       }
       const statuses: any[] = [];
-      if (uniqueIds.length) {
-        await new Promise((r) => setTimeout(r, 4000)); // give Periskope a moment
-        for (const uid of uniqueIds) {
+      if (toPoll.length) {
+        await new Promise((r) => setTimeout(r, 5000)); // give Periskope a moment to attempt delivery
+        for (const p of toPoll) {
+          let got = false;
           for (const base of ["https://api.periskope.app/v1/messages", "https://api.periskope.app/messages"]) {
             try {
-              const sr = await fetch(`${base}/${uid}/status`, {
-                headers: { Authorization: `Bearer ${apiKey}` },
+              const sr = await fetch(`${base}/${p.uid}/status`, {
+                headers: { Authorization: `Bearer ${apiKey}`, "x-phone": p.sender },
               });
               if (sr.status === 404) continue;
               const sbody = (await sr.text()).slice(0, 400);
-              statuses.push({ unique_id: uid, endpoint: `${base}/${uid}/status`, http: sr.status, body: sbody });
+              statuses.push({ kind: p.kind, unique_id: p.uid, http: sr.status, body: sbody });
+              got = true;
               break;
             } catch (err: any) {
-              statuses.push({ unique_id: uid, endpoint: base, http: 0, body: `THREW: ${err.message}` });
+              statuses.push({ kind: p.kind, unique_id: p.uid, http: 0, body: `THREW: ${err.message}` });
+              got = true;
             }
           }
+          if (!got) statuses.push({ kind: p.kind, unique_id: p.uid, http: 404, body: "no status endpoint matched" });
         }
       }
 
