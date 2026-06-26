@@ -1130,8 +1130,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // 5. Build structured message — Gemini will classify + reply in one call.
     //    No <INTENT>/<FLAGS> blocks because Gemini decides those itself.
-    const customerName =
+    //    Name fallback chain: Zoho first_+last_name, then Mongo user_profile.name,
+    //    then Mongo user_profile.first_name. Defaults to empty (prompt then
+    //    decides whether to say "Sir/Ma'am" via the persona rule).
+    let customerName =
       [leadDetails?.firstName, leadDetails?.lastName].filter(Boolean).join(" ").trim();
+    if (!customerName) {
+      const profileName = String(userProfile?.name || "").trim();
+      const profileFirst = String((userProfile as any)?.first_name || "").trim();
+      customerName = profileName || profileFirst || "";
+    }
 
     // Persist current_project hint into the profile BEFORE rendering it, so
     // the block the bot sees has the live resolution. setActiveProject is
@@ -1175,10 +1183,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const fallbackDocType = regexResult.intent === "DOCUMENT_REQUEST"
         ? extractDocTypeFromMessage(message)
         : null;
-      // Crude size/facing extraction for multi-slot lookups. These mirror
-      // what Gemini would extract via its structured output.
+      // Crude size/facing/tower extraction for multi-slot lookups. These
+      // mirror what Gemini would extract via its structured output. Tower
+      // patterns cover common ASBL naming: "Tower 1", "T-1", "T1", "Wing A",
+      // bare letter (A, B, C) in context. Without these, the strict lookup
+      // would miss tower-specific PDFs and deflect to "let me confirm",
+      // which sales reported as the "asked for X, bot stalled" bug.
       const sizeMatch = message.match(/\b(\d{3,4})\s*(?:sft|sqft|sq\.\s*ft)\b/i);
       const facingMatch = message.match(/\b(east|west|north|south)\b/i);
+      const towerMatch =
+        message.match(/\b(?:tower|t|wing|block)\s*[-_\s]?\s*([0-9A-Z])\b/i) ||
+        message.match(/\b(?:tower|t|wing|block)\s+(one|two|three|four|five|six)\b/i);
+      const towerWordToNum: Record<string, string> = {
+        one: "1", two: "2", three: "3", four: "4", five: "5", six: "6",
+      };
+      const towerStr = towerMatch
+        ? (towerWordToNum[towerMatch[1].toLowerCase()] || towerMatch[1].toUpperCase())
+        : null;
       geminiOutput = {
         intent: regexResult.intent,
         flags: regexResult.flags,
@@ -1187,7 +1208,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         docMeta: {
           unit_size_sft: sizeMatch ? Number(sizeMatch[1]) : null,
           facing: facingMatch ? facingMatch[1].toLowerCase() : null,
-          tower: null,
+          tower: towerStr,
         },
         extractedFacts: {},
         reply: fallbackReply,
@@ -1285,7 +1306,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const hasHistory =
       conversation.totalMessages > 0 &&
       /\byou:\s/.test(conversation.formatted || "");
-    const reply = stripReintroduction(sanitizeReply(geminiOutput.reply), hasHistory);
+    let reply = stripReintroduction(sanitizeReply(geminiOutput.reply), hasHistory);
     console.log(`[Periskope Webhook] Gemini reply (sanitized, history=${hasHistory}): ${reply.slice(0, 120)}`);
 
     // 10. Save outbound IMMEDIATELY so a fast follow-up message from the
@@ -1328,6 +1349,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         docTypeFromMsg === "unit_plan"  ||
         docTypeFromMsg === "floor_plan" ||
         docTypeFromMsg === "price_sheet";
+      // Flag flipped to true when SEND-ALL handled the request — the strict
+      // single-doc lookup below then no-ops so we don't double-send.
+      let sendAllAlreadyHandled = false;
 
       // SEND-ALL-VARIANTS detection: when customer asks for "all", "saare",
       // "har tower", "4 towers", "every variant" etc. of a multi-slot doc
@@ -1335,9 +1359,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // asking "which one?" QA bug 2026-06-19: customer asked for "Spectra
       // ke 4 towers ka floor plan" and bot asked for clarification instead
       // of just sending all 4. Cap at 8 sends per request to prevent abuse.
+      // SEND-ALL detector — narrow regex so it only fires on EXPLICIT
+      // multi-variant intent, not on phrases like "all amenities" or
+      // "tell me about each project". Requires:
+      //   (a) an "all" quantifier AND a multi-variant noun (towers / sizes
+      //        / variants / options / wings / all of them), OR
+      //   (b) a numeric quantity + multi-variant noun ("4 towers", "3 sizes").
+      // Common false-positive examples now BLOCKED:
+      //   "Tell me about each project" — "each" alone without towers/sizes
+      //   "all amenities info" — "all" + amenities noun (amenities is single-slot)
+      const ALL_QUANTIFIER = /\b(all|saare|saari|sari|har|sab|sare|every|each|all\s+of\s+them)\b/i;
+      const VARIANT_NOUN = /\b(towers?|sizes?|variants?|options?|units?|wings?|configurations?|configs?|layouts?)\b/i;
+      const NUMERIC_VARIANTS = /\b(\d+|do|teen|char|paanch|six|saat|aath)\s+(towers?|sizes?|variants?|options?|units?|wings?|configurations?|configs?|layouts?)\b/i;
       const wantsAllVariants = isMultiSlot && (
-        /\b(all|saare|saari|sari|har|sab|sare|every|each)\b/i.test(message) ||
-        /\b\d+\s*(towers?|sizes?|variants?|options?|units?|wings?)\b/i.test(message)
+        (ALL_QUANTIFIER.test(message) && VARIANT_NOUN.test(message)) ||
+        NUMERIC_VARIANTS.test(message)
       );
       if (wantsAllVariants) {
         const { findDocsByType } = await import("../_utils/project_documents");
@@ -1384,18 +1420,30 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               .filter((n) => Number.isFinite(n) && n > 0),
           });
           docSent = { doc_type: docTypeFromMsg, url: "(multiple)", source: "send-all-variants" };
-          return res.status(200).json({
-            ok: true,
-            sent: { type: docTypeFromMsg, variants: sentCount, total_available: allRows.length },
-            ack_message: ack,
-          });
+          // Set the reply text used by the downstream Zoho update so the
+          // CRM correctly reflects what we said to the customer.
+          reply = ack;
+          // CRITICAL: do NOT early-return here. We must let downstream code
+          // run so Zoho Last_Intent / Whatsapp_Replied / funnel stage all
+          // update. Earlier bug (commit c943758): early-return caused the
+          // CRM to think the customer never engaged even after we sent
+          // 4 PDFs (silent funnel failure).
+          // Mark a flag so the strict-lookup block below skips itself.
+          sendAllAlreadyHandled = true;
+        } else {
+          // No rows found → fall through to normal strict lookup (which
+          // will emit "no docs available" reply).
+          console.log(`[Periskope Webhook] SEND-ALL requested but no rows for ${project}/${docTypeFromMsg}`);
         }
-        // No rows found → fall through to normal strict lookup (which will
-        // emit "no docs available" reply).
-        console.log(`[Periskope Webhook] SEND-ALL requested but no rows for ${project}/${docTypeFromMsg}`);
       }
 
+      // sendAllAlreadyHandled — skip strict lookup if SEND-ALL just fired
+      // and shipped multiple PDFs. Otherwise we'd send a duplicate single
+      // doc on top of the bulk send.
       try {
+        if (sendAllAlreadyHandled) {
+          throw new Error("__SKIP_STRICT_LOOKUP__");
+        }
         const strictResult = await getDocumentStrict({
           project,
           docType: docTypeFromMsg,
@@ -1678,7 +1726,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           });
         }
       } catch (err: any) {
-        console.error(`[Periskope Webhook] doc routing threw: ${err.message}`);
+        // Sentinel from the strict-lookup-skip path — not a real error,
+        // just signals SEND-ALL already shipped the docs. Swallow silently.
+        if (err && err.message === "__SKIP_STRICT_LOOKUP__") {
+          console.log(`[Periskope Webhook] Strict lookup skipped — SEND-ALL handled ${docTypeFromMsg}`);
+        } else {
+          console.error(`[Periskope Webhook] doc routing threw: ${err.message}`);
         await logDocSend({
           phone,
           project,
@@ -1691,6 +1744,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           block_reason: err.message,
           sizes_in_reply: [],
         });
+        }
       }
     }
 

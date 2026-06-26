@@ -291,10 +291,24 @@ export async function handleLeadCreated(input: OnLeadCreatedInput): Promise<{
     }),
   ]);
 
-  // 3. Bump chatbot counter. Voice-call scheduling under v3 is owned
-  //    entirely by the posthook (writes Next_Call_At + Call_Status), so
-  //    no SS-side counter to bump here.
-  await incrementChatbotAttempt(input.zoho_lead_id, input.lead || {});
+  // 3. Bump chatbot counter ONLY if the WhatsApp send actually succeeded.
+  //    Previously this incremented unconditionally — when Periskope was
+  //    down (all senders dead, account issue), the counter would still
+  //    climb to the 50-attempt safety cap with zero actual messages
+  //    delivered, and cron would think the lead was exhausted. Silent
+  //    funnel failure. Now: chatbot.ok = false means no message went,
+  //    so counter stays put and cron will retry on the next tick.
+  //
+  //    Voice-call scheduling under v3 is owned entirely by the posthook
+  //    (writes Next_Call_At + Call_Status), so no SS-side counter here.
+  if (chatbot.ok) {
+    await incrementChatbotAttempt(input.zoho_lead_id, input.lead || {});
+  } else {
+    console.warn(
+      `[PRD Orch] T=0 chatbot send FAILED for lead ${input.zoho_lead_id} ` +
+      `(error=${chatbot.error || "unknown"}). Counter NOT bumped — will retry next cron tick.`,
+    );
+  }
 
   console.log(
     `[PRD Orch] T=0 fanout for lead ${input.zoho_lead_id} — ` +
@@ -370,6 +384,11 @@ export async function handleChatbotFollowupTick(opts: {
   const r = await fireChatbotMessage(opts.phone, msg, opts.project);
   if (r.ok) {
     await incrementChatbotFollowup(opts.zoho_lead_id, opts.lead);
+  } else {
+    console.warn(
+      `[PRD Orch] Cold follow-up send FAILED for lead ${opts.zoho_lead_id} ` +
+      `(error=${r.error || "unknown"}). Counter NOT bumped — will retry next cron tick.`,
+    );
   }
 }
 

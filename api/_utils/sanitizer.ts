@@ -20,6 +20,18 @@ const BANNED_PATTERNS: Array<RegExp> = [
   /\bhappy\s+to\s+help[^.!?\n]*[.!?\n]?/gi,
   // "It would be my pleasure to ..."
   /\bit\s+(would|will)\s+be\s+my\s+pleasure\s+to\s+[^.!?\n]*[.!?\n]/gi,
+  // 2026-06-19 additions: more corporate / formal AI tells. These were
+  // slipping past the original 7 patterns. Each is anchored on the
+  // characteristic phrase + trailing punctuation/newline.
+  /\bas\s+discussed\b[^.!?\n]*[.!?\n]?/gi,
+  /\bas\s+per\s+(my|our)\s+(records?|discussion|conversation)\b[^.!?\n]*[.!?\n]?/gi,
+  /\bkindly\s+(note|revert|confirm|advise|share|let\s+(me|us)\s+know)\b[^.!?\n]*[.!?\n]?/gi,
+  /\bi\s+would\s+(inform|like\s+to\s+inform|be\s+(delighted|happy))\b[^.!?\n]*[.!?\n]?/gi,
+  /\bplease\s+find\s+(attached|below|herewith|the\s+attached)\b[^.!?\n]*[.!?\n]?/gi,
+  /\bawaiting\s+your\s+(confirmation|response|reply|reverts?)\b[^.!?\n]*[.!?\n]?/gi,
+  /\bwith\s+(regards?|reference)\s+to\s+your\b[^.!?\n]*[.!?\n]?/gi,
+  /\bnoted\s+(with\s+thanks|your\s+(request|query)|the\s+same|duly)\b[^.!?\n]*[.!?\n]?/gi,
+  /\b(duly|gratefully)\s+noted\b[^.!?\n]*[.!?\n]?/gi,
 ];
 
 /**
@@ -93,12 +105,24 @@ export function sanitizeReply(text: string): string {
     out = out.replace(pattern, "");
   }
 
-  // ── 3. Cleanup whitespace and orphan punctuation ──────────────────────
+  // ── 3. Replace em-dash + en-dash with comma+space ─────────────────────
+  // The em-dash (—) is the single biggest AI tell on WhatsApp — humans
+  // almost never type it on a phone. Substituting with comma keeps the
+  // rhythm but removes the giveaway.
+  out = out
+    .replace(/\s*—\s*/g, ", ")  // em-dash
+    .replace(/\s*–\s*/g, ", ")  // en-dash
+    .replace(/(\w)\s*--\s*(\w)/g, "$1, $2");  // double-hyphen used as em-dash
+
+  // ── 4. Cleanup whitespace and orphan punctuation ──────────────────────
   out = out
     .replace(/[ \t]{2,}/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .replace(/\s+([.,!?;:])/g, "$1")
     .replace(/([.,!?;:]){2,}/g, "$1")
+    // After em-dash → comma replacement, we sometimes get ", ," sequences.
+    .replace(/,\s*,/g, ",")
+    .replace(/^\s*,\s*/, "")  // leading comma after stripped phrase
     .trim();
 
   return out;

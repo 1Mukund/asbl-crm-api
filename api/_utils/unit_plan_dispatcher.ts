@@ -261,13 +261,19 @@ export async function dispatchUnitPlan(
 }
 
 /** Build a friendly clarification message to send to the customer when
- *  decision = "ambiguous". Kept Anandita-style (Sir/Ma'am, conversational).
+ *  decision = "ambiguous". Three rotating openers + NO em-dashes + inline
+ *  format (instead of bullets, since real RMs don't text bullet lists).
  *
  *  DEFENSIVE NORMALISATION: callers historically passed objects like
- *  { size_label: "..." } here, which template-literal-stringified as
+ *  { size_label: "..." } here which template-literal-stringified as
  *  "[object Object]" in the bullet list. We now normalise each option to a
- *  string (favouring size_label) before rendering so that bug can never
- *  resurface even if a future caller passes the wrong shape. */
+ *  plain string (favouring size_label) before rendering, so that bug
+ *  cannot resurface even if a future caller passes the wrong shape. */
+const CLARIFICATION_OPENERS = [
+  "Got it, quick check before I send. We have a few",
+  "Sure, just so I send the right one. There are a few",
+  "Yep, but we have a few",
+];
 export function buildClarificationMessage(
   project: string,
   docType: "unit_plan" | "floor_plan" | "price_sheet",
@@ -282,15 +288,15 @@ export function buildClarificationMessage(
     .map((o) => {
       if (o == null) return "";
       if (typeof o === "string") return o.trim();
-      // Object — favour size_label, then label, then fall back to JSON
       const obj = o as { size_label?: string | null; label?: string | null };
       return String(obj.size_label || obj.label || "").trim();
     })
     .filter((s) => s.length > 0);
-  const list = normalised.map((o) => `• ${o}`).join("\n");
-  return (
-    `Sure Sir, just to send the right one — we have a few ${docLabel}s for ${project}:\n\n` +
-    `${list}\n\n` +
-    `Which one would you like me to send?`
-  );
+  const inlineList =
+    normalised.length === 0 ? ""
+    : normalised.length === 1 ? normalised[0]
+    : normalised.length === 2 ? `${normalised[0]} and ${normalised[1]}`
+    : `${normalised.slice(0, -1).join(", ")}, and ${normalised[normalised.length - 1]}`;
+  const opener = CLARIFICATION_OPENERS[Math.floor(Math.random() * CLARIFICATION_OPENERS.length)];
+  return `${opener} ${docLabel}s for ${project}: ${inlineList}. Which one do you need?`;
 }

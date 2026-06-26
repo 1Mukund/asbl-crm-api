@@ -254,11 +254,38 @@ async function runPrdCadenceProcessor(): Promise<{
       return { ms: Date.now() - start, scanned: 0, chatbot_ticks: 0, ss_call_ticks: 0, no_reply_transitions: 0, exhaustion_closes: 0, errors: [] };
     }
 
+    // Per-phone bot kill-switch lookup. The inbound webhook respects
+    // user_profiles.bot_enabled = false, but the cron historically did
+    // not. So sales would toggle a lead's bot OFF via the dashboard and
+    // inbound replies would stop, but unsolicited cron follow-ups would
+    // keep firing. Fixed 2026-06-19 by pre-fetching the disabled set
+    // and skipping those phones below.
+    let disabledPhones = new Set<string>();
+    try {
+      const { getCollection, COL } = await import("../_utils/mongo");
+      const upCol = await getCollection(COL.USER_PROFILES);
+      const disabledDocs = await upCol.find({ bot_enabled: false as any }, { projection: { phone: 1 } as any }).toArray();
+      disabledPhones = new Set(
+        disabledDocs.map((d: any) => String(d.phone || d._id || "").replace(/\D/g, "")).filter(Boolean),
+      );
+      if (disabledPhones.size > 0) {
+        console.log(`[PRD cron] Bot kill-switch: ${disabledPhones.size} phones will be skipped this tick`);
+      }
+    } catch (err: any) {
+      console.error(`[PRD cron] bot_enabled lookup failed: ${err.message}`);
+    }
+
     for (const lead of leads) {
       if (!lead.PRD_Stage) continue;            // not on PRD flow yet
       if (lead.PRD_Stage === "Not Interested") continue;
       if (lead.PRD_Stage === "Spam") continue;             // sales-marked spam — never follow up
       if (lead.PRD_Stage === "Pre Site Visit") continue;  // reminder cron is separate concern
+
+      // Bot kill-switch — skip phones where sales has disabled the bot.
+      const leadPhoneNorm = String(lead.Phone || lead.Mobile || "").replace(/\D/g, "");
+      if (leadPhoneNorm && disabledPhones.has(leadPhoneNorm)) {
+        continue;
+      }
 
       // 7-DAY SILENCE AUTO-STOP — if a lead was created more than 7 days ago
       // and we've had ZERO inbound + ZERO connected calls, stop bothering them.
@@ -334,10 +361,22 @@ async function runPrdCadenceProcessor(): Promise<{
               const dates = Object.keys(phoneDoc.by_date).sort().reverse();
               for (const dk of dates) {
                 const dayBucket = (phoneDoc.by_date[dk] as any) || {};
+                // parseTs accepts ISO strings, numeric ms, and ms-as-string.
+                // Returns 0 for unparseable values so the gate logic doesn't
+                // crash on malformed history rows.
+                const parseTs = (raw: any): number => {
+                  if (raw == null) return 0;
+                  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+                  const asNum = Number(raw);
+                  if (Number.isFinite(asNum) && asNum > 1_000_000_000_000) return asNum;
+                  const d = new Date(raw);
+                  const t = d.getTime();
+                  return Number.isFinite(t) ? t : 0;
+                };
                 if (lastOutboundMs === 0) {
                   const outArr = dayBucket.outbound || [];
                   for (let i = outArr.length - 1; i >= 0; i--) {
-                    const t = new Date(outArr[i]?.time || 0).getTime();
+                    const t = parseTs(outArr[i]?.time);
                     if (t > lastOutboundMs) lastOutboundMs = t;
                     if (lastOutboundMs > 0) break;
                   }
@@ -345,7 +384,7 @@ async function runPrdCadenceProcessor(): Promise<{
                 if (lastInboundMs === 0) {
                   const inArr = dayBucket.inbound || [];
                   for (let i = inArr.length - 1; i >= 0; i--) {
-                    const t = new Date(inArr[i]?.time || 0).getTime();
+                    const t = parseTs(inArr[i]?.time);
                     if (t > lastInboundMs) {
                       lastInboundMs = t;
                       lastInboundText = String(inArr[i]?.message || "");
