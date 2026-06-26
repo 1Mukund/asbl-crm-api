@@ -20,7 +20,7 @@
  */
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { resolveProject, detectMultiProjectIntent, Project } from "../_utils/project_detection";
-import { getProjectFacts } from "../_utils/project_facts";
+import { getProjectFacts, getPortfolioOverview } from "../_utils/project_facts";
 import { getInventoryForProject, getCrossProjectSizeIndex } from "../_utils/inventory_sheet";
 import { getConversationContext } from "../_utils/conversation_context";
 import { sanitizeReply, stripReintroduction } from "../_utils/sanitizer";
@@ -488,8 +488,19 @@ function isInbound(data: any): boolean {
 
 // ── Resolve project context text — manual KB notes + LIVE inventory sheet ─
 async function getProjectContextText(project: Project | null): Promise<string> {
-  if (!project) return "no specific project resolved";
-  if (project === "LEGACY") return LEGACY_TEASER;
+  // ALWAYS lead with the authoritative cross-project status so the bot never
+  // fabricates possession / ready-to-move answers, regardless of which single
+  // project's KB is in context (or none).
+  let portfolioHeader = "";
+  try {
+    const po = await getPortfolioOverview();
+    if (po) portfolioHeader = `## ASBL PORTFOLIO STATUS (authoritative — applies to EVERY reply)\n${po}\n\n`;
+  } catch { /* non-fatal */ }
+
+  if (!project) {
+    return portfolioHeader + "No specific project resolved yet. Use the portfolio status above; if the customer's need points to a specific project, talk about that one and ask their area / budget / timeline.";
+  }
+  if (project === "LEGACY") return portfolioHeader + LEGACY_TEASER;
 
   // KB + offer (one row read) and live inventory fetch in parallel —
   // both can take 200-500ms independently. Saves ~400ms in cold/cache-miss path.
@@ -527,7 +538,7 @@ async function getProjectContextText(project: Project | null): Promise<string> {
   }
 
   if (parts.length === 0) {
-    return `No knowledge base or inventory available for ${project} yet. Tell the customer you'll have a sales executive revert with details.`;
+    return portfolioHeader + `No detailed knowledge base or inventory loaded for ${project} yet. Use the portfolio status above for status/possession; for specifics, tell the customer you'll have the team revert with exact details rather than guessing.`;
   }
 
   // 4. PDF document extracts — fallback KB when curated text doesn't have it.
@@ -571,7 +582,8 @@ async function getProjectContextText(project: Project | null): Promise<string> {
 
   const combined = parts.join("\n").trim();
   // Trim to ~24 KB to keep prompt size reasonable (PDFs added headroom)
-  return combined.length > 24000 ? combined.slice(0, 24000) + "\n... (truncated)" : combined;
+  const body = combined.length > 24000 ? combined.slice(0, 24000) + "\n... (truncated)" : combined;
+  return portfolioHeader + body;
 }
 
 // ── Fetch + format PDF extracts for a single project (Phase 6: Mongo) ─────

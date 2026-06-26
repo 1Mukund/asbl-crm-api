@@ -145,3 +145,48 @@ export async function saveProjectKb(
     return { ok: false, error: err.message };
   }
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// ASBL PORTFOLIO — authoritative cross-project status.
+//
+// The per-project PROJECT_CONTEXT only ever contains ONE project's data, so
+// the bot has no reliable way to answer "which project is ready to move?"
+// and was FABRICATING answers ("all our projects are under construction" —
+// which is false, Spectra is ready-to-move). This block is injected into
+// EVERY message so the bot always has the hard, ground-truth status of all
+// projects: possession dates + ready-to-move flag.
+//
+// Stored in bot_settings.portfolio_overview (Mongo) so it is editable from
+// the dashboard without a code deploy. Falls back to the seed below.
+// ───────────────────────────────────────────────────────────────────────────
+export const DEFAULT_PORTFOLIO_OVERVIEW = `ASBL PROJECT PORTFOLIO — AUTHORITATIVE STATUS (ground truth; use this for ANY ready-to-move / possession / "which project" question; NEVER contradict it; NEVER state a possession date that is not listed here):
+
+- SPECTRA — READY TO MOVE IN. This is THE project to offer when a customer wants ready-to-move / ready possession / immediate move-in.
+- BROADWAY — Under construction, possession December 2029. NOT ready-to-move.
+- LOFT — Under construction. (Confirm the exact possession quarter before quoting a date.)
+- LANDMARK — Under construction. (Confirm the exact possession quarter before quoting a date.)
+
+HARD RULES:
+- If the customer asks for "ready to move", "ready to move in", "ready possession", or "immediate possession", LEAD WITH SPECTRA by name and offer it. Do NOT say "all our projects are under construction" — that is FALSE.
+- Only ever state a possession date that appears above. If a project's exact date is not listed, say you'll confirm and revert rather than guessing.
+- Never claim Spectra is under construction. Spectra is ready-to-move.`;
+
+let _portfolioCache: { val: string; at: number } | null = null;
+const PORTFOLIO_TTL_MS = 60_000;
+
+/** Authoritative cross-project status block, injected into every message.
+ *  Reads bot_settings.portfolio_overview (editable from the dashboard);
+ *  falls back to DEFAULT_PORTFOLIO_OVERVIEW. Cached 60s. */
+export async function getPortfolioOverview(): Promise<string> {
+  if (_portfolioCache && Date.now() - _portfolioCache.at < PORTFOLIO_TTL_MS) {
+    return _portfolioCache.val;
+  }
+  let val = DEFAULT_PORTFOLIO_OVERVIEW;
+  try {
+    const { getBotSetting } = await import("./bot_settings");
+    const row = await getBotSetting("portfolio_overview");
+    if (row?.value && row.value.trim().length > 30) val = row.value.trim();
+  } catch { /* fall back to default */ }
+  _portfolioCache = { val, at: Date.now() };
+  return val;
+}

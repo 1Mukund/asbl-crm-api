@@ -1579,7 +1579,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "send-doc-test", "audit-project-docs", "export-all-kb",
       "sync-prompt-to-hardcoded", "mark-unique-leads",
       "zoho-create-unique-lead-field", "zoho-create-call-scheduling-fields",
-      "periskope-doc-diag",
+      "periskope-doc-diag", "portfolio-get", "portfolio-save",
     ]);
     const incomingSecretTop =
       (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
@@ -2114,18 +2114,22 @@ ${SHARED_STYLE}
         return res.status(400).json({ error: `Unsupported mimetype: ${mimeType}` });
       }
 
-      // Upload original to storage (for backup / reference)
-      const upload = await uploadToStorage({
-        project,
-        docType: "kb_source",
-        filename,
-        mimeType,
-        base64Content: base64,
-      });
+      // Store the original source file in Mongo GridFS (NOT Supabase) for
+      // reference/backup. The bot only ever uses extractedText (kb_text), so
+      // even if this fails the KB still works — but GridFS keeps us off any
+      // external store. Best-effort; never block the KB save on it.
+      let kbPdfUrl = "";
+      try {
+        const { storeFile, fileServeUrl } = await import("./_utils/mongo_files");
+        const fid = await storeFile(decodeBase64Buffer(base64), filename, mimeType, { project, kind: "kb_source" });
+        kbPdfUrl = fileServeUrl(fid);
+      } catch (e: any) {
+        console.warn(`[upload-kb] source-file store failed (non-fatal): ${e.message}`);
+      }
 
-      // Save extracted KB text + PDF URL into project_facts.kb_text
+      // Save extracted KB text + source URL into project_facts.kb_text
       // (kept SEPARATE from facts_text so curated OFFER details are never overwritten)
-      const saveResult = await saveProjectKb(project, extractedText, upload.publicUrl);
+      const saveResult = await saveProjectKb(project, extractedText, kbPdfUrl);
       if (!saveResult.ok) {
         return res.status(500).json({ error: `Save failed: ${saveResult.error}` });
       }
@@ -2134,7 +2138,7 @@ ${SHARED_STYLE}
         ok: true,
         project,
         extractedChars: extractedText.length,
-        publicUrl: upload.publicUrl,
+        publicUrl: kbPdfUrl,
       });
     } catch (err: any) {
       console.error(`[upload-kb] failed: ${err.message}`);
@@ -5640,6 +5644,42 @@ ${SHARED_STYLE}
       });
     } catch (err: any) {
       console.error(`[upload-finalize] failed: ${err.message}`);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── ASBL PORTFOLIO STATUS (authoritative cross-project status) ─────────
+  //   The bot injects this into EVERY message so it never fabricates
+  //   ready-to-move / possession answers. Editable here without a deploy.
+  //   GET  ?action=portfolio-get                 -> current text (DB or default seed)
+  //   POST ?action=portfolio-save  { text }      -> set bot_settings.portfolio_overview
+  if (req.method === "GET" && req.query.action === "portfolio-get") {
+    try {
+      const { getBotSetting } = await import("./_utils/bot_settings");
+      const { DEFAULT_PORTFOLIO_OVERVIEW } = await import("./_utils/project_facts");
+      const row = await getBotSetting("portfolio_overview");
+      const isCustom = !!(row?.value && row.value.trim().length > 30);
+      return res.status(200).json({
+        ok: true,
+        source: isCustom ? "dashboard_db" : "default_seed",
+        text: isCustom ? row!.value : DEFAULT_PORTFOLIO_OVERVIEW,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+  if (req.method === "POST" && req.query.action === "portfolio-save") {
+    try {
+      const body = (typeof req.body === "object" && req.body) ? req.body as any : parseFormBody(req.body);
+      const text = String(body.text || body.portfolio || "").trim();
+      if (text.length < 30) {
+        return res.status(400).json({ error: "Portfolio text too short (min 30 chars)." });
+      }
+      const { setBotSetting } = await import("./_utils/bot_settings");
+      const result = await setBotSetting("portfolio_overview", text);
+      if (!result.ok) return res.status(500).json({ error: result.error });
+      return res.status(200).json({ ok: true, saved_chars: text.length, note: "Live within 60s (portfolio cache TTL)." });
+    } catch (err: any) {
       return res.status(500).json({ error: err.message });
     }
   }
