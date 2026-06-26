@@ -1555,6 +1555,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "export-all-kb",
     ]);
     const ADMIN_ONLY = new Set(["audit", "users", "approve-user", "reject-user"]);
+    // Actions that are session-gated for dashboard use BUT also accept a
+    // valid ?secret=INHOUSE_POSTHOOK_SECRET for curl/automation. Their own
+    // handlers do a (session OR secret) check; the top gate must therefore
+    // let a valid secret pass instead of short-circuiting with 401.
+    // Bug R5 (2026-06-26): send-doc-test / audit-project-docs / export-all-kb
+    // were in DASHBOARD_ACTIONS, so the top gate demanded a session and
+    // returned 401 on a valid secret before the handler ever ran.
+    const SECRET_CAPABLE_ACTIONS = new Set([
+      "send-doc-test", "audit-project-docs", "export-all-kb",
+      "sync-prompt-to-hardcoded", "mark-unique-leads",
+      "zoho-create-unique-lead-field", "zoho-create-call-scheduling-fields",
+    ]);
+    const incomingSecretTop =
+      (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecretTop = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    const hasValidSecret = !!expectedSecretTop && incomingSecretTop === expectedSecretTop;
 
     // ── Public auth endpoints (no session needed) ──
     if (req.method === "GET" && view === "login") {
@@ -1595,7 +1611,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // ── Gate dashboard surfaces ──
     const needsAuth = DASHBOARD_VIEWS.has(view) || DASHBOARD_ACTIONS.has(action);
-    if (needsAuth) {
+    // A valid shared secret bypasses the session requirement, but ONLY for
+    // actions explicitly marked secret-capable (so curl/automation works
+    // while real dashboard form actions like save-prompt still need a login).
+    const secretBypassesGate = hasValidSecret && SECRET_CAPABLE_ACTIONS.has(action);
+    if (needsAuth && !secretBypassesGate) {
       if (!session) {
         if (req.method === "GET") {
           res.setHeader("Location", `?view=login&msg=${encodeURIComponent("Please log in")}`);

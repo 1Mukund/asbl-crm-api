@@ -199,11 +199,23 @@ export async function sendDocumentTool(opts: {
   } else if (!isMulti) {
     // Single-slot doc type — always returns the most recently uploaded row.
     chosen = [rows[0]];
+  } else if (rows.length === 1) {
+    // CRITICAL FIX (R1, 2026-06-26): a multi-slot doc_type (price_sheet /
+    // floor_plan / unit_plan) that has exactly ONE uploaded row is NOT
+    // ambiguous — there is only one thing we could possibly send. The old
+    // code fell into the scoring branch below, scored the single row 0
+    // (no hint), and returned AMBIGUOUS → bot asked "which one: Spectra"
+    // with a single option. Just send it.
+    chosen = [rows[0]];
+  } else if (rows.some((r) => (r as any).applies_to_all === true)) {
+    // A row flagged applies_to_all covers every config for this doc_type
+    // (e.g. one price sheet for the whole project). Send that one.
+    const allRow = rows.find((r) => (r as any).applies_to_all === true);
+    chosen = allRow ? [allRow] : [rows[0]];
   } else {
-    // Multi-slot with disambiguation hint(s). Score rows; if a clear
-    // winner (highest score > 0 AND unique) → send that. If multiple
-    // tie at the top score → ambiguous. If all score 0 (no hint at all)
-    // → ambiguous, offer the variants.
+    // Multi-slot, multiple rows. Score by disambiguation hint(s); a clear
+    // unique winner (highest score > 0) → send. No hint or a tie → AMBIGUOUS,
+    // surface the options for the caller to ask which one.
     const scored = rows
       .map((r) => ({ r, s: scoreRow(r, opts.request) }))
       .sort((a, b) => b.s - a.s);
