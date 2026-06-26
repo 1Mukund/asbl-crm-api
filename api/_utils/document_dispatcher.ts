@@ -240,21 +240,25 @@ export async function getDocumentFor(
   return null;
 }
 
-// 10-sender pool — kept in sync with prd_orchestrator + resubmission. Used
-// by sendDocViaPeriskope to fall through to a working sender when the
-// caller's sticky sender is dead.
-const DOC_SENDER_POOL = [
-  "919063141693",
-  "917794028484",
-  "917396077334",
-  "919059555164",
-  "918977537630",
-  "917207048181",
-  "917396130606",
-  "917386023002",
-  "919247524774",
-  "917995284040",
+// Sender pool. PROVEN-PARITY with the calling agent (2026-06-26): the
+// calling agent reads its connected Periskope numbers from an env var, so
+// when the connected set changes there's no code edit. The WhatsApp bot
+// used to hardcode 10 numbers — if those drifted from the actually-connected
+// Periskope phones, EVERY x-phone became invalid and docs silently failed
+// (the "kuch nahi jaata" symptom). Now: read PERISKOPE_SENDERS (comma or
+// space separated) first; fall back to the hardcoded list only if unset.
+// Set PERISKOPE_SENDERS in Vercel to the SAME value the calling agent uses
+// on Render to guarantee the senders are live.
+const HARDCODED_DOC_SENDERS = [
+  "919063141693", "917794028484", "917396077334", "919059555164",
+  "918977537630", "917207048181", "917396130606", "917386023002",
+  "919247524774", "917995284040",
 ];
+const DOC_SENDER_POOL = (() => {
+  const raw = process.env.PERISKOPE_SENDERS || "";
+  const parsed = raw.split(/[\s,]+/).map((s) => s.replace(/\D/g, "")).filter((s) => s.length >= 10);
+  return parsed.length ? parsed : HARDCODED_DOC_SENDERS;
+})();
 
 function isDeadSenderErr(status: number, body: string): boolean {
   const b = (body || "").toLowerCase();

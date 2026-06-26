@@ -1566,6 +1566,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "send-doc-test", "audit-project-docs", "export-all-kb",
       "sync-prompt-to-hardcoded", "mark-unique-leads",
       "zoho-create-unique-lead-field", "zoho-create-call-scheduling-fields",
+      "periskope-doc-diag",
     ]);
     const incomingSecretTop =
       (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
@@ -6688,6 +6689,99 @@ ${SHARED_STYLE}
         },
         results: results.slice(0, 200),  // cap response size
         truncated_to: results.length > 200 ? 200 : null,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── periskope-doc-diag — RAW Periskope doc-send probe. Bypasses ALL bot
+  //     logic (no Gemini, no doc tool, no scoring). Hits Periskope directly
+  //     and returns the EXACT HTTP status + body per (sender, endpoint) so we
+  //     can see the real failure: 401 = bad key/sender, 4xx media error = bad
+  //     URL, 200 = Periskope is fine (problem is upstream logic).
+  //
+  //   POST /api/chat-history?action=periskope-doc-diag&secret=<...>
+  //     body: { phone, url?, sender?, all_senders?: true }
+  //   If url omitted, uses the first Spectra brochure from project_documents.
+  if (req.method === "POST" && req.query.action === "periskope-doc-diag") {
+    const session = (req as any)._session;
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!session && (!expectedSecret || incomingSecret !== expectedSecret)) {
+      return res.status(401).json({ error: "Unauthorized — log in OR pass ?secret=..." });
+    }
+    try {
+      const body = (req.body || {}) as any;
+      const phone = String(body.phone || "").replace(/^\+/, "").replace(/\D/g, "");
+      if (phone.length < 10) return res.status(400).json({ error: "valid phone required" });
+      const apiKey = process.env.PERISKOPE_API_KEY || "";
+      const keyPresent = !!apiKey;
+
+      // Resolve sender list
+      const sendersEnv = (process.env.PERISKOPE_SENDERS || "").split(/[\s,]+/).map((s) => s.replace(/\D/g, "")).filter((s) => s.length >= 10);
+      const hardcoded = ["919063141693","917794028484","917396077334","919059555164","918977537630","917207048181","917396130606","917386023002","919247524774","917995284040"];
+      const senderSource = sendersEnv.length ? "PERISKOPE_SENDERS env" : "hardcoded";
+      const pool = sendersEnv.length ? sendersEnv : hardcoded;
+      const senders = body.sender ? [String(body.sender).replace(/\D/g, "")] : (body.all_senders ? pool : [pool[0]]);
+
+      // Resolve a test PDF url
+      let url = String(body.url || "");
+      let urlSource = "provided";
+      if (!url) {
+        const { getCollection, COL } = await import("./_utils/mongo");
+        const col = await getCollection(COL.PROJECT_DOCUMENTS);
+        const doc = await col.findOne({ project: { $regex: /spectra/i } as any, doc_type: "brochure" } as any);
+        url = String((doc as any)?.url || "");
+        urlSource = doc ? "spectra brochure from project_documents" : "(none found)";
+      }
+      if (!url) return res.status(400).json({ error: "no url provided and no spectra brochure in project_documents" });
+
+      const endpoints = [
+        "https://api.periskope.app/v1/message/send",
+        "https://api.periskope.app/v1/messages/send",
+      ];
+      const chatId = `${phone}@c.us`;
+      const payload = {
+        chat_id: chatId,
+        message: "ASBL test document",
+        media: { type: "document", filename: "test.pdf", mimetype: "application/pdf", url },
+      };
+
+      const attempts: any[] = [];
+      let delivered = false;
+      for (const s of senders) {
+        for (const ep of endpoints) {
+          try {
+            const r = await fetch(ep, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, "x-phone": s },
+              body: JSON.stringify(payload),
+            });
+            const txt = (await r.text()).slice(0, 500);
+            attempts.push({ sender: s, endpoint: ep, status: r.status, ok: r.ok, body: txt });
+            if (r.ok) { delivered = true; break; }
+          } catch (err: any) {
+            attempts.push({ sender: s, endpoint: ep, status: 0, ok: false, body: `THREW: ${err.message}` });
+          }
+        }
+        if (delivered) break;
+      }
+
+      return res.status(200).json({
+        ok: true,
+        delivered,
+        diagnosis: !keyPresent ? "PERISKOPE_API_KEY is MISSING on this deployment"
+          : delivered ? "Periskope send WORKS — any failure is in upstream bot logic, not the Periskope client"
+          : attempts.some((a) => a.status === 401) ? "401 from Periskope — API key invalid OR sender(s) not connected. Check PERISKOPE_API_KEY + that the x-phone numbers are live in Periskope."
+          : attempts.some((a) => /media|url|fetch|download/i.test(a.body)) ? "Periskope rejected the media URL — the PDF URL may not be publicly fetchable (signed/expired/private)."
+          : "All attempts failed — see attempts[] for the exact Periskope responses.",
+        key_present: keyPresent,
+        sender_source: senderSource,
+        senders_tried: senders,
+        url_source: urlSource,
+        test_url: url,
+        attempts,
       });
     } catch (err: any) {
       return res.status(500).json({ error: err.message });
