@@ -927,69 +927,57 @@ function pickMulti(project, docType, title) {
   _fileInput.click();
 }
 
+function _fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => { const s = String(r.result || ''); resolve(s.slice(s.indexOf(',') + 1)); };
+    r.onerror = () => reject(new Error('file read failed'));
+    r.readAsDataURL(file);
+  });
+}
+
 async function uploadFile(ctx, file, btn) {
-  if (file.size > 50 * 1024 * 1024) { alert('File too large (max 50 MB)'); return; }
+  // Files now go to Mongo GridFS via our own endpoint (no Supabase). The
+  // base64 POST goes through Vercel, which caps the request body at ~4.5 MB,
+  // so the raw file must be under ~3.3 MB. Floor plans / unit plans / price
+  // sheets are well within this; very large brochures should be compressed.
+  if (file.size > 3.3 * 1024 * 1024) {
+    alert('File is ' + (file.size/1024/1024).toFixed(1) + ' MB. Max ~3.3 MB per file (server limit). Please compress the PDF and try again.');
+    return;
+  }
   const oldText = btn?.textContent;
-  if (btn) { btn.disabled = true; btn.textContent = 'Signing…'; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Reading…'; }
 
   const isKb = ctx.kind === 'kb';
   const mimetype = file.type || (file.name.toLowerCase().endsWith('.pdf') ? 'application/pdf' : 'text/plain');
 
   try {
-    // 1. Get signed upload URL from our backend
-    const signReq = { project: ctx.project, filename: file.name, is_kb: isKb };
-    if (!isKb) {
-      signReq.doc_type = ctx.docType;
-      if (ctx.sizeLabel) signReq.size_label = ctx.sizeLabel;
-      if (ctx.unit_size_sft !== undefined) signReq.unit_size_sft = ctx.unit_size_sft;
-      if (ctx.facing !== undefined) signReq.facing = ctx.facing;
-      if (ctx.tower !== undefined) signReq.tower = ctx.tower;
-      if (ctx.applies_to_all !== undefined) signReq.applies_to_all = ctx.applies_to_all;
-    }
-    const signRes = await fetch('?action=upload-sign', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(signReq),
-    });
-    const sign = await signRes.json();
-    if (!signRes.ok || !sign.ok) throw new Error(sign.error || 'sign failed');
+    const base64 = await _fileToBase64(file);
+    if (btn) btn.textContent = isKb ? 'Extracting…' : 'Uploading…';
 
-    // 2. PUT file directly to Supabase storage (bypasses Vercel body limit)
-    if (btn) btn.textContent = 'Uploading…';
-    const putRes = await fetch(sign.uploadPath, {
-      method: 'PUT',
-      headers: { 'Content-Type': mimetype, 'x-upsert': 'true' },
-      body: file,
-    });
-    if (!putRes.ok) {
-      const errText = await putRes.text().catch(() => '');
-      throw new Error('Storage upload ' + putRes.status + ': ' + errText.slice(0, 200));
+    if (isKb) {
+      const r = await fetch('?action=upload-kb', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project: ctx.project, filename: file.name, mimetype, base64_content: base64 }),
+      });
+      const j = await r.json();
+      if (!r.ok || !j.ok) throw new Error(j.error || 'kb upload failed');
+      alert('KB uploaded: ' + (j.extractedChars || j.text_extract_chars || '?') + ' chars extracted for ' + ctx.project);
+    } else {
+      const docReq = { project: ctx.project, doc_type: ctx.docType, filename: file.name, mimetype, base64_content: base64 };
+      if (ctx.sizeLabel) docReq.size_label = ctx.sizeLabel;
+      if (ctx.unit_size_sft !== undefined) docReq.unit_size_sft = ctx.unit_size_sft;
+      if (ctx.facing !== undefined) docReq.facing = ctx.facing;
+      if (ctx.tower !== undefined) docReq.tower = ctx.tower;
+      if (ctx.applies_to_all !== undefined) docReq.applies_to_all = ctx.applies_to_all;
+      const r = await fetch('?action=upload-doc', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(docReq),
+      });
+      const j = await r.json();
+      if (!r.ok || !j.ok) throw new Error(j.error || 'doc upload failed');
+      alert(ctx.label + ' uploaded for ' + ctx.project + ' (stored in Mongo, ' + (j.text_extract_chars || 0) + ' chars extracted)');
     }
-
-    // 3. Finalize — record metadata + (for KB) extract text
-    if (btn) btn.textContent = isKb ? 'Extracting…' : 'Saving…';
-    const finReq = {
-      project: ctx.project, filename: file.name, mimetype,
-      storage_path: sign.storagePath, public_url: sign.publicUrl, is_kb: isKb,
-    };
-    if (!isKb) {
-      finReq.doc_type = ctx.docType;
-      if (ctx.sizeLabel) finReq.size_label = ctx.sizeLabel;
-      if (ctx.unit_size_sft !== undefined) finReq.unit_size_sft = ctx.unit_size_sft;
-      if (ctx.facing !== undefined) finReq.facing = ctx.facing;
-      if (ctx.tower !== undefined) finReq.tower = ctx.tower;
-      if (ctx.applies_to_all !== undefined) finReq.applies_to_all = ctx.applies_to_all;
-    }
-    const finRes = await fetch('?action=upload-finalize', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(finReq),
-    });
-    const fin = await finRes.json();
-    if (!finRes.ok || !fin.ok) throw new Error(fin.error || 'finalize failed');
-
-    if (isKb) alert('KB uploaded: ' + fin.extractedChars + ' chars extracted for ' + ctx.project);
-    else alert(ctx.label + ' uploaded for ' + ctx.project);
     location.reload();
   } catch (err) {
     alert('Upload error: ' + err.message);
@@ -1527,6 +1515,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(200).end();
+
+  // ─── PUBLIC doc-file serve (BEFORE the auth gate) ───────────────────────
+  //   Streams a PDF stored in Mongo GridFS straight to the caller. Periskope
+  //   fetches this URL server-side to attach the document to a WhatsApp
+  //   message, so it MUST be public (no session, no secret) and return the
+  //   raw bytes with the right Content-Type. The id is an opaque GridFS
+  //   ObjectId, not guessable. This is what makes the bot independent of any
+  //   external object store (Supabase etc.).
+  //   GET /api/chat-history?action=doc-file&id=<gridfsId>
+  if (req.method === "GET" && req.query.action === "doc-file") {
+    try {
+      const id = String(req.query.id || "");
+      if (!id) return res.status(400).json({ error: "id required" });
+      const { getFile } = await import("./_utils/mongo_files");
+      const f = await getFile(id);
+      if (!f) return res.status(404).json({ error: "file not found" });
+      res.setHeader("Content-Type", f.contentType || "application/pdf");
+      res.setHeader("Content-Disposition", `inline; filename="${(f.filename || "document.pdf").replace(/"/g, "")}"`);
+      res.setHeader("Content-Length", String(f.buffer.length));
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      return res.status(200).send(f.buffer);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
 
   // ─── Dashboard authentication gate ──────────────────────────────────────
   // The HTML dashboard + its mutating form actions require a logged-in
@@ -2154,23 +2167,46 @@ ${SHARED_STYLE}
         return res.status(400).json({ error: `size_label required for ${docType} (e.g. "Tower A" / "1695 East")` });
       }
 
-      const upload = await uploadToStorage({
-        project,
-        docType,
-        filename,
-        mimeType,
-        base64Content: base64,
-        sizeLabel,
-      });
+      // Store the PDF binary in Mongo GridFS (NOT Supabase) and serve it from
+      // our own public endpoint. This removes the external-storage dependency
+      // that caused every doc to break when the Supabase project was deleted.
+      const { storeFile, fileServeUrl } = await import("./_utils/mongo_files");
+      const fileBuf = decodeBase64Buffer(base64);
+      const fileId = await storeFile(fileBuf, filename, mimeType, { project, doc_type: docType, size_label: sizeLabel });
+      const publicUrl = fileServeUrl(fileId);
 
-      // Insert row in project_documents (Phase 6: Mongo)
+      // Insert row in project_documents (metadata only; binary is in GridFS)
       const insertBody: any = {
         project,
         doc_type: docType,
         filename,
-        url: upload.publicUrl,
+        url: publicUrl,
+        file_id: fileId,
+        storage: "mongo_gridfs",
       };
       if (sizeLabel) insertBody.size_label = sizeLabel;
+      // Strict-lookup meta from the dashboard form (multi-slot docs)
+      if (body.unit_size_sft != null && body.unit_size_sft !== "") insertBody.unit_size_sft = Number(body.unit_size_sft);
+      if (body.facing) insertBody.facing = String(body.facing).toLowerCase();
+      if (body.tower) insertBody.tower = String(body.tower);
+      if (body.applies_to_all === true || body.applies_to_all === "true") insertBody.applies_to_all = true;
+
+      // Extract text from the PDF (binary already in memory) so it feeds the
+      // bot's KB / grounding. Best-effort — never block the upload on it.
+      let extractChars = 0;
+      try {
+        if ((mimeType || "").includes("pdf") || filename.toLowerCase().endsWith(".pdf")) {
+          const text = await extractTextFromPDF(fileBuf);
+          if (text && text.trim()) {
+            insertBody.text_extract = text.slice(0, 8000);
+            insertBody.text_extract_chars = text.length;
+            insertBody.text_extracted_at = new Date().toISOString();
+            extractChars = text.length;
+          }
+        }
+      } catch (err: any) {
+        console.warn(`[upload-doc] text extract failed (non-fatal): ${err.message}`);
+      }
 
       let insertedId: string;
       try {
@@ -2184,8 +2220,10 @@ ${SHARED_STYLE}
         project,
         docType,
         sizeLabel,
-        publicUrl: upload.publicUrl,
-        record: inserted,
+        storage: "mongo_gridfs",
+        publicUrl,
+        text_extract_chars: extractChars,
+        record: { ...inserted, text_extract: undefined },
       });
     } catch (err: any) {
       console.error(`[upload-doc] failed: ${err.message}`);
