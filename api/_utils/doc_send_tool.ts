@@ -172,6 +172,14 @@ export async function sendDocumentTool(opts: {
   // This is a hard safety net so we never return NOT_FOUND for that case.
   if (/spectra/i.test(cleanProject) && docType === "payment_structure") {
     docType = "price_sheet";
+    // If no specific size was given, the price_sheet lookup would be
+    // AMBIGUOUS (1980 vs 2220) and send NOTHING while the reply may already
+    // promise a document. Send BOTH price sheets so the customer always gets
+    // the pricing; the reply (per the portfolio rule) tells them the sales
+    // executive explains the payment structure at site.
+    if (opts.request.unit_size_sft == null && !opts.request.size_label) {
+      opts.request.send_all_variants = true;
+    }
   }
 
   const isMulti = MULTI_SLOT_TYPES.has(docType);
