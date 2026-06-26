@@ -1329,6 +1329,72 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         docTypeFromMsg === "floor_plan" ||
         docTypeFromMsg === "price_sheet";
 
+      // SEND-ALL-VARIANTS detection: when customer asks for "all", "saare",
+      // "har tower", "4 towers", "every variant" etc. of a multi-slot doc
+      // type, send each variant as a separate Periskope file instead of
+      // asking "which one?" QA bug 2026-06-19: customer asked for "Spectra
+      // ke 4 towers ka floor plan" and bot asked for clarification instead
+      // of just sending all 4. Cap at 8 sends per request to prevent abuse.
+      const wantsAllVariants = isMultiSlot && (
+        /\b(all|saare|saari|sari|har|sab|sare|every|each)\b/i.test(message) ||
+        /\b\d+\s*(towers?|sizes?|variants?|options?|units?|wings?)\b/i.test(message)
+      );
+      if (wantsAllVariants) {
+        const { findDocsByType } = await import("../_utils/project_documents");
+        const allRows = await findDocsByType(project, docTypeFromMsg, 50);
+        if (allRows && allRows.length > 0) {
+          const cap = 8;
+          const toSend = allRows.slice(0, cap);
+          const docLabelMap: Record<string, string> = {
+            floor_plan: "floor plan",
+            unit_plan: "unit plan",
+            price_sheet: "price sheet",
+          };
+          const docLabel = docLabelMap[docTypeFromMsg] || docTypeFromMsg;
+          // Send a short verbal acknowledgement first (the customer-facing
+          // reply) — then loop through and send each PDF.
+          const ack = `Sharing all ${toSend.length} ${docLabel}${toSend.length > 1 ? "s" : ""} for ${project} now${allRows.length > cap ? ` (top ${cap}; reply if you need the rest)` : ""}.`;
+          await saveMessage(phone, "outbound", ack, sender, project);
+          try { await sendReply(phone, sender, ack); } catch (err: any) {
+            console.error(`[Periskope Webhook] all-variants ack send failed: ${err.message}`);
+          }
+          let sentCount = 0;
+          for (const row of toSend) {
+            try {
+              const caption = `${project} ${row.size_label || docLabel}`.trim();
+              await sendDocViaPeriskope(phone, sender, row.url, row.filename || `${docLabel}.pdf`, caption);
+              sentCount++;
+            } catch (err: any) {
+              console.error(`[Periskope Webhook] variant send failed (${row.size_label}): ${err.message}`);
+            }
+          }
+          console.log(`[Periskope Webhook] SEND-ALL fired — ${sentCount}/${toSend.length} ${docTypeFromMsg} variants sent to ${phone}`);
+          await logDocSend({
+            phone,
+            project,
+            doc_type: docTypeFromMsg,
+            doc_meta: docMeta,
+            matched_url: null,
+            matched_file: null,
+            reply_text: ack,
+            outcome: "sent",
+            block_reason: null,
+            sizes_in_reply: toSend
+              .map((r) => Number(String(r.size_label || "").replace(/\D/g, "")))
+              .filter((n) => Number.isFinite(n) && n > 0),
+          });
+          docSent = { doc_type: docTypeFromMsg, url: "(multiple)", source: "send-all-variants" };
+          return res.status(200).json({
+            ok: true,
+            sent: { type: docTypeFromMsg, variants: sentCount, total_available: allRows.length },
+            ack_message: ack,
+          });
+        }
+        // No rows found → fall through to normal strict lookup (which will
+        // emit "no docs available" reply).
+        console.log(`[Periskope Webhook] SEND-ALL requested but no rows for ${project}/${docTypeFromMsg}`);
+      }
+
       try {
         const strictResult = await getDocumentStrict({
           project,

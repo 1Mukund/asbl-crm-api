@@ -1549,6 +1549,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "mark-unique-leads", "zoho-create-unique-lead-field",
       "zoho-create-call-scheduling-fields",
       "site-visit-leads-csv",
+      "sync-prompt-to-hardcoded",
     ]);
     const ADMIN_ONLY = new Set(["audit", "users", "approve-user", "reject-user"]);
 
@@ -6670,18 +6671,48 @@ ${SHARED_STYLE}
     }
   }
 
-  // ─── Reset prompt to hardcoded default (deletes DB override) ────────────
+  // ─── Reset prompt: DELETE the DB override so reads fall back to the
+  //     hardcoded ANANDITA_SYSTEM_PROMPT (which contains ABSOLUTE RULES inline).
   if (req.method === "POST" && req.query.action === "reset-prompt") {
     try {
-      await fetch(`${SUPABASE_URL}/rest/v1/bot_settings?key=eq.system_prompt`, {
-        method: "DELETE",
-        headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, Prefer: "return=minimal" },
-      });
-      res.setHeader("Location", `?view=edit-prompt&msg=${encodeURIComponent("Reset to hardcoded default.")}`);
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const col = await getCollection(COL.BOT_SETTINGS);
+      await col.deleteOne({ _id: "system_prompt" as any });
+      res.setHeader("Location", `?view=edit-prompt&msg=${encodeURIComponent("Reset complete — bot is now using the hardcoded default (includes latest ABSOLUTE RULES).")}`);
     } catch (err: any) {
       res.setHeader("Location", `?view=edit-prompt&msg=${encodeURIComponent("Reset failed: " + err.message)}`);
     }
     return res.status(303).end();
+  }
+
+  // ─── Sync: overwrite the DB prompt with the current hardcoded version.
+  //     Use case: user has a customized prompt saved in DB but wants the
+  //     latest ABSOLUTE RULES applied without losing their workspace. They
+  //     can hit this to "factory reset to the latest code" then re-edit on
+  //     top of the fresh base.
+  if ((req.method === "POST" || req.method === "GET") && req.query.action === "sync-prompt-to-hardcoded") {
+    const session = (req as any)._session;
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    const authedBySecret = !!expectedSecret && incomingSecret === expectedSecret;
+    if (!session && !authedBySecret) {
+      return res.status(401).json({ error: "Unauthorized — log in OR pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    try {
+      const { ANANDITA_SYSTEM_PROMPT } = await import("./_utils/gemini_chat");
+      const { setBotSetting } = await import("./_utils/bot_settings");
+      const result = await setBotSetting("system_prompt", ANANDITA_SYSTEM_PROMPT);
+      return res.status(200).json({
+        ok: result.ok,
+        error: result.error,
+        synced_length_chars: ANANDITA_SYSTEM_PROMPT.length,
+        message: result.ok
+          ? "Hardcoded ANANDITA_SYSTEM_PROMPT (with latest ABSOLUTE RULES) is now the saved DB prompt. Bot will load this on its next message. Dashboard editor will show this as the live prompt — edit + save to customize from here."
+          : "Sync failed",
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
   }
 
   // ─── Per-phone bot kill-switch (toggle from dashboard) ────────────────
