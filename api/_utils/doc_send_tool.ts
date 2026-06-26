@@ -1,0 +1,263 @@
+/**
+ * Document Send Tool — the SINGLE entry point for every doc send in the
+ * system. Periskope-webhook, cron, admin actions, and any future Gemini
+ * function-calling integration all route through here.
+ *
+ * Why this exists: doc-send used to be inlined in periskope-webhook with
+ * three near-duplicate code paths (strict lookup, legacy fallback,
+ * SEND-ALL). Each path drifted slightly, so a bug fixed in one didn't
+ * apply to the others (e.g. dead-sender pool fallback was added to
+ * sendDocViaPeriskope only after user reported docs silently failing).
+ *
+ * The tool's contract:
+ *   - Looks up matching rows in project_documents by (project, doc_type)
+ *     and the disambiguation fields you pass in.
+ *   - Decides one of: SEND (1+ rows match cleanly), AMBIGUOUS (multiple
+ *     rows but no disambiguation hint), NOT_FOUND (zero rows).
+ *   - On SEND, dispatches via sendDocViaPeriskope (which has 10-sender
+ *     pool fallback on dead senders, two-endpoint retry on 404s).
+ *   - Writes a structured doc_send_log entry per attempt for debugging.
+ *   - Returns a structured result the caller renders into the WhatsApp
+ *     reply text.
+ *
+ * Public surface (callable from any handler):
+ *   sendDocumentTool({ request, phone, sender }) → SendDocResult
+ *
+ * Admin test endpoint: /api/chat-history?action=send-doc-test
+ *   POST body: { phone, project, doc_type, size_label?, tower?, facing?,
+ *                unit_size_sft?, send_all? }
+ *   Fires the tool directly without going through Gemini — quick way to
+ *   verify doc plumbing when the customer-facing flow is broken.
+ */
+
+import { findDocsByType, ProjectDocumentRow } from "./project_documents";
+import { sendDocViaPeriskope } from "./document_dispatcher";
+import { logDocSend } from "./doc_validator";
+
+const MULTI_SLOT_TYPES = new Set(["unit_plan", "floor_plan", "price_sheet"]);
+/** Hard cap on bulk sends — 8 PDFs at once is plenty for "all towers"
+ *  and prevents accidental abuse. */
+const BULK_SEND_CAP = 8;
+
+export interface SendDocRequest {
+  /** Project name as stored in project_documents.project (case-insensitive). */
+  project: string;
+  /** One of the 8 enum types: brochure / price_sheet / specifications /
+   *  master_plan / floor_plan / unit_plan / payment_structure / amenities. */
+  doc_type: string;
+  /** Optional disambiguation. Any combination is accepted; the lookup
+   *  picks rows matching the most specific field provided. */
+  size_label?: string | null;
+  unit_size_sft?: number | null;
+  facing?: string | null;
+  tower?: string | null;
+  /** When true, send EVERY available row (capped at BULK_SEND_CAP). Use
+   *  when customer says "all towers", "every size", "saare", etc. */
+  send_all_variants?: boolean;
+}
+
+export interface SendDocVariant {
+  size_label: string;
+  tower: string;
+  facing: string;
+  unit_size_sft: number | null;
+  filename: string;
+  url: string;
+}
+
+export interface SendDocResult {
+  /** SEND = at least one doc delivered. AMBIGUOUS = multiple matches, caller
+   *  must ask which one. NOT_FOUND = zero matches in project_documents.
+   *  ERROR = Periskope or DB blew up. */
+  outcome: "SEND" | "AMBIGUOUS" | "NOT_FOUND" | "ERROR";
+  /** Number of docs actually delivered to Periskope without error. */
+  sent_count: number;
+  /** Per-variant details for variants we attempted (whether or not the
+   *  attempt succeeded). The caller renders these into a reply caption. */
+  variants_sent: SendDocVariant[];
+  /** Variants the caller could offer the customer if outcome=AMBIGUOUS. */
+  options?: string[];
+  /** Periskope or lookup error message, present when outcome=ERROR or when
+   *  sent_count < variants_sent.length (partial failure). */
+  error?: string;
+  /** Latency breakdown for ops dashboards. */
+  ms: { lookup: number; send: number };
+}
+
+function rowToVariant(row: ProjectDocumentRow): SendDocVariant {
+  return {
+    size_label: String(row.size_label || ""),
+    tower: String(row.tower || ""),
+    facing: String(row.facing || ""),
+    unit_size_sft: (row as any).unit_size_sft ?? null,
+    filename: String(row.filename || "document.pdf"),
+    url: row.url,
+  };
+}
+
+function variantLabel(v: SendDocVariant): string {
+  const parts: string[] = [];
+  if (v.unit_size_sft) parts.push(`${v.unit_size_sft} sft`);
+  if (v.facing) parts.push(v.facing);
+  if (v.tower) parts.push(`Tower ${v.tower}`);
+  if (parts.length) return parts.join(" ");
+  return v.size_label || v.filename || "variant";
+}
+
+/** Build a caption for one PDF — short and human, no em-dash. */
+function buildCaption(project: string, doc_type: string, variant: SendDocVariant): string {
+  const label = variantLabel(variant);
+  if (label && label !== doc_type) return `${project} ${doc_type} (${label})`;
+  return `${project} ${doc_type}`;
+}
+
+/** Score how well a row matches the disambiguation fields. Higher is better.
+ *  Used to pick the best row when the caller gave a hint but multiple rows
+ *  could match (e.g. customer said "1980" but we have 1980-East and 1980-
+ *  West rows). Returns 0 for no match, positive for partial, more for
+ *  exact-attribute matches. */
+function scoreRow(row: ProjectDocumentRow, hint: SendDocRequest): number {
+  let score = 0;
+  if (hint.unit_size_sft && (row as any).unit_size_sft === hint.unit_size_sft) score += 4;
+  if (hint.facing && String(row.facing || "").toLowerCase() === hint.facing.toLowerCase()) score += 3;
+  if (hint.tower && String(row.tower || "").toLowerCase() === hint.tower.toLowerCase()) score += 3;
+  if (hint.size_label && String(row.size_label || "").toLowerCase() === hint.size_label.toLowerCase()) score += 5;
+  // Fuzzy: size hint contained in size_label OR vice versa
+  if (hint.size_label && row.size_label) {
+    const a = String(hint.size_label).toLowerCase();
+    const b = String(row.size_label).toLowerCase();
+    if (a.includes(b) || b.includes(a)) score += 1;
+  }
+  return score;
+}
+
+/** THE TOOL. Caller hands in a request + the phone + the sender that the
+ *  conversation is sticky-mapped to; we do everything else. */
+export async function sendDocumentTool(opts: {
+  request: SendDocRequest;
+  phone: string;
+  sender: string;
+}): Promise<SendDocResult> {
+  const t0 = Date.now();
+  const cleanProject = String(opts.request.project || "").trim();
+  const docType = String(opts.request.doc_type || "").trim().toLowerCase();
+  const isMulti = MULTI_SLOT_TYPES.has(docType);
+
+  let rows: ProjectDocumentRow[] = [];
+  try {
+    rows = await findDocsByType(cleanProject, docType, 50);
+  } catch (err: any) {
+    return {
+      outcome: "ERROR",
+      sent_count: 0,
+      variants_sent: [],
+      error: `lookup failed: ${err.message}`,
+      ms: { lookup: Date.now() - t0, send: 0 },
+    };
+  }
+
+  const lookupMs = Date.now() - t0;
+
+  // NOT_FOUND — caller renders a "we don't have that doc" reply.
+  if (!rows || rows.length === 0) {
+    return {
+      outcome: "NOT_FOUND",
+      sent_count: 0,
+      variants_sent: [],
+      error: `no rows for project=${cleanProject} doc_type=${docType}`,
+      ms: { lookup: lookupMs, send: 0 },
+    };
+  }
+
+  // BULK / SEND-ALL — caller explicitly asked for every variant.
+  let chosen: ProjectDocumentRow[] = [];
+  if (opts.request.send_all_variants) {
+    chosen = rows.slice(0, BULK_SEND_CAP);
+  } else if (!isMulti) {
+    // Single-slot doc type — always returns the most recently uploaded row.
+    chosen = [rows[0]];
+  } else {
+    // Multi-slot with disambiguation hint(s). Score rows; if a clear
+    // winner (highest score > 0 AND unique) → send that. If multiple
+    // tie at the top score → ambiguous. If all score 0 (no hint at all)
+    // → ambiguous, offer the variants.
+    const scored = rows
+      .map((r) => ({ r, s: scoreRow(r, opts.request) }))
+      .sort((a, b) => b.s - a.s);
+    const top = scored[0].s;
+    const winners = scored.filter((x) => x.s === top);
+    if (top > 0 && winners.length === 1) {
+      chosen = [winners[0].r];
+    } else {
+      // No hint, or tie. Surface the options for the caller to ask.
+      const options = rows.map((r) => {
+        const v = rowToVariant(r);
+        return variantLabel(v);
+      });
+      return {
+        outcome: "AMBIGUOUS",
+        sent_count: 0,
+        variants_sent: rows.map(rowToVariant),
+        options,
+        ms: { lookup: lookupMs, send: 0 },
+      };
+    }
+  }
+
+  // SEND — fire each chosen row in sequence.
+  const tSend0 = Date.now();
+  const attempted: SendDocVariant[] = [];
+  let sent = 0;
+  let lastErr = "";
+  for (const row of chosen) {
+    const v = rowToVariant(row);
+    attempted.push(v);
+    const caption = buildCaption(cleanProject, docType, v);
+    try {
+      await sendDocViaPeriskope(opts.phone, opts.sender, row.url, row.filename, caption);
+      sent++;
+      await logDocSend({
+        phone: opts.phone,
+        project: cleanProject,
+        doc_type: docType,
+        doc_meta: {
+          unit_size_sft: v.unit_size_sft ?? null,
+          facing: v.facing || null,
+          tower: v.tower || null,
+        },
+        matched_url: row.url,
+        matched_file: row.filename,
+        reply_text: caption,
+        outcome: "sent",
+        block_reason: null,
+        sizes_in_reply: v.unit_size_sft ? [v.unit_size_sft] : [],
+      }).catch(() => {});
+    } catch (err: any) {
+      lastErr = err?.message || String(err);
+      await logDocSend({
+        phone: opts.phone,
+        project: cleanProject,
+        doc_type: docType,
+        doc_meta: {
+          unit_size_sft: v.unit_size_sft ?? null,
+          facing: v.facing || null,
+          tower: v.tower || null,
+        },
+        matched_url: row.url,
+        matched_file: row.filename,
+        reply_text: caption,
+        outcome: "blocked_not_found",
+        block_reason: lastErr,
+        sizes_in_reply: [],
+      }).catch(() => {});
+    }
+  }
+
+  return {
+    outcome: sent > 0 ? "SEND" : "ERROR",
+    sent_count: sent,
+    variants_sent: attempted,
+    error: sent === attempted.length ? undefined : lastErr,
+    ms: { lookup: lookupMs, send: Date.now() - tSend0 },
+  };
+}

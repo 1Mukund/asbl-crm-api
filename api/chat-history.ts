@@ -1551,6 +1551,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "site-visit-leads-csv",
       "sync-prompt-to-hardcoded",
       "audit-project-docs",
+      "send-doc-test",
     ]);
     const ADMIN_ONLY = new Set(["audit", "users", "approve-user", "reject-user"]);
 
@@ -6667,6 +6668,68 @@ ${SHARED_STYLE}
         results: results.slice(0, 200),  // cap response size
         truncated_to: results.length > 200 ? 200 : null,
       });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── send-doc-test — invokes the unified sendDocumentTool directly,
+  //     bypassing Gemini, so you can verify doc plumbing end-to-end.
+  //
+  //   POST /api/chat-history?action=send-doc-test
+  //     body: {
+  //       phone:      "+919876543210",      // recipient (E.164 or digits)
+  //       project:    "Spectra",
+  //       doc_type:   "floor_plan",         // one of the 8 enum types
+  //       size_label?: "Tower-B",           // any combination of these
+  //       tower?:      "B",                 //   four disambiguation
+  //       facing?:     "east",              //   fields is fine
+  //       unit_size_sft?: 1980,
+  //       send_all?:  true                  // bulk-send every variant
+  //     }
+  //   Sender resolution: caller-supplied "sender" field OR sticky-map for
+  //   that phone OR first pool member.
+  if (req.method === "POST" && req.query.action === "send-doc-test") {
+    const session = (req as any)._session;
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!session && (!expectedSecret || incomingSecret !== expectedSecret)) {
+      return res.status(401).json({ error: "Unauthorized — log in OR pass ?secret=..." });
+    }
+    try {
+      const body = (req.body || {}) as any;
+      const phoneRaw = String(body.phone || "").trim();
+      const project = String(body.project || "").trim();
+      const docType = String(body.doc_type || "").trim();
+      if (!phoneRaw || !project || !docType) {
+        return res.status(400).json({ error: "phone + project + doc_type are required" });
+      }
+      const phone = phoneRaw.replace(/^\+/, "").replace(/\D/g, "");
+      if (phone.length < 10) return res.status(400).json({ error: "invalid phone" });
+      // Sender resolution: explicit > sticky map > pool[0]
+      let sender: string = String(body.sender || "").trim();
+      if (!sender) {
+        try {
+          const ops = await import("./_utils/ops_collections");
+          sender = (await ops.getSenderForPhone(phone)) || "";
+        } catch {}
+      }
+      if (!sender) sender = "919063141693"; // pool[0] fallback
+      const { sendDocumentTool } = await import("./_utils/doc_send_tool");
+      const result = await sendDocumentTool({
+        request: {
+          project,
+          doc_type: docType,
+          size_label: body.size_label || null,
+          tower: body.tower || null,
+          facing: body.facing || null,
+          unit_size_sft: body.unit_size_sft ?? null,
+          send_all_variants: !!body.send_all,
+        },
+        phone,
+        sender,
+      });
+      return res.status(200).json({ ok: true, sender_used: sender, ...result });
     } catch (err: any) {
       return res.status(500).json({ error: err.message });
     }

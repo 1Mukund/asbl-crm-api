@@ -1376,64 +1376,54 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         NUMERIC_VARIANTS.test(message)
       );
       if (wantsAllVariants) {
-        const { findDocsByType } = await import("../_utils/project_documents");
-        const allRows = await findDocsByType(project, docTypeFromMsg, 50);
-        if (allRows && allRows.length > 0) {
-          const cap = 8;
-          const toSend = allRows.slice(0, cap);
-          const docLabelMap: Record<string, string> = {
-            floor_plan: "floor plan",
-            unit_plan: "unit plan",
-            price_sheet: "price sheet",
-          };
-          const docLabel = docLabelMap[docTypeFromMsg] || docTypeFromMsg;
-          // Send a short verbal acknowledgement first (the customer-facing
-          // reply) — then loop through and send each PDF.
-          const ack = `Sharing all ${toSend.length} ${docLabel}${toSend.length > 1 ? "s" : ""} for ${project} now${allRows.length > cap ? ` (top ${cap}; reply if you need the rest)` : ""}.`;
-          await saveMessage(phone, "outbound", ack, sender, project);
-          try { await sendReply(phone, sender, ack); } catch (err: any) {
-            console.error(`[Periskope Webhook] all-variants ack send failed: ${err.message}`);
-          }
-          let sentCount = 0;
-          for (const row of toSend) {
-            try {
-              const caption = `${project} ${row.size_label || docLabel}`.trim();
-              await sendDocViaPeriskope(phone, sender, row.url, row.filename || `${docLabel}.pdf`, caption);
-              sentCount++;
-            } catch (err: any) {
-              console.error(`[Periskope Webhook] variant send failed (${row.size_label}): ${err.message}`);
-            }
-          }
-          console.log(`[Periskope Webhook] SEND-ALL fired — ${sentCount}/${toSend.length} ${docTypeFromMsg} variants sent to ${phone}`);
-          await logDocSend({
-            phone,
+        // Route through the unified sendDocumentTool — same code path as
+        // the admin send-doc-test endpoint + any future caller, so dead-
+        // sender fallback / logging / caption format / cap are uniform.
+        const { sendDocumentTool } = await import("../_utils/doc_send_tool");
+        const toolResult = await sendDocumentTool({
+          request: {
             project,
             doc_type: docTypeFromMsg,
-            doc_meta: docMeta,
-            matched_url: null,
-            matched_file: null,
-            reply_text: ack,
-            outcome: "sent",
-            block_reason: null,
-            sizes_in_reply: toSend
-              .map((r) => Number(String(r.size_label || "").replace(/\D/g, "")))
-              .filter((n) => Number.isFinite(n) && n > 0),
-          });
-          docSent = { doc_type: docTypeFromMsg, url: "(multiple)", source: "send-all-variants" };
-          // Set the reply text used by the downstream Zoho update so the
-          // CRM correctly reflects what we said to the customer.
+            send_all_variants: true,
+          },
+          phone,
+          sender,
+        });
+
+        const docLabelMap: Record<string, string> = {
+          floor_plan: "floor plan",
+          unit_plan: "unit plan",
+          price_sheet: "price sheet",
+        };
+        const docLabel = docLabelMap[docTypeFromMsg] || docTypeFromMsg;
+
+        if (toolResult.outcome === "SEND" && toolResult.sent_count > 0) {
+          // Build a single ack message AFTER the dispatcher already shipped
+          // the PDFs (so customer first sees the files, then "sharing all
+          // 4 now"). The order looks more natural that way.
+          const ack = `Sharing all ${toolResult.sent_count} ${docLabel}${toolResult.sent_count > 1 ? "s" : ""} for ${project} now.${toolResult.sent_count < toolResult.variants_sent.length ? " (Some still on the way.)" : ""}`;
+          await saveMessage(phone, "outbound", ack, sender, project);
+          try {
+            await sendReply(phone, sender, ack);
+          } catch (err: any) {
+            console.error(`[Periskope Webhook] all-variants ack send failed: ${err.message}`);
+          }
+          console.log(`[Periskope Webhook] SEND-ALL-TOOL fired — ${toolResult.sent_count}/${toolResult.variants_sent.length} ${docTypeFromMsg} variants sent to ${phone} (lookup ${toolResult.ms.lookup}ms send ${toolResult.ms.send}ms)`);
+          docSent = { doc_type: docTypeFromMsg, url: "(multiple)", source: "send-all-tool" };
           reply = ack;
-          // CRITICAL: do NOT early-return here. We must let downstream code
-          // run so Zoho Last_Intent / Whatsapp_Replied / funnel stage all
-          // update. Earlier bug (commit c943758): early-return caused the
-          // CRM to think the customer never engaged even after we sent
-          // 4 PDFs (silent funnel failure).
-          // Mark a flag so the strict-lookup block below skips itself.
           sendAllAlreadyHandled = true;
+        } else if (toolResult.outcome === "NOT_FOUND") {
+          // No rows → let downstream strict-lookup emit "no docs available".
+          console.log(`[Periskope Webhook] SEND-ALL via tool: NOT_FOUND for ${project}/${docTypeFromMsg}`);
         } else {
-          // No rows found → fall through to normal strict lookup (which
-          // will emit "no docs available" reply).
-          console.log(`[Periskope Webhook] SEND-ALL requested but no rows for ${project}/${docTypeFromMsg}`);
+          // ERROR — surface a casual deflection. Downstream strict lookup
+          // would also fail so just skip it.
+          const deflection = `Trying to send the ${docLabel}s for ${project} but the system is being slow. Lemme retry in a couple mins.`;
+          await saveMessage(phone, "outbound", deflection, sender, project);
+          try { await sendReply(phone, sender, deflection); } catch {}
+          console.error(`[Periskope Webhook] SEND-ALL via tool: ERROR ${toolResult.error}`);
+          reply = deflection;
+          sendAllAlreadyHandled = true;
         }
       }
 
