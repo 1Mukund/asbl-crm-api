@@ -93,7 +93,7 @@ function isDeadSenderResponse(status: number, body: string): boolean {
  *  a dead sticky-sender would permanently block the lead — no greeting,
  *  no follow-up, no callback. Customer goes silent in our funnel.
  */
-async function fireChatbotMessage(phone: string, message: string, project?: string): Promise<{ ok: boolean; error?: string }> {
+export async function fireChatbotMessage(phone: string, message: string, project?: string): Promise<{ ok: boolean; error?: string }> {
   // Build send order: sticky first (if alive), then everything else in pool
   // order. Skip senders we already know are dead within the 1h TTL.
   const ops = await import("./ops_collections");
@@ -126,6 +126,10 @@ async function fireChatbotMessage(phone: string, message: string, project?: stri
       });
 
       if (r.ok) {
+        // Reset this sender's consecutive-failure counter on every
+        // successful delivery so a transient blip doesn't drift towards
+        // the permanent-dead alert threshold.
+        await ops.recordSenderSuccess(sender).catch(() => {});
         // Save to whatsapp_messages so it shows in dashboard + LLM history.
         try {
           const { insertMessage } = await import("./whatsapp_messages");
@@ -172,7 +176,21 @@ async function fireChatbotMessage(phone: string, message: string, project?: stri
     }
   }
 
+  // ALL senders failed for this phone. This is rare (whole pool down) but
+  // critical when it happens — customer gets no message and nobody knows.
+  // Write a stuck_sends Mongo entry so the dashboard can surface a banner
+  // and ops can manually run /phone/restart. Logged at error so it stands
+  // out in Vercel logs too.
   console.error(`[PRD Orch] WhatsApp send EXHAUSTED — all ${tried} senders failed for ${phone}. Last error: ${lastErr}`);
+  try {
+    const { getCollection } = await import("./mongo");
+    const stuckCol = await getCollection("stuck_sends" as any);
+    await stuckCol.insertOne({
+      phone, message: message.slice(0, 200),
+      tried_senders: tried, last_error: lastErr,
+      at: new Date().toISOString(),
+    } as any);
+  } catch {}
   return { ok: false, error: `all senders exhausted: ${lastErr}` };
 }
 
@@ -473,7 +491,7 @@ function buildFollowupMessage(customerName: string, project: string | undefined,
     `Hi ${name}, just following up on my earlier message about ${proj}. ` +
     `Would you like me to share the brochure / pricing, or shall I help you schedule a quick site visit?`,
     // 2: Inventory urgency
-    `${name}, sharing one more time — ${proj} me popular configurations me limited inventory hai. ` +
+    `${name}, sharing one more time. ${proj} me popular configurations me limited inventory hai. ` +
     `Are you available for a 10-minute call or a site visit this weekend?`,
     // 3: Final-tone gentle
     `Hi ${name}, just one more check-in. ${proj} ki current options aapke budget aur preference ke hisaab se discuss kar sakte hain. ` +
@@ -485,7 +503,7 @@ function buildFollowupMessage(customerName: string, project: string | undefined,
     `Hi ${name}, ${proj} me ek quick site visit consider karenge? Even 30 minutes me poora project samajh aa jata hai. ` +
     `Apka koi preferred day batayenge?`,
     // 6: Soft re-engage
-    `${name}, ek choti si update — ${proj} ke kuch new amenities + payment options confirm hue hain. ` +
+    `${name}, ek choti si update. ${proj} ke kuch new amenities aur payment options confirm hue hain. ` +
     `Interested ho to reply karein, main share karti hu.`,
   ];
   return messages[(idx - 1) % messages.length];
@@ -523,7 +541,7 @@ export function buildReengagementMessage(
 
   const messages = [
     // 1: Quote + soft remind
-    `Hi ${name}, ${ctxPhrase} Usi ke baare me follow karna chahti thi — koi specific question hai jo abhi tak unanswered hai?`,
+    `Hi ${name}, ${ctxPhrase} Usi ke baare me follow karna chahti thi. Koi specific question hai jo abhi tak unanswered hai?`,
 
     // 2: Quote + offer next step
     `${name}, ${ctxPhrase} Kya aap ${proj} ki updated pricing / availability dekhna chahenge? ` +
@@ -534,7 +552,7 @@ export function buildReengagementMessage(
     `Project poora samajh aa jata hai aur clarity bhi mil jati hai.`,
 
     // 4: Quote + direct ask
-    `${name}, ${ctxPhrase} Bata dijiye kya aapko aage badhne me koi confusion hai — pricing, configuration, ya documentation. ` +
+    `${name}, ${ctxPhrase} Bata dijiye kya aapko aage badhne me koi confusion hai. Pricing, configuration, ya documentation. ` +
     `Main resolve kar dungi.`,
   ];
   return messages[(idx - 1) % messages.length];

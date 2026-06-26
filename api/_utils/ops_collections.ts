@@ -71,25 +71,63 @@ export async function setSenderForPhone(phone: string, sender: string): Promise<
 // /phone/restart usually fixes within minutes.
 
 const DEAD_SENDER_TTL_MS = 60 * 60 * 1000; // 1 hour
+/** Number of consecutive failures before we flag a sender as "likely
+ *  permanently dead" and surface a stuck_senders alert. Below this the
+ *  retry cadence stays on the 1-hour TTL. */
+const DEAD_SENDER_PERMANENT_THRESHOLD = 6;
 
 interface DeadSenderDoc {
   _id: string;
   dead_at: string;
+  /** Number of consecutive times this sender has been marked dead
+   *  (incremented on every markSenderDead call without an interleaving
+   *  successful delivery). Tracks long-term flapping vs transient blips. */
+  consecutive_failures?: number;
+  first_dead_at?: string;
+  alerted_permanent?: boolean;
 }
 
-/** Mark a sender as dead. Idempotent — refreshes the timestamp. */
+/** Mark a sender as dead. Idempotent on the dead_at timestamp; increments
+ *  consecutive_failures on every call so ops can spot permanently-broken
+ *  senders that are wasting Periskope credits on every hourly retry. */
 export async function markSenderDead(sender: string): Promise<void> {
   if (!sender) return;
   try {
     const col = await getCollection<DeadSenderDoc>(COL.DEAD_SENDERS);
+    const now = new Date().toISOString();
     await col.updateOne(
       { _id: sender as any },
-      { $set: { dead_at: new Date().toISOString() } },
+      {
+        $set: { dead_at: now },
+        $setOnInsert: { first_dead_at: now } as any,
+        $inc: { consecutive_failures: 1 } as any,
+      },
       { upsert: true },
     );
+    // Surface an alert on the Nth consecutive failure. Logged at warn so
+    // it stands out in Vercel function logs without paging anyone.
+    const doc = await col.findOne({ _id: sender as any });
+    const fails = doc?.consecutive_failures || 0;
+    if (fails >= DEAD_SENDER_PERMANENT_THRESHOLD && !doc?.alerted_permanent) {
+      console.warn(
+        `[ops] STUCK SENDER ${sender} — ${fails} consecutive failures since ${doc?.first_dead_at}. ` +
+        `Likely permanently offline; recommend manual /phone/restart or rotation out of pool.`,
+      );
+      await col.updateOne({ _id: sender as any }, { $set: { alerted_permanent: true } });
+    }
   } catch (err: any) {
     console.error(`[ops] markSenderDead failed: ${err.message}`);
   }
+}
+
+/** Reset the failure counter after a successful delivery from this sender,
+ *  so a single bad hour doesn't permanently flag a normally-working number. */
+export async function recordSenderSuccess(sender: string): Promise<void> {
+  if (!sender) return;
+  try {
+    const col = await getCollection<DeadSenderDoc>(COL.DEAD_SENDERS);
+    await col.deleteOne({ _id: sender as any });
+  } catch {}
 }
 
 /** Set of senders dead within the last TTL window. Caller uses this to

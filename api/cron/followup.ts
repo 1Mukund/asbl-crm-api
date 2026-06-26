@@ -656,6 +656,92 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ── Pre-Site-Visit reminder cron (every hour) ──────────────────────────
+  // Audit 2026-06-19 surfaced: leads with PRD_Stage = "Pre Site Visit" and
+  // a future Site_Visit_Date were getting ZERO automated reminders because
+  // no reminder cron existed (the main prd-cadence cron explicitly SKIPs
+  // them with a comment "reminder cron is separate concern" but the cron
+  // was never built). Now it is:
+  //   - 24h before site visit → 1 reminder WhatsApp
+  //   - 3h before site visit → 1 reminder WhatsApp
+  // Runs hourly so the gates fire at granular hour-windows. Idempotency
+  // via Mongo dedup keys: phone_visit-24h / phone_visit-3h written after
+  // each send.
+  if (req.query.task === "pre-site-visit-reminders") {
+    const start = Date.now();
+    const result: any = { ms: 0, scanned: 0, fired_24h: 0, fired_3h: 0, errors: [] as any[] };
+    try {
+      const { getAccessToken } = await import("../_utils/zoho");
+      const { getCollection, COL } = await import("../_utils/mongo");
+      const orchestrator = await import("../_utils/prd_orchestrator");
+      const fireChatbot = (orchestrator as any).fireChatbotMessage as
+        | undefined
+        | ((p: string, m: string, proj?: string) => Promise<{ ok: boolean }>);
+
+      const token = await getAccessToken();
+      const FIELDS = "id,First_Name,Last_Name,Mobile,Phone,ASBL_Project,Site_Visit_Date,PRD_Stage";
+      const now = Date.now();
+      const horizonHigh = now + 26 * 3600 * 1000; // catch leads up to 26h away
+
+      const r = await fetch(
+        `https://www.zohoapis.in/crm/v3/Leads/search?` +
+        `criteria=(PRD_Stage:equals:Pre Site Visit)&fields=${FIELDS}&per_page=200`,
+        { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
+      );
+      const arr: any[] = r.ok ? (((await r.json()) as any)?.data || []) : [];
+      result.scanned = arr.length;
+
+      const remCol = await getCollection("psv_reminders" as any);
+      for (const lead of arr) {
+        try {
+          const visitMs = lead.Site_Visit_Date ? new Date(lead.Site_Visit_Date).getTime() : 0;
+          if (!visitMs || visitMs <= now) continue;
+          const phone = String(lead.Phone || lead.Mobile || "").replace(/\D/g, "");
+          if (!phone || !fireChatbot) continue;
+          const project = lead.ASBL_Project || "ASBL";
+          const fullName = [lead.First_Name, lead.Last_Name].filter(Boolean).join(" ").trim() || "Sir";
+          const hoursOut = (visitMs - now) / 3600000;
+          // 24h window: between 23h and 25h before visit
+          if (hoursOut >= 23 && hoursOut <= 25 && visitMs < horizonHigh) {
+            const key = `${phone}-${visitMs}-24h`;
+            const exists = await remCol.findOne({ _id: key as any });
+            if (!exists) {
+              const msg = `Hi ${fullName}, just a quick reminder. Your site visit to ${project} is tomorrow. Let me know if you need directions or any prep details.`;
+              const sent = await fireChatbot(phone, msg, project);
+              if (sent.ok) {
+                await remCol.insertOne({ _id: key as any, sent_at: new Date().toISOString() } as any);
+                result.fired_24h++;
+              }
+            }
+          }
+          // 3h window: between 2h and 4h before visit
+          if (hoursOut >= 2 && hoursOut <= 4) {
+            const key = `${phone}-${visitMs}-3h`;
+            const exists = await remCol.findOne({ _id: key as any });
+            if (!exists) {
+              const msg = `Hi ${fullName}, your ${project} site visit is in about 3 hours. The team is ready to host you. Reply if anything changes.`;
+              const sent = await fireChatbot(phone, msg, project);
+              if (sent.ok) {
+                await remCol.insertOne({ _id: key as any, sent_at: new Date().toISOString() } as any);
+                result.fired_3h++;
+              }
+            }
+          }
+        } catch (err: any) {
+          result.errors.push({ lead_id: lead.id, error: err.message });
+        }
+      }
+      result.ms = Date.now() - start;
+      await logCronRun("pre-site-visit-reminders", result.ms, result, null);
+      return res.status(200).json({ task: "pre-site-visit-reminders", ...result });
+    } catch (err: any) {
+      console.error("[PSV Reminders Cron] Fatal:", err.message);
+      result.ms = Date.now() - start;
+      await logCronRun("pre-site-visit-reminders", result.ms, result, err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // Default = legacy 10-day daily follow-up sequence — DISABLED 2026-06-09.
   // Reason: messages are all hardcoded for "ASBL Loft current offer" copy
   // which is outdated (offer ended) AND would fire for BROADWAY/SPECTRA/
@@ -663,7 +749,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // (3 attempts max, 24h gated, project-aware) supersedes this loop.
   // Schedule entry removed from vercel.json; this early-return ensures
   // any manual hits also no-op cleanly.
-  if (req.query.task !== "prd-cadence" && req.query.task !== "meta-backfill" && req.query.task !== "mark-unique-leads") {
+  if (req.query.task !== "prd-cadence" && req.query.task !== "meta-backfill" && req.query.task !== "mark-unique-leads" && req.query.task !== "pre-site-visit-reminders") {
     return res.status(200).json({
       task: "legacy-followup",
       disabled: true,
