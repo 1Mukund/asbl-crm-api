@@ -240,11 +240,40 @@ export async function getDocumentFor(
   return null;
 }
 
+// 10-sender pool — kept in sync with prd_orchestrator + resubmission. Used
+// by sendDocViaPeriskope to fall through to a working sender when the
+// caller's sticky sender is dead.
+const DOC_SENDER_POOL = [
+  "919063141693",
+  "917794028484",
+  "917396077334",
+  "919059555164",
+  "918977537630",
+  "917207048181",
+  "917396130606",
+  "917386023002",
+  "919247524774",
+  "917995284040",
+];
+
+function isDeadSenderErr(status: number, body: string): boolean {
+  const b = (body || "").toLowerCase();
+  if (b.includes("phone server") && b.includes("switched off")) return true;
+  if (b.includes("/phone/restart")) return true;
+  if (b.includes("unauthorized_error")) return true;
+  if (status === 401) return true;
+  return false;
+}
+
 // ── Send document via Periskope ────────────────────────────────────────────
 // Per Periskope docs: POST /v1/message/send with nested `media` object and
-// chat_id in `<phone>@c.us` form. We try the documented endpoint first; if
-// it 404s (some accounts may still be on the older /messages/send path), we
-// fall back to that. Errors propagate to the caller, where they're logged.
+// chat_id in `<phone>@c.us` form. Two endpoints are tried per sender
+// (singular + legacy plural alias). On 401 / "phone switched off" from
+// Periskope (caller's sticky sender is offline), we fall through to other
+// pool members exactly the way text-send does — without this, docs would
+// silently fail whenever the conversation's primary sender was down.
+// Bug observed 2026-06-19 in QA: PDFs weren't reaching customers even
+// though text replies were getting through.
 export async function sendDocViaPeriskope(
   phone: string,
   sender: string,
@@ -260,19 +289,29 @@ export async function sendDocViaPeriskope(
   const body = {
     chat_id: chatId,
     message: caption,
-    media: {
-      type: "document",
-      filename: safeFilename,
-      mimetype: mimeType,
-      url: docUrl,
-    },
+    media: { type: "document", filename: safeFilename, mimetype: mimeType, url: docUrl },
   };
 
-  const headers = {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${PERISKOPE_API_KEY}`,
-    "x-phone": sender,
-  };
+  // Build sender order: caller's sticky first, then remaining pool members
+  // (skipping recently-dead ones via ops_collections.getDeadSenders).
+  let deadSet = new Set<string>();
+  let markDead: ((s: string) => Promise<void>) | null = null;
+  let recordOk: ((s: string) => Promise<void>) | null = null;
+  try {
+    const ops = await import("./ops_collections");
+    deadSet = await ops.getDeadSenders().catch(() => new Set<string>());
+    markDead = ops.markSenderDead;
+    recordOk = ops.recordSenderSuccess;
+  } catch {}
+
+  const ordered: string[] = [];
+  if (sender && !deadSet.has(sender)) ordered.push(sender);
+  for (const s of DOC_SENDER_POOL) {
+    if (s === sender) continue;
+    if (deadSet.has(s)) continue;
+    ordered.push(s);
+  }
+  if (!ordered.length) ordered.push(...DOC_SENDER_POOL);
 
   const endpoints = [
     "https://api.periskope.app/v1/message/send",   // documented
@@ -280,31 +319,59 @@ export async function sendDocViaPeriskope(
   ];
 
   let lastErr = "";
-  for (const url of endpoints) {
-    try {
-      const r = await fetch(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-      });
-      if (r.ok) {
-        console.log(`[DocDispatcher] sent doc via ${url} → ${docUrl}`);
-        return;
-      }
-      const t = await r.text();
-      lastErr = `${r.status} from ${url}: ${t.slice(0, 300)}`;
-      // Only fall through to next endpoint on 404 (path mismatch)
-      if (r.status !== 404) {
+  let triedSenders = 0;
+  for (const trySender of ordered) {
+    triedSenders++;
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${PERISKOPE_API_KEY}`,
+      "x-phone": trySender,
+    };
+    let senderIsDead = false;
+    for (const url of endpoints) {
+      try {
+        const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+        if (r.ok) {
+          if (recordOk) await recordOk(trySender).catch(() => {});
+          if (triedSenders > 1) {
+            console.log(`[DocDispatcher] sent doc via ${url} on sender ${trySender} (after ${triedSenders - 1} dead-sender fallback${triedSenders > 2 ? "s" : ""})`);
+          } else {
+            console.log(`[DocDispatcher] sent doc via ${url} → ${docUrl}`);
+          }
+          return;
+        }
+        const t = await r.text();
+        lastErr = `${r.status} from ${url}: ${t.slice(0, 300)}`;
+        if (isDeadSenderErr(r.status, t)) {
+          console.warn(`[DocDispatcher] Sender ${trySender} dead (${r.status}). Marking + falling through to next sender.`);
+          if (markDead) await markDead(trySender).catch(() => {});
+          senderIsDead = true;
+          break; // exit the inner endpoint loop, try next sender
+        }
+        if (r.status === 404) {
+          console.warn(`[DocDispatcher] ${url} returned 404, trying alternate endpoint`);
+          continue; // try the alternate endpoint with the same sender
+        }
+        // Non-sender, non-404 error (e.g. 400 bad payload, 5xx) — fatal
         throw new Error(`Periskope doc send error ${lastErr}`);
+      } catch (err: any) {
+        // For network exceptions, retry the same sender once on the alt
+        // endpoint. If we're already on the last endpoint, propagate.
+        if (url === endpoints[endpoints.length - 1] && !senderIsDead) {
+          lastErr = err?.message || String(err);
+          // Drop through to next sender (we've burned both endpoints
+          // for the current sender).
+          break;
+        }
+        lastErr = err?.message || String(err);
       }
-      console.warn(`[DocDispatcher] ${url} returned 404, trying fallback`);
-    } catch (err: any) {
-      // Re-throw the last attempt's error so the caller can log it
-      if (url === endpoints[endpoints.length - 1]) {
-        throw err instanceof Error ? err : new Error(String(err));
-      }
-      lastErr = err?.message || String(err);
+    }
+    if (!senderIsDead) {
+      // Non-dead failure — we exited the endpoint loop without success
+      // and without flagging the sender. No point trying other senders
+      // for a payload-level error.
+      throw new Error(`Periskope doc send failed: ${lastErr}`);
     }
   }
-  throw new Error(`Periskope doc send failed: ${lastErr}`);
+  throw new Error(`Periskope doc send EXHAUSTED — tried ${triedSenders} senders. Last: ${lastErr}`);
 }
