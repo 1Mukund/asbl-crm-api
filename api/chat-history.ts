@@ -6695,6 +6695,61 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── supabase-config-check — where do dashboard uploads actually go?
+  //   Reports the SUPABASE_URL host (not the key) + does a real round-trip:
+  //   upload a tiny test file via the same helper the dashboard uses, build
+  //   the public URL, then fetch it back. If the round-trip fails, every
+  //   dashboard upload is landing in a dead/wrong Supabase project — which
+  //   is exactly the doc-delivery root cause.
+  //   GET /api/chat-history?action=supabase-config-check&secret=<...>
+  if (req.method === "GET" && req.query.action === "supabase-config-check") {
+    const session = (req as any)._session;
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!session && (!expectedSecret || incomingSecret !== expectedSecret)) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    const supaUrl = process.env.SUPABASE_URL || "";
+    const host = (() => { try { return new URL(supaUrl).host; } catch { return "(invalid/empty)"; } })();
+    const ref = host.split(".")[0] || "";
+    const DEAD_REF = "qexmwffpjawowxqqttec";
+    const out: any = {
+      ok: true,
+      supabase_url_host: host,
+      project_ref: ref,
+      is_known_dead_project: ref === DEAD_REF,
+      key_present: !!process.env.SUPABASE_SECRET_KEY,
+    };
+    try {
+      const { uploadToStorage } = await import("./_utils/storage_upload");
+      const testContent = Buffer.from(`asbl-upload-roundtrip ${new Date().toISOString()}`).toString("base64");
+      const up = await uploadToStorage({
+        project: "_diag", docType: "_test", filename: "roundtrip.txt",
+        mimeType: "text/plain", base64Content: testContent,
+      });
+      out.upload_ok = true;
+      out.public_url = up.publicUrl;
+      // Fetch it back to prove it's actually retrievable (what Periskope does)
+      try {
+        const fr = await fetch(up.publicUrl);
+        out.fetch_back_status = fr.status;
+        out.fetch_back_ok = fr.ok;
+        out.diagnosis = fr.ok
+          ? "Uploads land in a LIVE, publicly-fetchable bucket. Doc delivery should work for newly-uploaded files."
+          : `Upload succeeded but the public URL is NOT fetchable (HTTP ${fr.status}) — Periskope can't get the file. Bucket may not be public.`;
+      } catch (err: any) {
+        out.fetch_back_ok = false;
+        out.diagnosis = `Upload succeeded but the public URL is unreachable (${err.message}) — the Supabase project URL does not resolve. This is the doc-delivery root cause.`;
+      }
+    } catch (err: any) {
+      out.upload_ok = false;
+      out.diagnosis = ref === DEAD_REF
+        ? `SUPABASE_URL points to the DELETED project ${DEAD_REF}. Every dashboard upload fails / produces dead URLs. FIX: set SUPABASE_URL + SUPABASE_SECRET_KEY in Vercel to a LIVE Supabase project, then re-upload (or re-point via import-doc-urls).`
+        : `Upload failed: ${err.message}`;
+    }
+    return res.status(200).json(out);
+  }
+
   // ─── import-doc-urls — bulk-set project_documents from a clean URL list.
   //
   //   Root cause found 2026-06-26: the Supabase project holding every PDF
