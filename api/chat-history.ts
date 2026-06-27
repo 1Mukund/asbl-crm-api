@@ -1580,6 +1580,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "sync-prompt-to-hardcoded", "mark-unique-leads",
       "zoho-create-unique-lead-field", "zoho-create-call-scheduling-fields",
       "periskope-doc-diag", "portfolio-get", "portfolio-save",
+      "callback-log", "zoho-lead-match-test",
     ]);
     const incomingSecretTop =
       (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
@@ -5656,6 +5657,69 @@ ${SHARED_STYLE}
       });
     } catch (err: any) {
       console.error(`[upload-finalize] failed: ${err.message}`);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── Callback diagnostics: why did "call me" not place a call? ──────────
+  //   GET ?action=callback-log&secret=...&limit=50[&phone=98xxxxxxxx]
+  //   Returns recent WhatsApp callback attempts with outcome + reason
+  //   (no_zoho_lead_matched / cooldown / voicebot_error / triggered).
+  if (req.method === "GET" && req.query.action === "callback-log") {
+    try {
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const col = await getCollection(COL.CALLBACK_LOG);
+      const limit = Math.min(Number(req.query.limit) || 50, 500);
+      const q: any = {};
+      if (req.query.phone) {
+        const d = String(req.query.phone).replace(/\D/g, "").slice(-10);
+        if (d) q.phone = { $regex: d + "$" };
+      }
+      const rows = await col.find(q).sort({ created_at: -1 }).limit(limit).toArray();
+      const summary: Record<string, number> = {};
+      for (const r of rows as any[]) {
+        const k = `${r.outcome}:${r.reason}`;
+        summary[k] = (summary[k] || 0) + 1;
+      }
+      return res.status(200).json({ ok: true, count: rows.length, summary, rows });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── Test Zoho lead matching for a phone (does the bot find this lead?) ──
+  //   GET ?action=zoho-lead-match-test&phone=<any format>&secret=...
+  //   Shows whether the robust multi-format lookup matches a Zoho lead — use
+  //   to confirm a lead the user messaged is reachable for chat sync + callback.
+  if (req.method === "GET" && req.query.action === "zoho-lead-match-test") {
+    try {
+      const raw = String(req.query.phone || "");
+      if (!raw) return res.status(400).json({ error: "phone query param required" });
+      const { getAccessToken } = await import("./_utils/zoho");
+      const token = await getAccessToken();
+      const digits = raw.replace(/\D/g, "");
+      const last10 = digits.slice(-10);
+      const variants = Array.from(new Set([digits, last10, last10 ? `91${last10}` : "", last10 ? `+91${last10}` : ""].filter(Boolean)));
+      const fields = "id,First_Name,Last_Name,Mobile,Phone,ASBL_Project,Lead_Status";
+      const ZBASE = "https://www.zohoapis.in/crm/v3";
+      const tryFetch = async (criteria: string) => {
+        const r = await fetch(`${ZBASE}/Leads/search?criteria=${encodeURIComponent(criteria)}&fields=${fields}`, { headers: { Authorization: `Zoho-oauthtoken ${token}` } });
+        if (!r.ok || r.status === 204) return [];
+        const t = await r.text(); if (!t) return [];
+        try { return (JSON.parse(t)?.data || []); } catch { return []; }
+      };
+      const orParts: string[] = [];
+      for (const v of variants) { orParts.push(`(Mobile:equals:${v})`); orParts.push(`(Phone:equals:${v})`); }
+      let rows = await tryFetch(orParts.length === 1 ? orParts[0] : `(${orParts.join("or")})`);
+      let method = "equals_variants";
+      if (!rows.length && last10) { rows = await tryFetch(`(Mobile:contains:${last10})`); method = "contains_mobile"; }
+      if (!rows.length && last10) { rows = await tryFetch(`(Phone:contains:${last10})`); method = "contains_phone"; }
+      return res.status(200).json({
+        ok: true, input: raw, variants_tried: variants,
+        matched: rows.length > 0, match_method: rows.length ? method : null,
+        leads: rows.map((r: any) => ({ id: r.id, name: [r.First_Name, r.Last_Name].filter(Boolean).join(" "), mobile: r.Mobile, phone: r.Phone, project: r.ASBL_Project, status: r.Lead_Status })),
+      });
+    } catch (err: any) {
       return res.status(500).json({ error: err.message });
     }
   }

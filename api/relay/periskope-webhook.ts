@@ -336,16 +336,49 @@ async function findLeadDetailsByPhone(phone: string, token: string): Promise<Lea
     } catch { return null; }
   };
 
-  let row = await tryFetch(`(Mobile:equals:${phone})`);
-  if (!row) row = await tryFetch(`(Phone:equals:${phone})`);
-  if (!row) return null;
-
-  return {
+  const mapRow = (row: any): LeadDetails => ({
     id: row.id,
     firstName: row.First_Name || "",
     lastName: row.Last_Name || "",
     asblProject: row.ASBL_Project || null,
-  };
+  });
+
+  // WhatsApp delivers a country-code-prefixed number (e.g. 919876543210), but
+  // Zoho leads are very often stored as the bare 10-digit national number
+  // (9876543210), or with +91, or with spaces/dashes. A plain
+  // (Mobile:equals:<whatsapp form>) silently MISSES all of those — which is
+  // exactly why so many leads showed no WhatsApp activity in Zoho AND why
+  // "call me" callbacks stopped firing (the callback trigger needs a matched
+  // lead). Try every common format across BOTH Mobile and Phone in one search.
+  const digits = String(phone).replace(/\D/g, "");
+  const last10 = digits.slice(-10);
+  const variants = Array.from(new Set([
+    digits,
+    last10,
+    last10 ? `91${last10}` : "",
+    last10 ? `+91${last10}` : "",
+  ].filter(Boolean)));
+
+  const orParts: string[] = [];
+  for (const v of variants) {
+    orParts.push(`(Mobile:equals:${v})`);
+    orParts.push(`(Phone:equals:${v})`);
+  }
+  if (orParts.length) {
+    const criteria = orParts.length === 1 ? orParts[0] : `(${orParts.join("or")})`;
+    const row = await tryFetch(criteria);
+    if (row) return mapRow(row);
+  }
+
+  // Fallback for numbers stored with spaces/dashes/brackets that `equals`
+  // can't match: search by the 10-digit core with `contains` (10 consecutive
+  // digits is effectively unique to one subscriber).
+  if (last10) {
+    let row = await tryFetch(`(Mobile:contains:${last10})`);
+    if (!row) row = await tryFetch(`(Phone:contains:${last10})`);
+    if (row) return mapRow(row);
+  }
+  return null;
 }
 
 // ── Zoho: Update lead intent ──────────────────────────────────────────────────
@@ -1885,31 +1918,59 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // in-house voice-bot call immediately. Throttled to 1/30min per lead.
     // bot_enabled=false leads have already returned early at step ~7, so
     // by reaching here the bot is enabled for this phone.
-    if (leadDetails && zohoToken && zohoIntent === "call_me") {
-      const fullName =
-        [leadDetails.firstName, leadDetails.lastName].filter(Boolean).join(" ").trim() ||
-        "Sir/Ma'am";
+    //
+    // Every attempt (incl. the silent "no Zoho lead matched" case) is logged
+    // to callback_log so "call me but no call came" is debuggable — view via
+    // /api/chat-history?action=callback-log&secret=...
+    const logCallback = async (outcome: string, reason: string, leadId: string | null) => {
       try {
-        const callRes = await triggerCallbackCall(
-          leadDetails.id,
-          phone,
-          fullName,
-          leadDetails.asblProject,
-          zohoToken,
-        );
-        if (callRes.ok) {
-          console.log(
-            `[Periskope Webhook] ✓ Callback call triggered for ${phone} (lead ${leadDetails.id})`,
+        const { getCollection, COL } = await import("../_utils/mongo");
+        const col = await getCollection(COL.CALLBACK_LOG);
+        await col.insertOne({
+          phone, lead_id: leadId, intent: classification.intent,
+          zoho_intent: zohoIntent, outcome, reason,
+          message: message.slice(0, 200), created_at: new Date().toISOString(),
+        } as any);
+      } catch { /* never block on diagnostics */ }
+    };
+
+    if (zohoIntent === "call_me") {
+      if (!leadDetails) {
+        // The customer asked for a call but we couldn't match them to a Zoho
+        // lead — so no call fires. This is the #1 cause of "call nahi aayi".
+        console.log(`[Periskope Webhook] ✗ Callback wanted but NO Zoho lead matched for ${phone}`);
+        await logCallback("skipped", zohoToken ? "no_zoho_lead_matched" : "no_zoho_token", null);
+      } else if (!zohoToken) {
+        await logCallback("skipped", "no_zoho_token", leadDetails.id);
+      } else {
+        const fullName =
+          [leadDetails.firstName, leadDetails.lastName].filter(Boolean).join(" ").trim() ||
+          "Sir/Ma'am";
+        try {
+          const callRes = await triggerCallbackCall(
+            leadDetails.id,
+            phone,
+            fullName,
+            leadDetails.asblProject,
+            zohoToken,
           );
-        } else {
-          console.log(
-            `[Periskope Webhook] ✗ Callback call skipped for ${phone}: ${callRes.reason}`,
+          if (callRes.ok) {
+            console.log(
+              `[Periskope Webhook] ✓ Callback call triggered for ${phone} (lead ${leadDetails.id})`,
+            );
+            await logCallback("triggered", "ok", leadDetails.id);
+          } else {
+            console.log(
+              `[Periskope Webhook] ✗ Callback call skipped for ${phone}: ${callRes.reason}`,
+            );
+            await logCallback("skipped", callRes.reason || "unknown", leadDetails.id);
+          }
+        } catch (err: any) {
+          console.error(
+            `[Periskope Webhook] Callback call threw for ${phone}: ${err.message}`,
           );
+          await logCallback("error", err.message, leadDetails.id);
         }
-      } catch (err: any) {
-        console.error(
-          `[Periskope Webhook] Callback call threw for ${phone}: ${err.message}`,
-        );
       }
     }
 

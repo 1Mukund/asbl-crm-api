@@ -53,6 +53,10 @@ export const COL = {
   DEAD_SENDERS:       "dead_senders",
   FOLLOW_UP_LOG:      "follow_up_log",
   CRON_LOG:           "cron_log",
+  /** Diagnostic trail of every WhatsApp "call me" → voice-bot callback
+   *  attempt: outcome + reason (no_lead / cooldown / voicebot_error / ok)
+   *  so failures are visible instead of vanishing into Vercel logs. */
+  CALLBACK_LOG:       "callback_log",
   /** Internal: monotonic counters used by getNextSequence() to mimic
    *  Postgres serial sequences atomically (e.g. for MLID/PLID + the
    *  round-robin sender index). */
