@@ -1391,6 +1391,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         `options=${(toolResult.options || []).length}`,
       );
 
+      // Language of the customer's CURRENT message, so the deflection text
+      // below matches it (the hinglish_roman flag is set for ANY latin text
+      // incl. pure English, so detect from actual Hindi/Hinglish word cues).
+      const custLang: "dev" | "hin" | "en" =
+        /[ऀ-ॿ]/.test(message) ? "dev" :
+        /\b(hai|hain|kya|kyaa|bhej|bhejo|bhejdo|bhejdena|chahiye|chaiye|karo|kardo|krdo|bata|batao|batana|kaun|kaunsa|kitna|kitne|nahi|nahin|mujhe|mereko|aap|aapko|haan|theek|dikhao|dedo|de\s*do|ka|ki|ke|wala|wale|wali)\b/i.test(message) ? "hin" :
+        "en";
+      const docLabel =
+        docTypeFromMsg === "unit_plan"  ? "unit plan"   :
+        docTypeFromMsg === "floor_plan" ? "floor plan"  :
+        docTypeFromMsg === "price_sheet" ? "price sheet" :
+        docTypeFromMsg.replace(/_/g, " ");
+
       if (toolResult.outcome === "SEND") {
         // Docs already shipped by the tool. Keep Gemini's "sending now" text
         // as the ack (it accurately reflects what we did).
@@ -1409,26 +1422,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           opts.length === 1 ? opts[0] :
           opts.length === 2 ? `${opts[0]} and ${opts[1]}` :
           `${opts.slice(0, -1).join(", ")}, and ${opts[opts.length - 1]}`;
-        const docLabel =
-          docTypeFromMsg === "unit_plan"  ? "unit plan"   :
-          docTypeFromMsg === "floor_plan" ? "floor plan"  :
-          docTypeFromMsg === "price_sheet" ? "price sheet" :
-          docTypeFromMsg;
-        reply = `Quick check before I send. We have a few ${docLabel}s for ${project}: ${inline}. Which one do you need?`;
+        reply =
+          custLang === "dev" ? `भेजने से पहले एक छोटा सा सवाल। ${project} के लिए हमारे पास कुछ ${docLabel} हैं: ${inline}। आपको कौन सा चाहिए?` :
+          custLang === "hin" ? `Bhejne se pehle ek quick check. ${project} ke liye humare paas kuch ${docLabel}s hain: ${inline}. Aapko kaunsa chahiye?` :
+          `Quick check before I send. We have a few ${docLabel}s for ${project}: ${inline}. Which one do you need?`;
         preflightHandled = true;
       } else if (toolResult.outcome === "NOT_FOUND") {
         // No matching row exists. REPLACE Gemini's "sending now" with a
         // casual deflection that admits we don't have it yet.
-        const docLabel =
-          docTypeFromMsg === "unit_plan"  ? "unit plan"   :
-          docTypeFromMsg === "floor_plan" ? "floor plan"  :
-          docTypeFromMsg === "price_sheet" ? "price sheet" :
-          docTypeFromMsg.replace(/_/g, " ");
-        reply = `Honestly haven't got the ${docLabel} for ${project} on hand right now. Lemme check with the team and revert. Tab tak kuch aur dekhna ho to bata dijiye.`;
+        reply =
+          custLang === "dev" ? `अभी ${project} का ${docLabel} मेरे पास तैयार नहीं है। टीम से चेक करके आपको भेजती हूँ। तब तक कुछ और देखना हो तो बताइए।` :
+          custLang === "hin" ? `Honestly abhi ${project} ka ${docLabel} mere paas ready nahi hai. Team se check karke bhejti hu. Tab tak kuch aur dekhna ho to bata dijiye.` :
+          `Honestly I don't have the ${project} ${docLabel} on hand right now. Let me check with the team and get back to you. Anything else I can help with meanwhile?`;
         preflightHandled = true;
       } else if (toolResult.outcome === "ERROR") {
         // Periskope or DB failure. Casual deflection.
-        reply = `Trying to send that to you. Periskope side se thodi dikkat aa rahi hai. Quick retry karke aati hu in a couple mins.`;
+        reply =
+          custLang === "dev" ? `आपको भेजने की कोशिश कर रही हूँ, भेजने में थोड़ी दिक्कत आ रही है। कुछ ही मिनटों में दोबारा भेजती हूँ।` :
+          custLang === "hin" ? `Aapko bhejne ki koshish kar rahi hu, sending side pe thodi dikkat aa rahi hai. Couple of mins me dobara try karti hu.` :
+          `Trying to get that across to you. Facing a small issue on the sending side, I'll retry in a couple of minutes.`;
         preflightHandled = true;
         console.error(`[Periskope Webhook] DocTool ERROR: ${toolResult.error}`);
       }
