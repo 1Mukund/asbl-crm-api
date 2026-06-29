@@ -1581,7 +1581,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "zoho-create-unique-lead-field", "zoho-create-call-scheduling-fields",
       "periskope-doc-diag", "portfolio-get", "portfolio-save",
       "callback-log", "zoho-lead-match-test", "storage-freshness",
-      "cron-runs",
+      "cron-runs", "mongo-sync-leads",
     ]);
     const incomingSecretTop =
       (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
@@ -5709,6 +5709,29 @@ ${SHARED_STYLE}
       });
     } catch (err: any) {
       console.error(`[upload-finalize] failed: ${err.message}`);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── FULL Zoho -> Mongo lead sync (in-house CRM source-of-truth) ────────
+  //   ADDITIVE — copies Zoho leads into Mongo `leads` so the CRM (and later
+  //   the bot) can read everything from Mongo. Touches NO bot/call/WhatsApp/
+  //   followup logic; it only reads Zoho and writes Mongo.
+  //   GET ?action=mongo-sync-leads&secret=...        -> backfill ALL leads
+  //   GET ?action=mongo-sync-leads&since=<ISO>&secret -> only modified-since
+  //   Returns counts; safe to re-run (idempotent upsert).
+  if (req.method === "GET" && req.query.action === "mongo-sync-leads") {
+    try {
+      const { runZohoLeadSync } = await import("./_utils/supabase");
+      const since = req.query.since ? String(req.query.since) : undefined;
+      const maxPages = req.query.max_pages ? Number(req.query.max_pages) : undefined;
+      const result = await runZohoLeadSync({ since, maxPages });
+      return res.status(200).json({
+        ok: true,
+        mode: since ? `incremental since ${since}` : "full backfill",
+        ...result,
+      });
+    } catch (err: any) {
       return res.status(500).json({ error: err.message });
     }
   }

@@ -354,3 +354,120 @@ export async function mirrorLeadStateToMongo(
     console.error(`[mirrorLeadStateToMongo] zoho_lead_id=${zohoLeadId} failed: ${err.message}`);
   }
 }
+
+// ─── FULL Zoho lead -> Mongo sync (for in-house CRM source-of-truth) ────────
+//
+// PURELY ADDITIVE. This does NOT touch any bot/call/WhatsApp/followup logic —
+// it only copies a Zoho lead record into the Mongo `leads` collection so the
+// in-house CRM (and, later, the bot) can read everything from Mongo.
+//
+// Differences vs mirrorLeadStateToMongo (which is whitelist + upsert:false):
+//   - upsert:TRUE  → leads created DIRECTLY in Zoho (sales manual / bulk /
+//     LeadChain) that never went through our ingest still land in Mongo.
+//   - FULL snapshot → every Zoho field is stored under `zoho`, plus the
+//     CRM-relevant ones mapped to flat snake_case for easy display.
+//
+// Existing ingest-created docs (which already carry zoho_lead_id, keyed by
+// plid) are matched + merged. Direct-Zoho leads with no Mongo doc get a new
+// doc keyed `zoho_<id>` so it never collides with a plid-keyed doc.
+export async function syncZohoLeadToMongo(
+  zohoLead: any,
+): Promise<"created" | "updated" | "skipped"> {
+  const id = zohoLead?.id;
+  if (!id) return "skipped";
+  const phone = String(zohoLead.Mobile || zohoLead.Phone || "").replace(/\D/g, "");
+  const now = new Date().toISOString();
+  const mapped: Record<string, any> = {
+    zoho_lead_id: id,
+    phone,
+    first_name: zohoLead.First_Name ?? "",
+    last_name: zohoLead.Last_Name ?? "",
+    email: zohoLead.Email ?? "",
+    project: zohoLead.ASBL_Project ?? "",
+    lead_source: zohoLead.Lead_Source ?? null,
+    lead_status: zohoLead.Lead_Status ?? null,
+    prd_stage: zohoLead.PRD_Stage ?? null,
+    prd_status: zohoLead.PRD_Status ?? null,
+    prd_last_action: zohoLead.PRD_Last_Action ?? null,
+    prd_last_action_time: zohoLead.PRD_Last_Action_Time ?? null,
+    chatbot_attempt_count: zohoLead.Chatbot_Attempt_Count ?? null,
+    chatbot_follow_up_count: zohoLead.Chatbot_Follow_up_Count ?? null,
+    last_intent: zohoLead.Last_Intent ?? null,
+    last_whatsapp_at: zohoLead.Last_Whatsapp_At ?? null,
+    whatsapp_replied: zohoLead.Whatsapp_Replied ?? null,
+    call_status: zohoLead.Call_Status ?? null,
+    total_call_duration_secs: zohoLead.Total_Call_Duration_Secs ?? null,
+    last_call_at: zohoLead.Last_Call_At ?? null,
+    last_recording_url: zohoLead.Last_Recording_URL ?? null,
+    next_call_at: zohoLead.Next_Call_At ?? null,
+    site_visit_date: zohoLead.Site_Visit_Date ?? null,
+    last_customer_response: zohoLead.Last_Customer_Response ?? null,
+    created_time: zohoLead.Created_Time ?? null,
+    modified_time: zohoLead.Modified_Time ?? null,
+    zoho: zohoLead,            // full raw snapshot — nothing is lost
+    zoho_synced_at: now,
+    updated_at: now,
+  };
+  const col = await getCollection<any>(COL.LEADS);
+  const existing = await col.findOne({ zoho_lead_id: id } as any);
+  if (existing) {
+    await col.updateOne({ zoho_lead_id: id } as any, { $set: mapped });
+    return "updated";
+  }
+  await col.updateOne(
+    { _id: `zoho_${id}` as any },
+    { $set: mapped, $setOnInsert: { doc_source: "zoho_sync" } },
+    { upsert: true },
+  );
+  return "created";
+}
+
+/** Page Zoho leads and full-sync each into Mongo. Shared by the backfill
+ *  endpoint and the incremental cron. `since` (ISO) → only modified-since;
+ *  omit → full backfill. PURELY ADDITIVE: reads Zoho, writes Mongo, never
+ *  touches the bot/call/WhatsApp/followup paths. */
+export async function runZohoLeadSync(
+  opts: { since?: string; maxPages?: number } = {},
+): Promise<{ pages: number; scanned: number; created: number; updated: number; skipped: number; ms: number; errors: string[] }> {
+  const t0 = Date.now();
+  const { getAccessToken } = await import("./zoho");
+  const token = await getAccessToken();
+  const ZBASE = "https://www.zohoapis.in/crm/v3";
+  const FIELDS = [
+    "id","First_Name","Last_Name","Mobile","Phone","Email","ASBL_Project",
+    "Lead_Source","Lead_Status","Created_Time","Modified_Time",
+    "PRD_Stage","PRD_Status","PRD_Last_Action","PRD_Last_Action_Time",
+    "Chatbot_Attempt_Count","Chatbot_Follow_up_Count","Last_Intent",
+    "Last_Whatsapp_At","Whatsapp_Replied","Call_Status",
+    "Total_Call_Duration_Secs","Last_Call_At","Last_Recording_URL",
+    "Next_Call_At","Site_Visit_Date","Last_Customer_Response",
+    "Last_Inhouse_Call_ID","Last_Arrowhead_Call_ID","Budget","Lead_Comments",
+  ].join(",");
+  const since = opts.since || "";
+  const maxPages = Math.min(opts.maxPages || 60, 200);
+  let page = 1, created = 0, updated = 0, skipped = 0, scanned = 0;
+  const errors: string[] = [];
+  while (page <= maxPages) {
+    const url = since
+      ? `${ZBASE}/Leads/search?criteria=${encodeURIComponent(`(Modified_Time:greater_equal:${since})`)}&fields=${FIELDS}&page=${page}&per_page=200`
+      : `${ZBASE}/Leads?fields=${FIELDS}&page=${page}&per_page=200&sort_by=Modified_Time&sort_order=desc`;
+    const r = await fetch(url, { headers: { Authorization: `Zoho-oauthtoken ${token}` } });
+    if (r.status === 204) break;
+    if (!r.ok) { errors.push(`page ${page}: ${r.status} ${(await r.text()).slice(0, 120)}`); break; }
+    const text = await r.text();
+    if (!text.trim()) break;
+    let data: any = null;
+    try { data = JSON.parse(text); } catch { break; }
+    const rows = (data?.data || []) as any[];
+    for (const row of rows) {
+      scanned++;
+      try {
+        const res = await syncZohoLeadToMongo(row);
+        if (res === "created") created++; else if (res === "updated") updated++; else skipped++;
+      } catch (e: any) { skipped++; errors.push(`${row.id}: ${e.message}`); }
+    }
+    if (!data?.info?.more_records) break;
+    page++;
+  }
+  return { pages: page, scanned, created, updated, skipped, ms: Date.now() - t0, errors: errors.slice(0, 10) };
+}

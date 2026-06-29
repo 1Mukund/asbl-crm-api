@@ -16,6 +16,10 @@
     {
       "path": "/api/cron/followup?task=pre-site-visit-reminders",
       "schedule": "23 * * * *"
+    },
+    {
+      "path": "/api/cron/followup?task=mongo-sync",
+      "schedule": "*/15 * * * *"
     }
   ]
 }

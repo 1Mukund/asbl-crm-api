@@ -664,6 +664,38 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ── Mongo lead sync (every 15 min) — Zoho -> Mongo, for in-house CRM ────
+  // PURELY ADDITIVE. Keeps the Mongo `leads` collection a complete + fresh
+  // copy of Zoho (incl. leads created directly in Zoho + sales manual edits)
+  // so the in-house CRM can read everything from Mongo. Does NOT touch any
+  // call/WhatsApp/followup logic — it only reads Zoho and writes Mongo.
+  // Incremental: syncs leads modified since the last run (with a 30-min
+  // overlap buffer so nothing slips through), tracked in bot_settings.
+  if (req.query.task === "mongo-sync") {
+    const start = Date.now();
+    try {
+      const { getBotSetting, setBotSetting } = await import("../_utils/bot_settings");
+      const { runZohoLeadSync } = await import("../_utils/supabase");
+      const lastRow = await getBotSetting("mongo_sync_last_run");
+      // 30-min overlap buffer; first-ever run defaults to last 24h.
+      const sinceMs = lastRow?.value
+        ? new Date(lastRow.value).getTime() - 30 * 60 * 1000
+        : Date.now() - 24 * 60 * 60 * 1000;
+      const since = new Date(sinceMs).toISOString().replace(/\.\d{3}Z$/, "+00:00");
+      const result = await runZohoLeadSync({ since, maxPages: 30 });
+      // Stamp the run time only on success (so a failed run re-tries the window).
+      if (!result.errors.length) {
+        await setBotSetting("mongo_sync_last_run", new Date(start).toISOString());
+      }
+      await logCronRun("mongo-sync", result.ms, result, result.errors.length ? `${result.errors.length} errors` : null);
+      return res.status(200).json({ task: "mongo-sync", since, ...result });
+    } catch (err: any) {
+      console.error("[Mongo Sync Cron] Fatal:", err.message);
+      await logCronRun("mongo-sync", Date.now() - start, {}, err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ── Pre-Site-Visit reminder cron (every hour) ──────────────────────────
   // Audit 2026-06-19 surfaced: leads with PRD_Stage = "Pre Site Visit" and
   // a future Site_Visit_Date were getting ZERO automated reminders because
