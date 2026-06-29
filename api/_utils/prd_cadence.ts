@@ -23,15 +23,20 @@ export const CFG = {
   /** X for no chatbot response — time after initial msg before SF status. */
   CHATBOT_NO_REPLY_WINDOW_MS: 24 * 60 * 60 * 1000, // 24h
 
-  /** Hard safety cap on total chatbot messages per lead. Cold (~30 in 15d)
-   *  + ghost (~7 in 7d) worst-case = ~37, with 50 as safety overhead. */
-  CHATBOT_FOLLOWUP_MAX_ATTEMPTS: 50,
+  /** Hard safety cap on total chatbot messages per lead. Cold (~60 in 30d)
+   *  + ghost (~7 in 7d) worst-case = ~67, with 80 as safety overhead so the
+   *  cap never cuts the 30-day cold window short. */
+  CHATBOT_FOLLOWUP_MAX_ATTEMPTS: 80,
 
   // ─── COLD branch ─────────────────────────────────────────────────────
   /** Gap between cold follow-ups. */
   COLD_FOLLOWUP_INTERVAL_MS: 7 * 60 * 60 * 1000, // 7h
-  /** Total window for cold follow-ups from Created_Time. */
-  COLD_FOLLOWUP_WINDOW_MS: 15 * 24 * 60 * 60 * 1000, // 15 days
+  /** Total window for cold follow-ups from Created_Time. Bumped 15->30 days
+   *  (2026-06-29) to re-engage the older lead backlog per product call. The
+   *  silence-stop in followup.ts keys off this same constant, so both extend
+   *  together. Leads created within 30 days that never replied resume the
+   *  7-hourly cold cadence; the cold branch closes them at day 30. */
+  COLD_FOLLOWUP_WINDOW_MS: 30 * 24 * 60 * 60 * 1000, // 30 days
   /** Customer-local hour window. */
   COLD_HOURS_START: 7,   // 7 AM
   COLD_HOURS_END: 21,    // 9 PM (exclusive)
