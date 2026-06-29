@@ -1580,7 +1580,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "sync-prompt-to-hardcoded", "mark-unique-leads",
       "zoho-create-unique-lead-field", "zoho-create-call-scheduling-fields",
       "periskope-doc-diag", "portfolio-get", "portfolio-save",
-      "callback-log", "zoho-lead-match-test",
+      "callback-log", "zoho-lead-match-test", "storage-freshness",
     ]);
     const incomingSecretTop =
       (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
@@ -5708,6 +5708,57 @@ ${SHARED_STYLE}
       });
     } catch (err: any) {
       console.error(`[upload-finalize] failed: ${err.message}`);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── Storage freshness: are NEW writes actually landing in Mongo? ───────
+  //   GET ?action=storage-freshness&secret=...
+  //   Shows newest timestamp + recent counts per write-path collection, so
+  //   we can tell "nothing stores" (broken writes) from "stored but stale"
+  //   (old backfill, no new traffic) from "working fine, just couldn't see it".
+  if (req.method === "GET" && req.query.action === "storage-freshness") {
+    try {
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const nowMs = Date.now();
+      const h24 = new Date(nowMs - 24 * 3600e3).toISOString();
+      const d7 = new Date(nowMs - 7 * 24 * 3600e3).toISOString();
+
+      // whatsapp_messages is phone-bucketed: each doc has last_message_at.
+      const wa = await getCollection(COL.WHATSAPP_MESSAGES);
+      const waNewest = await wa.find({} as any).sort({ last_message_at: -1 }).limit(1).toArray();
+      const waNewestTs = (waNewest[0] as any)?.last_message_at || null;
+      const waActive24h = await wa.countDocuments({ last_message_at: { $gte: h24 } } as any);
+      const waActive7d = await wa.countDocuments({ last_message_at: { $gte: d7 } } as any);
+      const waTotal = await wa.estimatedDocumentCount();
+
+      const newestOf = async (cname: string, field: string) => {
+        try {
+          const c = await getCollection(cname);
+          const newest = await c.find({} as any).sort({ [field]: -1 } as any).limit(1).toArray();
+          const total = await c.estimatedDocumentCount();
+          const recent24 = await c.countDocuments({ [field]: { $gte: h24 } } as any);
+          return { total, newest: (newest[0] as any)?.[field] || null, last24h: recent24 };
+        } catch (e: any) { return { error: e.message }; }
+      };
+
+      return res.status(200).json({
+        ok: true,
+        now: new Date(nowMs).toISOString(),
+        whatsapp_messages: {
+          phone_buckets: waTotal,
+          newest_message_at: waNewestTs,
+          buckets_active_last_24h: waActive24h,
+          buckets_active_last_7d: waActive7d,
+          newest_phone: (waNewest[0] as any)?._id || null,
+        },
+        follow_up_log:  await newestOf(COL.FOLLOW_UP_LOG, "created_at"),
+        doc_send_log:   await newestOf(COL.DOC_SEND_LOG, "created_at"),
+        callback_log:   await newestOf(COL.CALLBACK_LOG, "created_at"),
+        user_profiles:  await newestOf(COL.USER_PROFILES, "last_interaction_at"),
+        cron_log:       await newestOf(COL.CRON_LOG, "ran_at"),
+      });
+    } catch (err: any) {
       return res.status(500).json({ error: err.message });
     }
   }
