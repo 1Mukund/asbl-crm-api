@@ -287,13 +287,21 @@ async function runPrdCadenceProcessor(): Promise<{
         continue;
       }
 
-      // 7-DAY SILENCE AUTO-STOP — if a lead was created more than 7 days ago
-      // and we've had ZERO inbound + ZERO connected calls, stop bothering them.
-      // (PRD spec gives 3 chatbot follow-ups + 3 SS calls; if 7d in with no
-      //  engagement on EITHER channel, the customer is clearly not interested.)
-      const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+      // SILENCE AUTO-STOP — stop outreach to a never-engaged lead, but ONLY
+      // after the full cold follow-up window (15 days, CFG.COLD_FOLLOWUP_WINDOW_MS).
+      //
+      // BUG (fixed 2026-06-29): this used a hardcoded 7 days, citing the OLD
+      // "3 follow-ups" spec. The current spec is 15 days of 7-hourly cold
+      // pings for never-replied leads — but a 7-day silence stop short-circuits
+      // the loop (continue) BEFORE the cold branch runs, killing cold
+      // follow-ups at ~day 7. That's why leads like Sameer (created Jun 7,
+      // never replied) stopped at 3 follow-ups on Jun 11 instead of running
+      // through Jun 22. Aligning to the cold window lets the 15-day campaign
+      // actually run; the cold branch's own !withinColdWindow check then
+      // closes the lead cleanly at day 15.
+      const silenceStopMs = CFG.COLD_FOLLOWUP_WINDOW_MS;
       const createdTimeForSilence = lead.Created_Time ? new Date(lead.Created_Time).getTime() : 0;
-      if (createdTimeForSilence > 0 && (now - createdTimeForSilence) >= SEVEN_DAYS_MS) {
+      if (createdTimeForSilence > 0 && (now - createdTimeForSilence) >= silenceStopMs) {
         const totalCallSecs = Number(lead.Total_Call_Duration_Secs ?? 0);
         const customerEngagedEver = lead.PRD_Status === "CF" || lead.PRD_Status === "CS";
         // "Connected call" proxy = any total duration > 10s (rings <10s = no answer)
