@@ -486,25 +486,27 @@ export function detectsNotInterestedIntent(msg: string | null | undefined): bool
 function buildFollowupMessage(customerName: string, project: string | undefined, idx: number): string {
   const name = (customerName || "").trim() || "Sir/Ma'am";
   const proj = project || "ASBL";
+  // ENGLISH ONLY — all follow-ups must go in English regardless of customer
+  // language (product directive 2026-06-29). Warm, human, no em-dash.
   const messages = [
     // 1: Brochure / pricing offer
     `Hi ${name}, just following up on my earlier message about ${proj}. ` +
-    `Would you like me to share the brochure / pricing, or shall I help you schedule a quick site visit?`,
+    `Would you like me to share the brochure and pricing, or shall I help you schedule a quick site visit?`,
     // 2: Inventory urgency
-    `${name}, sharing one more time. ${proj} me popular configurations me limited inventory hai. ` +
-    `Are you available for a 10-minute call or a site visit this weekend?`,
+    `${name}, checking in once more. The popular configurations at ${proj} have limited inventory left. ` +
+    `Are you free for a 10-minute call or a site visit this weekend?`,
     // 3: Final-tone gentle
-    `Hi ${name}, just one more check-in. ${proj} ki current options aapke budget aur preference ke hisaab se discuss kar sakte hain. ` +
-    `Reply karein, main details share kar dungi.`,
+    `Hi ${name}, just one more check-in. We can tailor the ${proj} options to your budget and preferences. ` +
+    `Reply here and I'll share the details right away.`,
     // 4: Configuration-focused
-    `${name}, kya aapko ${proj} me kisi specific configuration / size ya floor me interest hai? ` +
-    `Bata dijiye, main matching options + pricing share karti hu.`,
+    `${name}, are you interested in any particular configuration, size or floor at ${proj}? ` +
+    `Let me know and I'll send the matching options with pricing.`,
     // 5: Site visit nudge
-    `Hi ${name}, ${proj} me ek quick site visit consider karenge? Even 30 minutes me poora project samajh aa jata hai. ` +
-    `Apka koi preferred day batayenge?`,
+    `Hi ${name}, would you consider a quick site visit to ${proj}? Even 30 minutes gives you a full feel of the project. ` +
+    `What day works best for you?`,
     // 6: Soft re-engage
-    `${name}, ek choti si update. ${proj} ke kuch new amenities aur payment options confirm hue hain. ` +
-    `Interested ho to reply karein, main share karti hu.`,
+    `${name}, a quick update. A few new amenities and payment options at ${proj} have just been confirmed. ` +
+    `If you're interested, reply here and I'll share them.`,
   ];
   return messages[(idx - 1) % messages.length];
 }
@@ -515,8 +517,8 @@ function buildFollowupMessage(customerName: string, project: string | undefined,
  *  bank of 4 messages.
  *
  *  lastInboundText is the customer's most recent reply text. If non-empty,
- *  we include a trimmed quote in the message. Empty → fallback to generic
- *  "hamari pichli baat" phrasing. */
+ *  we include a trimmed quote in the message. Empty → fallback to a generic
+ *  "our last conversation" phrasing. All output is ENGLISH only. */
 export function buildReengagementMessage(
   customerName: string,
   project: string | undefined,
@@ -535,25 +537,27 @@ export function buildReengagementMessage(
     .replace(/[*_~`]/g, "")
     .trim();
   const excerpt = cleaned.length > 80 ? cleaned.slice(0, 77) + "..." : cleaned;
+  // ENGLISH ONLY — all follow-ups go in English regardless of the customer's
+  // language (product directive 2026-06-29).
   const ctxPhrase = excerpt
-    ? `Aapne pichli baar likha tha: "${excerpt}".`
-    : `Hamari pichli baat ${proj} ke baare me chal rahi thi.`;
+    ? `you'd written earlier: "${excerpt}".`
+    : `our last conversation was about ${proj}.`;
 
   const messages = [
     // 1: Quote + soft remind
-    `Hi ${name}, ${ctxPhrase} Usi ke baare me follow karna chahti thi. Koi specific question hai jo abhi tak unanswered hai?`,
+    `Hi ${name}, ${ctxPhrase} I wanted to follow up on that. Is there a specific question that's still unanswered?`,
 
     // 2: Quote + offer next step
-    `${name}, ${ctxPhrase} Kya aap ${proj} ki updated pricing / availability dekhna chahenge? ` +
-    `Main 5 min me share kar dungi.`,
+    `${name}, ${ctxPhrase} Would you like to see the updated pricing and availability for ${proj}? ` +
+    `I can share it in 5 minutes.`,
 
     // 3: Quote + soft site-visit nudge
-    `Hi ${name}, ${ctxPhrase} Aapke convenience ke hisaab se ek 30-min site visit consider karenge? ` +
-    `Project poora samajh aa jata hai aur clarity bhi mil jati hai.`,
+    `Hi ${name}, ${ctxPhrase} Would a quick 30-minute site visit work for you at your convenience? ` +
+    `It gives you a complete feel of the project and a lot of clarity.`,
 
     // 4: Quote + direct ask
-    `${name}, ${ctxPhrase} Bata dijiye kya aapko aage badhne me koi confusion hai. Pricing, configuration, ya documentation. ` +
-    `Main resolve kar dungi.`,
+    `${name}, ${ctxPhrase} Let me know if anything is holding you back, whether it's pricing, configuration or documentation. ` +
+    `I'll get it sorted for you.`,
   ];
   return messages[(idx - 1) % messages.length];
 }
