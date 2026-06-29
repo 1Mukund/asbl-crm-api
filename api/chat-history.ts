@@ -749,7 +749,7 @@ ${SHARED_STYLE}
         <td>${esc(nameStr)}</td>
         <td>${esc(m.funnel)}</td>
         <td style="white-space:nowrap">${esc(m.lastStr)} <span style="color:#888">(${esc(m.ago)})</span></td>
-        <td style="text-align:center">${m.inbound}/${m.outbound}</td>
+        <td style="text-align:center"><a href="?view=chat&amp;phone=${encodeURIComponent(m.phone)}" title="View full WhatsApp conversation">${m.inbound}/${m.outbound} 💬</a></td>
         <td>${stateChip}</td>
         <td>
           <form method="POST" action="?action=toggle-bot&amp;phone=${encodeURIComponent(m.phone)}&amp;enabled=${toggleTarget}" style="display:inline" onsubmit="return confirm('${esc(confirmMsg)}')">
@@ -1554,7 +1554,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const session = auth.getSessionFromCookies(req.headers.cookie as string | undefined);
 
     // Views + actions that make up the dashboard UI surface (session-gated)
-    const DASHBOARD_VIEWS = new Set(["dashboard", "edit-prompt", "edit-facts", "audit", "users", "unique-leads"]);
+    const DASHBOARD_VIEWS = new Set(["dashboard", "edit-prompt", "edit-facts", "audit", "users", "unique-leads", "chat"]);
     const DASHBOARD_ACTIONS = new Set([
       "save-prompt", "reset-prompt", "save-facts", "delete-doc", "toggle-bot",
       "refresh-inventory", "set-pdf-extracts", "upload-sign", "upload-finalize",
@@ -1683,6 +1683,57 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).send(html);
     } catch (err: any) {
       return res.status(500).send(`<pre>Dashboard error: ${err.message}</pre>`);
+    }
+  }
+
+  // ─── Chat transcript view (HTML) — read the actual WhatsApp conversation ──
+  //   GET /api/chat-history?view=chat&phone=<phone>
+  //   Renders every inbound/outbound message for a phone from Mongo
+  //   whatsapp_messages as WhatsApp-style bubbles. This is what was missing:
+  //   messages were always stored, but there was no way to READ them in the UI.
+  if (req.method === "GET" && req.query.view === "chat") {
+    try {
+      const rawPhone = String(req.query.phone || "").replace(/\D/g, "");
+      if (rawPhone.length < 10) return res.status(400).send(`<pre>valid ?phone= required</pre>`);
+      const { getMessagesForPhone } = await import("./_utils/whatsapp_messages");
+      const msgs = await getMessagesForPhone(rawPhone, { limit: 1000 });
+      let prof: any = null;
+      try {
+        const { getCollection, COL } = await import("./_utils/mongo");
+        const pc = await getCollection(COL.USER_PROFILES);
+        prof = await pc.findOne({ _id: rawPhone as any } as any) || await pc.findOne({ phone: rawPhone } as any);
+      } catch {}
+      const name = prof?.name || "";
+      const bubbles = msgs.length ? msgs.map((m) => {
+        const out = m.direction === "outbound";
+        const when = m.created_at ? new Date(m.created_at).toLocaleString("en-IN") : "";
+        const meta = [m.project, m.intent].filter(Boolean).join(" · ");
+        return `<div style="display:flex;justify-content:${out ? "flex-end" : "flex-start"};margin:6px 0">
+          <div style="max-width:72%;background:${out ? "#dcf8c6" : "#fff"};border:1px solid #e0e0e0;border-radius:10px;padding:8px 11px;box-shadow:0 1px 1px rgba(0,0,0,.06)">
+            <div style="font-size:14px;color:#111;white-space:pre-wrap;word-break:break-word">${esc(m.message || "")}</div>
+            <div style="font-size:10px;color:#888;margin-top:4px;text-align:right">${out ? "Anandita" : (name || "Customer")}${meta ? " · " + esc(meta) : ""} · ${esc(when)}</div>
+          </div>
+        </div>`;
+      }).join("") : `<div class="empty" style="padding:40px;text-align:center;color:#888">No messages stored for this number.</div>`;
+      const inCount = msgs.filter((m) => m.direction === "inbound").length;
+      const outCount = msgs.filter((m) => m.direction === "outbound").length;
+      const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>Chat — ${esc(name || rawPhone)}</title>
+        <style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#ece5dd}
+        .hdr{position:sticky;top:0;background:#075e54;color:#fff;padding:12px 16px;display:flex;align-items:center;gap:12px}
+        .hdr a{color:#fff;text-decoration:none;font-size:20px}.hdr .nm{font-weight:600}.hdr .sub{font-size:12px;opacity:.85}
+        .wrap{max-width:780px;margin:0 auto;padding:14px 14px 60px}</style></head>
+        <body>
+        <div class="hdr"><a href="?view=dashboard" title="Back">←</a>
+          <div><div class="nm">${esc(name || rawPhone)}</div><div class="sub">${esc(rawPhone)} · ${msgs.length} messages (${inCount} in / ${outCount} out)</div></div>
+        </div>
+        <div class="wrap">${bubbles}</div>
+        </body></html>`;
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).send(html);
+    } catch (err: any) {
+      return res.status(500).send(`<pre>Chat view error: ${err.message}</pre>`);
     }
   }
 
