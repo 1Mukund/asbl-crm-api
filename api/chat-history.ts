@@ -225,6 +225,14 @@ function nextCronRun(schedule: string): string {
 async function renderDashboard(): Promise<string> {
   const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
+  // Authoritative project portfolio (ready-to-move / possession) — shown in
+  // an editable card so the PM can update it without a deploy.
+  let portfolioText = "";
+  try {
+    const { getPortfolioOverview } = await import("./_utils/project_facts");
+    portfolioText = await getPortfolioOverview();
+  } catch {}
+
   // All tables Mongo-backed as of Phase 8.
   const { getRecentActivity, getInboundIntentStats, listConversationPhones } = await import("./_utils/whatsapp_messages");
   const { listAllProfiles } = await import("./_utils/user_profile");
@@ -615,6 +623,40 @@ ${SHARED_STYLE}
 
   <div class="grid">
 
+  <div class="card full" id="portfolio">
+    <h2>0. Project Portfolio — Ready-to-Move &amp; Possession (authoritative)</h2>
+    <div class="proj-help">
+      The bot injects this into <strong>every</strong> reply as ground-truth for "ready to move" /
+      possession / "which project" questions. Edit and Save — live within ~60 seconds, no deploy.
+      <br><strong>Keep it accurate:</strong> the bot will quote possession dates and the ready-to-move
+      project (Spectra) straight from here.
+    </div>
+    <textarea id="pf-text" style="width:100%;min-height:220px;font-family:ui-monospace,monospace;font-size:13px;padding:10px;border:1px solid var(--border,#ccc);border-radius:6px;box-sizing:border-box">${esc(portfolioText)}</textarea>
+    <div style="margin-top:10px;display:flex;gap:10px;align-items:center">
+      <button class="btn-primary" onclick="savePortfolio(this)">Save portfolio</button>
+      <span id="pf-msg" style="font-size:13px;color:#888"></span>
+    </div>
+  </div>
+
+  <div class="card full" id="ops">
+    <h2>0b. Ops &amp; Diagnostics</h2>
+    <div class="proj-help">
+      Health checks for the WhatsApp + calling + followup pipeline. Click a button to run it live.
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+      <button class="btn-mini" onclick="ops('storage-freshness', this)">📦 Storage freshness (are writes landing?)</button>
+      <button class="btn-mini" onclick="ops('cron-runs&task=prd-cadence', this)">🔁 Followups ticking? (cron runs)</button>
+      <button class="btn-mini" onclick="ops('cron-runs&task=mongo-sync', this)">🗂️ Mongo sync status</button>
+      <button class="btn-mini" onclick="ops('callback-log', this)">📞 Callback log (why a call did/didn't fire)</button>
+      <button class="btn-mini" onclick="ops('audit-project-docs', this)">📄 Document audit (per project)</button>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+      <input id="lead-phone" type="text" placeholder="phone e.g. 98xxxxxxxx" style="padding:7px;border:1px solid var(--border,#ccc);border-radius:6px;min-width:200px" />
+      <button class="btn-mini" onclick="leadMatch(this)">🔎 Lead match test (does the bot find this Zoho lead?)</button>
+    </div>
+    <pre id="ops-out" style="background:var(--surface-muted,#f6f6f6);padding:12px;border-radius:6px;font-size:12px;max-height:420px;overflow:auto;white-space:pre-wrap;margin:0">Click a button above to run a check…</pre>
+  </div>
+
   <div class="card full">
     <h2>1. Project Offer Details (per project)</h2>
     <div class="proj-help">
@@ -849,6 +891,41 @@ curl "https://asbl-crm-api.vercel.app/api/chat-history?action=backfill-doc-meta&
 <input type="file" id="hidden-file-input" accept=".pdf,.txt,application/pdf,text/plain" style="display:none" />
 
 <script>
+// ── Portfolio editor + Ops/diagnostics (session-authed via cookie) ──
+async function savePortfolio(btn) {
+  var t = (document.getElementById('pf-text').value || '').trim();
+  var msg = document.getElementById('pf-msg');
+  if (t.length < 30) { msg.textContent = 'Too short.'; msg.style.color = '#a00'; return; }
+  btn.disabled = true; msg.style.color = '#888'; msg.textContent = 'Saving…';
+  try {
+    var r = await fetch('?action=portfolio-save', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: t }),
+    });
+    var j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || 'save failed');
+    msg.style.color = '#080'; msg.textContent = 'Saved ✓ (live within ~60s)';
+  } catch (e) { msg.style.color = '#a00'; msg.textContent = 'Error: ' + e.message; }
+  btn.disabled = false;
+}
+async function ops(action, btn) {
+  var out = document.getElementById('ops-out');
+  out.textContent = 'Running ' + action + ' …';
+  if (btn) btn.disabled = true;
+  try {
+    var r = await fetch('?action=' + action, { credentials: 'include' });
+    var j = await r.json();
+    out.textContent = JSON.stringify(j, null, 2);
+  } catch (e) { out.textContent = 'Error: ' + e.message; }
+  if (btn) btn.disabled = false;
+}
+function leadMatch(btn) {
+  var p = (document.getElementById('lead-phone').value || '').replace(/\\D/g, '');
+  if (p.length < 10) { document.getElementById('ops-out').textContent = 'Enter a valid phone.'; return; }
+  ops('zoho-lead-match-test&phone=' + encodeURIComponent(p), btn);
+}
+
 // ── Upload flow: signed-URL direct to Supabase, then finalize metadata ──
 const _fileInput = document.getElementById('hidden-file-input');
 let _ctx = null;
@@ -1566,6 +1643,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "audit-project-docs",
       "send-doc-test",
       "export-all-kb",
+      // Ops/diagnostics + portfolio — surfaced on the dashboard. Session-gated
+      // here (so the logged-in dashboard can call them via cookie) AND
+      // secret-capable (so curl/automation still works).
+      "portfolio-get", "portfolio-save", "callback-log", "zoho-lead-match-test",
+      "storage-freshness", "cron-runs", "mongo-sync-leads",
     ]);
     const ADMIN_ONLY = new Set(["audit", "users", "approve-user", "reject-user"]);
     // Actions that are session-gated for dashboard use BUT also accept a
