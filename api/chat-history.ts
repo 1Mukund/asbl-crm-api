@@ -1581,6 +1581,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "zoho-create-unique-lead-field", "zoho-create-call-scheduling-fields",
       "periskope-doc-diag", "portfolio-get", "portfolio-save",
       "callback-log", "zoho-lead-match-test", "storage-freshness",
+      "cron-runs",
     ]);
     const incomingSecretTop =
       (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
@@ -5708,6 +5709,37 @@ ${SHARED_STYLE}
       });
     } catch (err: any) {
       console.error(`[upload-finalize] failed: ${err.message}`);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── Cron runs: are followups (prd-cadence) actually ticking? ───────────
+  //   GET ?action=cron-runs&secret=...[&task=prd-cadence&limit=30]
+  //   Reads cron_log newest-first. The new cold/ghost WhatsApp followups do
+  //   NOT write follow_up_log (that's the OLD system); they're counted in the
+  //   prd-cadence run result as chatbot_ticks. This shows whether they fire.
+  if (req.method === "GET" && req.query.action === "cron-runs") {
+    try {
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const col = await getCollection(COL.CRON_LOG);
+      const limit = Math.min(Number(req.query.limit) || 30, 200);
+      const q: any = {};
+      if (req.query.task) q.task = String(req.query.task);
+      const rows = await col.find(q).sort({ ran_at: -1 }).limit(limit).toArray();
+      const runs = (rows as any[]).map((r) => ({
+        task: r.task,
+        ran_at: r.ran_at,
+        duration_ms: r.duration_ms,
+        error: r.error || null,
+        // surface the followup-relevant counters when present
+        scanned: r.result?.scanned ?? null,
+        chatbot_ticks: r.result?.chatbot_ticks ?? null,
+        ss_call_ticks: r.result?.ss_call_ticks ?? null,
+        exhaustion_closes: r.result?.exhaustion_closes ?? null,
+      }));
+      const totalTicks = runs.reduce((s, r) => s + (Number(r.chatbot_ticks) || 0), 0);
+      return res.status(200).json({ ok: true, count: runs.length, total_chatbot_ticks_in_window: totalTicks, runs });
+    } catch (err: any) {
       return res.status(500).json({ error: err.message });
     }
   }
