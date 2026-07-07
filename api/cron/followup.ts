@@ -231,6 +231,7 @@ async function runPrdCadenceProcessor(): Promise<{
       `Chatbot_Attempt_Count,Chatbot_Follow_up_Count,` +
       `Total_Call_Duration_Secs,` +  // needed for 7-day silence check
       `Next_Call_At,` +              // v3 call gate — slot-based scheduling
+      `Last_Inhouse_Call_ID,` +      // stalled-call safety-net guard (has this lead ever been called?)
       `Site_Visit_Date,Last_Customer_Response,Intent_Captured,` +
       `Last_Resubmission_At`;
     const leads: any[] = [];
