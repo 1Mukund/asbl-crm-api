@@ -1647,7 +1647,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // here (so the logged-in dashboard can call them via cookie) AND
       // secret-capable (so curl/automation still works).
       "portfolio-get", "portfolio-save", "callback-log", "zoho-lead-match-test",
-      "storage-freshness", "cron-runs", "mongo-sync-leads",
+      "storage-freshness", "cron-runs", "mongo-sync-leads", "set-followup-pause",
+      "sender-stats",
     ]);
     const ADMIN_ONLY = new Set(["audit", "users", "approve-user", "reject-user"]);
     // Actions that are session-gated for dashboard use BUT also accept a
@@ -1663,7 +1664,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "zoho-create-unique-lead-field", "zoho-create-call-scheduling-fields",
       "periskope-doc-diag", "portfolio-get", "portfolio-save",
       "callback-log", "zoho-lead-match-test", "storage-freshness",
-      "cron-runs", "mongo-sync-leads",
+      "cron-runs", "mongo-sync-leads", "set-followup-pause", "sender-stats",
     ]);
     const incomingSecretTop =
       (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
@@ -5844,6 +5845,107 @@ ${SHARED_STYLE}
       }));
       const totalTicks = runs.reduce((s, r) => s + (Number(r.chatbot_ticks) || 0), 0);
       return res.status(200).json({ ok: true, count: runs.length, total_chatbot_ticks_in_window: totalTicks, runs });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── Sender message stats (per Periskope sender number) ─────────────────
+  //   GET ?action=sender-stats&secret=...
+  //   Read-only aggregation over whatsapp_messages + dead_senders. Powers the
+  //   "messages per sender / by date / first switch-off (block)" sheet.
+  //   - outbound counted per sender (our Periskope numbers)
+  //   - per (sender, date) outbound counts
+  //   - "proactive" proxy = outbound in buckets with ZERO inbound (never-
+  //     replied leads) — approximates cold follow-ups (the system doesn't
+  //     tag follow-ups explicitly)
+  //   - dead_senders with first_dead_at (treated as the block time)
+  if (req.method === "GET" && req.query.action === "sender-stats") {
+    try {
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const wa = await getCollection(COL.WHATSAPP_MESSAGES);
+      const docs = await wa.find({} as any).toArray();
+      const perSender: Record<string, number> = {};
+      const perSenderInbound: Record<string, number> = {}; // by bucket sticky? no sender on inbound; skip
+      const perSenderProactive: Record<string, number> = {};
+      const perSenderDate: Record<string, number> = {}; // `${sender}__${date}`
+      let totalOutbound = 0, totalInbound = 0;
+      for (const d of docs as any[]) {
+        const byDate = d.by_date || {};
+        let bucketInbound = 0;
+        for (const b of Object.values(byDate) as any[]) bucketInbound += (b?.inbound?.length || 0);
+        const bucketHasInbound = bucketInbound > 0;
+        for (const [date, b] of Object.entries(byDate) as any[]) {
+          totalInbound += (b?.inbound?.length || 0);
+          for (const o of (b?.outbound || [])) {
+            const s = String(o?.sender || "(unknown)");
+            perSender[s] = (perSender[s] || 0) + 1;
+            perSenderDate[`${s}__${date}`] = (perSenderDate[`${s}__${date}`] || 0) + 1;
+            if (!bucketHasInbound) perSenderProactive[s] = (perSenderProactive[s] || 0) + 1;
+            totalOutbound++;
+          }
+        }
+      }
+      const senders = Object.entries(perSender)
+        .map(([sender, outbound]) => ({ sender, outbound, proactive_outbound_approx: perSenderProactive[sender] || 0 }))
+        .sort((a, b) => b.outbound - a.outbound);
+      const bySenderDate = Object.entries(perSenderDate)
+        .map(([k, outbound]) => { const [sender, date] = k.split("__"); return { sender, date, outbound }; })
+        .sort((a, b) => a.sender.localeCompare(b.sender) || a.date.localeCompare(b.date));
+
+      const ds = await getCollection(COL.DEAD_SENDERS);
+      const deadDocs = await ds.find({} as any).toArray();
+      const dead_senders = (deadDocs as any[])
+        .map((d) => ({
+          sender: String(d._id),
+          first_dead_at: d.first_dead_at || d.dead_at || null,
+          last_dead_at: d.dead_at || null,
+          consecutive_failures: d.consecutive_failures || 0,
+          flagged_permanent: !!d.alerted_permanent,
+        }))
+        .sort((a, b) => String(a.first_dead_at).localeCompare(String(b.first_dead_at)));
+
+      return res.status(200).json({
+        ok: true,
+        phone_buckets_scanned: docs.length,
+        total_outbound: totalOutbound,
+        total_inbound: totalInbound,
+        senders,
+        by_sender_date: bySenderDate,
+        dead_senders,
+        notes: {
+          proactive_outbound_approx: "outbound to buckets with zero inbound (never-replied leads) — a proxy for cold follow-ups; the system does not tag follow-ups explicitly",
+          dead_senders: "only currently-failing senders are retained; a sender's doc is deleted on its next successful send, so recovered senders are not listed here. first_dead_at = start of the current failure streak (treated as the block time).",
+        },
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── Pause / resume WhatsApp follow-ups (calls unaffected) ──────────────
+  //   GET ?action=set-followup-pause&paused=true|false&secret=...
+  //   Sets bot_settings.whatsapp_followups_paused. The prd-cadence cron reads
+  //   it each tick — pausing skips cold/ghost chatbot sends while calls keep
+  //   running. No deploy needed to pause or resume.
+  if (req.query.action === "set-followup-pause") {
+    try {
+      const { getBotSetting, setBotSetting } = await import("./_utils/bot_settings");
+      if (req.query.paused === undefined) {
+        const row = await getBotSetting("whatsapp_followups_paused");
+        return res.status(200).json({ ok: true, whatsapp_followups_paused: row?.value === "true" });
+      }
+      const paused = String(req.query.paused) === "true";
+      const result = await setBotSetting("whatsapp_followups_paused", paused ? "true" : "false");
+      if (!result.ok) return res.status(500).json({ error: result.error });
+      return res.status(200).json({
+        ok: true,
+        whatsapp_followups_paused: paused,
+        note: paused
+          ? "WhatsApp cold/ghost follow-ups PAUSED. Calls still run. Resume with &paused=false."
+          : "WhatsApp follow-ups RESUMED.",
+        effective: "next prd-cadence tick (within ~15 min)",
+      });
     } catch (err: any) {
       return res.status(500).json({ error: err.message });
     }
