@@ -275,6 +275,21 @@ async function runPrdCadenceProcessor(): Promise<{
       console.error(`[PRD cron] bot_enabled lookup failed: ${err.message}`);
     }
 
+    // GLOBAL WhatsApp-follow-up pause switch. When bot_settings
+    // whatsapp_followups_paused = "true", we skip the cold/ghost chatbot
+    // follow-up sends this tick but STILL run the call cadence (calls are
+    // unaffected). Toggle from the dashboard / ?action=set-followup-pause —
+    // no deploy needed to pause or resume.
+    let waFollowupsPaused = false;
+    try {
+      const { getBotSetting } = await import("../_utils/bot_settings");
+      const row = await getBotSetting("whatsapp_followups_paused");
+      waFollowupsPaused = row?.value === "true";
+      if (waFollowupsPaused) console.log("[PRD cron] WhatsApp follow-ups PAUSED — skipping chatbot ticks (calls still run)");
+    } catch (err: any) {
+      console.error(`[PRD cron] followup-pause lookup failed: ${err.message}`);
+    }
+
     for (const lead of leads) {
       if (!lead.PRD_Stage) continue;            // not on PRD flow yet
       if (lead.PRD_Stage === "Not Interested") continue;
@@ -350,7 +365,9 @@ async function runPrdCadenceProcessor(): Promise<{
         const followupsSent = lead.Chatbot_Follow_up_Count ?? 0;
         const counterUnderCap = followupsSent < CFG.CHATBOT_FOLLOWUP_MAX_ATTEMPTS;
 
-        if (counterUnderCap && createdTime > 0) {
+        // waFollowupsPaused (global switch) skips ALL cold/ghost chatbot sends
+        // this tick while leaving the call cadence below untouched.
+        if (!waFollowupsPaused && counterUnderCap && createdTime > 0) {
           try {
             const { getCollection, COL } = await import("../_utils/mongo");
             const wmCol = await getCollection(COL.WHATSAPP_MESSAGES);
