@@ -181,6 +181,7 @@ async function runPrdCadenceProcessor(): Promise<{
   ss_call_ticks: number;
   no_reply_transitions: number;
   exhaustion_closes: number;
+  stalled_calls_rescheduled: number;
   errors: any[];
 }> {
   const start = Date.now();
@@ -190,6 +191,7 @@ async function runPrdCadenceProcessor(): Promise<{
   let ssCallTicks = 0;
   let noReplyTransitions = 0;
   let exhaustionCloses = 0;
+  let stalledRescheduled = 0;
 
   try {
     const { getAccessToken, updateLead } = await import("../_utils/zoho");
@@ -251,7 +253,7 @@ async function runPrdCadenceProcessor(): Promise<{
       if (!data?.info?.more_records) break;
     }
     if (!leads.length) {
-      return { ms: Date.now() - start, scanned: 0, chatbot_ticks: 0, ss_call_ticks: 0, no_reply_transitions: 0, exhaustion_closes: 0, errors: [] };
+      return { ms: Date.now() - start, scanned: 0, chatbot_ticks: 0, ss_call_ticks: 0, no_reply_transitions: 0, exhaustion_closes: 0, stalled_calls_rescheduled: 0, errors: [] };
     }
 
     // Per-phone bot kill-switch lookup. The inbound webhook respects
@@ -507,14 +509,26 @@ async function runPrdCadenceProcessor(): Promise<{
         //    slot hours + 7-day lifetime cap.
         {
           const nextCallAtMs = lead.Next_Call_At ? new Date(lead.Next_Call_At).getTime() : 0;
+          // Compute the next MISS-grid slot now (respects the 7-day cap — null
+          // once the lead is past its lifetime). Used both as the SELF-HEAL
+          // value when firing and as the SAFETY-NET reschedule value.
+          const { nextCallAfterMiss, zohoIso: schedIso } = await import("../_utils/call_scheduling");
+          const nextSlot = nextCallAfterMiss({ phone, createdAt: lead.Created_Time });
+          const nextSlotIso = nextSlot.nextCallAt ? schedIso(nextSlot.nextCallAt) : null;
+
           if (nextCallAtMs > 0 && nextCallAtMs <= now) {
             try {
-              // Clear Next_Call_At up front so we don't re-fire if the
-              // posthook is slow (same call would otherwise fire every
-              // 15 min). Posthook will set the next slot when it arrives.
-              await updateLead(lead.id, { Next_Call_At: null });
-              await mirrorLeadStateToMongo(lead.id, { Next_Call_At: null });
-              // Fire the actual call via the same relay that T=0 uses.
+              // SELF-HEAL (fix 2026-07-07): set Next_Call_At to the NEXT slot
+              // up front instead of null. Previously it was cleared to null and
+              // ONLY the posthook re-set it — so a single missed posthook
+              // (failed call / dropped call_completed webhook) stalled the lead
+              // forever with Next_Call_At=null and no more calls. Setting the
+              // next slot means the cadence self-recovers even if the posthook
+              // never lands; the posthook simply overwrites this with the
+              // outcome-accurate slot when it does arrive. (Slot is >= next grid
+              // hour, so no 15-min re-fire loop.)
+              await updateLead(lead.id, { Next_Call_At: nextSlotIso });
+              await mirrorLeadStateToMongo(lead.id, { Next_Call_At: nextSlotIso });
               const { fireAiCallDirect } = await import("../_utils/prd_orchestrator");
               await fireAiCallDirect({
                 zoho_lead_id: lead.id,
@@ -525,6 +539,20 @@ async function runPrdCadenceProcessor(): Promise<{
               ssCallTicks++;
             } catch (err: any) {
               console.error(`[PRD cron] call fire failed for ${lead.id}: ${err.message}`);
+            }
+          } else if (nextCallAtMs === 0 && nextSlotIso && lead.Last_Inhouse_Call_ID) {
+            // SAFETY-NET (fix 2026-07-07): the lead has already had a call but
+            // Next_Call_At is null while still inside the 7-day window — i.e.
+            // its scheduling posthook was missed and it's stuck. Re-schedule
+            // the next slot so calling resumes on the next tick. Guarded by
+            // Last_Inhouse_Call_ID so we never step on a brand-new lead's T=0
+            // flow, and by nextSlotIso (non-null) so past-cap leads stay closed.
+            try {
+              await updateLead(lead.id, { Next_Call_At: nextSlotIso });
+              await mirrorLeadStateToMongo(lead.id, { Next_Call_At: nextSlotIso });
+              stalledRescheduled++;
+            } catch (err: any) {
+              console.error(`[PRD cron] stalled-call reschedule failed for ${lead.id}: ${err.message}`);
             }
           }
         }
@@ -543,6 +571,7 @@ async function runPrdCadenceProcessor(): Promise<{
     ss_call_ticks: ssCallTicks,
     no_reply_transitions: noReplyTransitions,
     exhaustion_closes: exhaustionCloses,
+    stalled_calls_rescheduled: stalledRescheduled,
     errors: errors.slice(0, 10),
   };
 }
