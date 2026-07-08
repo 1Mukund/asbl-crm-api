@@ -1648,7 +1648,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // secret-capable (so curl/automation still works).
       "portfolio-get", "portfolio-save", "callback-log", "zoho-lead-match-test",
       "storage-freshness", "cron-runs", "mongo-sync-leads", "set-followup-pause",
-      "sender-stats",
+      "sender-stats", "message-rows",
     ]);
     const ADMIN_ONLY = new Set(["audit", "users", "approve-user", "reject-user"]);
     // Actions that are session-gated for dashboard use BUT also accept a
@@ -1665,6 +1665,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "periskope-doc-diag", "portfolio-get", "portfolio-save",
       "callback-log", "zoho-lead-match-test", "storage-freshness",
       "cron-runs", "mongo-sync-leads", "set-followup-pause", "sender-stats",
+      "message-rows",
     ]);
     const incomingSecretTop =
       (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
@@ -5860,6 +5861,53 @@ ${SHARED_STYLE}
   //     replied leads) — approximates cold follow-ups (the system doesn't
   //     tag follow-ups explicitly)
   //   - dead_senders with first_dead_at (treated as the block time)
+  // ─── Raw per-message rows (for deep sender analytics / Excel) ───────────
+  //   GET ?action=message-rows&secret=...
+  //   Flattens whatsapp_messages into compact rows so richer analytics can be
+  //   computed client-side: per-number × day × time distinct users, message
+  //   character lengths, per-number daily inbounds, and concurrency (one
+  //   number replying to multiple users at once). Inbound has no sender field,
+  //   so it's attributed to the conversation's sticky sender.
+  //   Row: { s: sender, p: customer_phone, t: epoch_ms, d: "o"|"i", l: char_len }
+  if (req.method === "GET" && req.query.action === "message-rows") {
+    try {
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const wa = await getCollection(COL.WHATSAPP_MESSAGES);
+      // sticky sender map (phone -> our sender number) for inbound attribution
+      const sticky: Record<string, string> = {};
+      try {
+        const sm = await getCollection(COL.WHATSAPP_SENDER_MAP);
+        for (const s of (await sm.find({} as any).toArray()) as any[]) {
+          const ph = String(s._id || s.phone || "").replace(/\D/g, "");
+          if (ph && s.sender) sticky[ph] = String(s.sender);
+        }
+      } catch {}
+      const parseTs = (raw: any): number => {
+        if (raw == null) return 0;
+        if (typeof raw === "number" && isFinite(raw)) return raw;
+        const n = Number(raw); if (isFinite(n) && n > 1e12) return n;
+        const t = new Date(raw).getTime(); return isFinite(t) ? t : 0;
+      };
+      const docs = await wa.find({} as any).toArray();
+      const rows: any[] = [];
+      for (const d of docs as any[]) {
+        const phone = String(d._id || "").replace(/\D/g, "");
+        const byDate = d.by_date || {};
+        for (const b of Object.values(byDate) as any[]) {
+          for (const o of (b?.outbound || [])) {
+            rows.push({ s: String(o?.sender || "(unknown)"), p: phone, t: parseTs(o?.time), d: "o", l: String(o?.msg ?? "").length });
+          }
+          for (const inb of (b?.inbound || [])) {
+            rows.push({ s: sticky[phone] || "(unknown)", p: phone, t: parseTs(inb?.time), d: "i", l: String(inb?.msg ?? "").length });
+          }
+        }
+      }
+      return res.status(200).json({ ok: true, buckets: docs.length, count: rows.length, rows });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   if (req.method === "GET" && req.query.action === "sender-stats") {
     try {
       const { getCollection, COL } = await import("./_utils/mongo");

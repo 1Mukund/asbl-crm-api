@@ -40,11 +40,16 @@ const VOICEBOT_API_KEY = process.env.ASBL_VOICEBOT_API_KEY || "";
 function toE164(raw: string): string {
   const trimmed = String(raw || "").trim();
   if (!trimmed) return "";
-  if (trimmed.startsWith("+")) return trimmed;
-  const digits = trimmed.replace(/\D/g, "");
+  // Strip everything that isn't a digit (drops +, spaces, dashes, parens).
+  let digits = trimmed.replace(/\D/g, "");
+  // Drop leading zeros — STD / international trunk prefixes (e.g. "0 98765…",
+  // "00 91 98765…"). Voice-bot dev requires E.164 with NO leading 0, and the
+  // old code passed "09876543210" straight through as "+09876543210" (invalid).
+  digits = digits.replace(/^0+/, "");
   if (!digits) return "";
-  // Heuristic: if 10 digits and looks Indian, prepend 91
+  // Bare 10-digit → Indian mobile → prepend 91.
   if (digits.length === 10) return `+91${digits}`;
+  // Otherwise it already carries a country code (91XXXXXXXXXX, 1XXXXXXXXXX, …).
   return `+${digits}`;
 }
 
