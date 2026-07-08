@@ -370,14 +370,13 @@ export async function mirrorLeadStateToMongo(
 // Existing ingest-created docs (which already carry zoho_lead_id, keyed by
 // plid) are matched + merged. Direct-Zoho leads with no Mongo doc get a new
 // doc keyed `zoho_<id>` so it never collides with a plid-keyed doc.
-export async function syncZohoLeadToMongo(
-  zohoLead: any,
-): Promise<"created" | "updated" | "skipped"> {
+/** Pure mapper: Zoho lead → the flat Mongo `leads` doc. No DB access. */
+function mapZohoLead(zohoLead: any): Record<string, any> | null {
   const id = zohoLead?.id;
-  if (!id) return "skipped";
+  if (!id) return null;
   const phone = String(zohoLead.Mobile || zohoLead.Phone || "").replace(/\D/g, "");
   const now = new Date().toISOString();
-  const mapped: Record<string, any> = {
+  return {
     zoho_lead_id: id,
     phone,
     first_name: zohoLead.First_Name ?? "",
@@ -408,18 +407,30 @@ export async function syncZohoLeadToMongo(
     zoho_synced_at: now,
     updated_at: now,
   };
+}
+
+let _leadsIdxEnsured = false;
+async function ensureLeadsZohoIndex(col: any): Promise<void> {
+  if (_leadsIdxEnsured) return;
+  try { await col.createIndex({ zoho_lead_id: 1 }); _leadsIdxEnsured = true; } catch { /* non-fatal */ }
+}
+
+/** Full upsert of a single Zoho lead into Mongo `leads`, keyed on zoho_lead_id
+ *  (one op, index-backed — no findOne). New leads get a Mongo-generated _id;
+ *  existing docs (ingest plid-keyed or prior sync) are matched + updated. */
+export async function syncZohoLeadToMongo(
+  zohoLead: any,
+): Promise<"created" | "updated" | "skipped"> {
+  const mapped = mapZohoLead(zohoLead);
+  if (!mapped) return "skipped";
   const col = await getCollection<any>(COL.LEADS);
-  const existing = await col.findOne({ zoho_lead_id: id } as any);
-  if (existing) {
-    await col.updateOne({ zoho_lead_id: id } as any, { $set: mapped });
-    return "updated";
-  }
-  await col.updateOne(
-    { _id: `zoho_${id}` as any },
-    { $set: mapped, $setOnInsert: { doc_source: "zoho_sync" } },
+  await ensureLeadsZohoIndex(col);
+  const r = await col.updateOne(
+    { zoho_lead_id: mapped.zoho_lead_id } as any,
+    { $set: mapped },
     { upsert: true },
   );
-  return "created";
+  return r.upsertedCount ? "created" : "updated";
 }
 
 /** Page Zoho leads and full-sync each into Mongo. Shared by the backfill
@@ -432,6 +443,8 @@ export async function runZohoLeadSync(
   const t0 = Date.now();
   const { getAccessToken } = await import("./zoho");
   const token = await getAccessToken();
+  const col = await getCollection<any>(COL.LEADS);
+  await ensureLeadsZohoIndex(col);   // index on zoho_lead_id so upserts are fast
   const ZBASE = "https://www.zohoapis.in/crm/v3";
   const FIELDS = [
     "id","First_Name","Last_Name","Mobile","Phone","Email","ASBL_Project",
@@ -459,14 +472,27 @@ export async function runZohoLeadSync(
     let data: any = null;
     try { data = JSON.parse(text); } catch { break; }
     const rows = (data?.data || []) as any[];
+    // Build ONE bulk upsert per page (index-backed on zoho_lead_id) instead of
+    // 2 sequential Mongo round-trips per lead. This is the fix for the mongo-sync
+    // cron hitting the 300s Vercel timeout (~12k sequential ops → ~280s).
+    const ops: any[] = [];
     for (const row of rows) {
       scanned++;
+      const mapped = mapZohoLead(row);
+      if (!mapped) { skipped++; continue; }
+      ops.push({ updateOne: { filter: { zoho_lead_id: mapped.zoho_lead_id }, update: { $set: mapped }, upsert: true } });
+    }
+    if (ops.length) {
       try {
-        const res = await syncZohoLeadToMongo(row);
-        if (res === "created") created++; else if (res === "updated") updated++; else skipped++;
-      } catch (e: any) { skipped++; errors.push(`${row.id}: ${e.message}`); }
+        const bw = await col.bulkWrite(ops, { ordered: false });
+        created += bw.upsertedCount || 0;
+        updated += (bw.matchedCount || 0);
+      } catch (e: any) { errors.push(`bulk page ${page}: ${e.message}`); }
     }
     if (!data?.info?.more_records) break;
+    // Safety net: never approach the 300s serverless cap — stop paging at ~120s
+    // (the incremental window picks up the rest on the next run).
+    if (Date.now() - t0 > 120_000) { errors.push(`time-budget stop at page ${page}`); break; }
     page++;
   }
   return { pages: page, scanned, created, updated, skipped, ms: Date.now() - t0, errors: errors.slice(0, 10) };
