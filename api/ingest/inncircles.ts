@@ -57,7 +57,10 @@ function buildLead(body: any): NormalizedLead | null {
     const raw = pick(body, ...keys);
     if (raw === "") return undefined;
     const n = Number(raw);
-    return Number.isFinite(n) ? n : undefined;
+    // Engagement time can't be negative and a day of dwell time can't exceed
+    // 24h; reject out-of-range values so bad payloads don't corrupt analytics.
+    if (!Number.isFinite(n) || n < 0 || n > 86400) return undefined;
+    return n;
   };
   const section_timespent = {
     home:          num("HOME_TIMESPENT", "home_timespent", "homeTimespent"),
