@@ -84,6 +84,16 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
     ...(isValidUrl(lead.referrer_url)       ? { Referrer_URL: lead.referrer_url }             : {}),
     Total_Page_Views: lead.total_page_views ?? 0,
     Time_Spent_Minutes: lead.time_spent_minutes ?? 0,
+
+    // Per-section engagement time (Inncircles). Only sent when present so
+    // other sources don't overwrite with 0.
+    ...(lead.section_timespent?.home          != null ? { Home_Timespent:          lead.section_timespent.home }          : {}),
+    ...(lead.section_timespent?.plans         != null ? { Plans_Timespent:         lead.section_timespent.plans }         : {}),
+    ...(lead.section_timespent?.price         != null ? { Price_Timespent:         lead.section_timespent.price }         : {}),
+    ...(lead.section_timespent?.location      != null ? { Location_Timespent:      lead.section_timespent.location }      : {}),
+    ...(lead.section_timespent?.specification != null ? { Specification_Timespent: lead.section_timespent.specification } : {}),
+    ...(lead.section_timespent?.amenities     != null ? { Amenities_Timespent:     lead.section_timespent.amenities }     : {}),
+    ...(lead.section_timespent?.media         != null ? { Media_Timespent:         lead.section_timespent.media }         : {}),
   };
 
   // ── Step 3: Atomic dedupe via Mongo claim — closes ALL race windows ─────

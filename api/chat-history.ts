@@ -2979,6 +2979,54 @@ ${SHARED_STYLE}
   }
 
   // ─── PRD v1.0 — create the 13 required Zoho fields ──────────────────────
+  // ─── Create the 7 per-section time-spent Zoho fields (Inncircles) ───────
+  //   GET ?action=zoho-create-timespent-fields&secret=<INHOUSE_POSTHOOK_SECRET>
+  //   Idempotent — skips any api_name that already exists. Decimal number
+  //   fields on the Leads module.
+  if (req.method === "GET" && req.query.action === "zoho-create-timespent-fields") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+      const fr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+        headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      });
+      if (!fr.ok) return res.status(fr.status).json({ error: "field-list failed", body: (await fr.text()).slice(0, 500) });
+      const fj = (await fr.json()) as any;
+      const existingApis = new Set((fj?.fields || []).map((f: any) => f.api_name));
+      const desired = [
+        { api: "Home_Timespent",          label: "Home Timespent" },
+        { api: "Plans_Timespent",         label: "Plans Timespent" },
+        { api: "Price_Timespent",         label: "Price Timespent" },
+        { api: "Location_Timespent",      label: "Location Timespent" },
+        { api: "Specification_Timespent", label: "Specification Timespent" },
+        { api: "Amenities_Timespent",     label: "Amenities Timespent" },
+        { api: "Media_Timespent",         label: "Media Timespent" },
+      ];
+      const results: any[] = [];
+      for (const d of desired) {
+        if (existingApis.has(d.api)) { results.push({ api: d.api, status: "already_exists" }); continue; }
+        const body = { fields: [{ field_label: d.label, data_type: "double", decimal_place: 2 }] };
+        const cr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+          method: "POST",
+          headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const j = await cr.json().catch(() => ({}));
+        const ok = cr.status >= 200 && cr.status < 300;
+        results.push({ api: d.api, label: d.label, status: ok ? "created" : "failed", http_status: cr.status, response: ok ? "ok" : j });
+      }
+      return res.status(200).json({ ok: true, module: "Leads", results });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // GET ?action=prd-create-fields&secret=<INHOUSE_POSTHOOK_SECRET>
   //   Creates the 13 custom fields per PRD section 11. Each field has a
   //   primary label (matching PRD exactly) and a "PRD <X>" fallback label
