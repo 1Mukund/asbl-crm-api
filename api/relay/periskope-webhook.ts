@@ -1060,7 +1060,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // delivers the PDF in one shot when the intent is unambiguous.
     let pendingDocHandled = false;
     let docSentEarly: { doc_type: string; url: string; source?: string } | null = null;
-    if (project && conversation.formatted && conversation.formatted !== "no prior conversation") {
+    // NEW LAUNCH (LEGACY) never sends ANY document — exclude it from the
+    // pending-doc fast-path too, so a stale clarification state can't leak a
+    // unit_plan before the main-path guard runs.
+    if (project && project !== "LEGACY" && conversation.formatted && conversation.formatted !== "no prior conversation") {
       const lastBotTurn = extractLastBotTurn(conversation.formatted);
       const askedForSize = isClarificationAsk(lastBotTurn);
       const looksLikeSizeAnswer = looksLikeSizePick(message);
