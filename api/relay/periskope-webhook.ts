@@ -70,11 +70,33 @@ const ZOHO_CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET || "";
 const ZOHO_REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN || "";
 const ZOHO_API_BASE      = "https://www.zohoapis.in/crm/v3";
 
-// LEGACY teaser — hardcoded, project name NEVER appears in system context
+// LEGACY teaser — hardcoded KB for the upcoming new launch. The project's
+// real name is NOT announced yet, so it NEVER appears in system context; the
+// bot always refers to it as "our new launch project by ASBL". Soft facts
+// (location, config, scale, amenities, developer) are shareable to build
+// interest; anything specific (price, exact size/area, plans, possession,
+// specs) is SITE-VISIT-ONLY and the customer must be pushed to a site visit.
 const LEGACY_TEASER =
-  "RTC X Roads upcoming pre-RERA project. Detailed pricing, floor plans, " +
-  "and possession dates will be shared during a site visit only. " +
-  "The project is in early stage and not yet RERA-registered.";
+`NEW LAUNCH PROJECT BY ASBL, near RTC X Roads, Hyderabad (upcoming, pre-RERA).
+
+NAMING RULE (non-negotiable): the project name is NOT announced yet. NEVER state any project name for it. ALWAYS call it "our new launch project by ASBL" or "our upcoming launch near RTC X Roads". It is NOT RERA-registered yet; if asked for RERA, say it isn't registered yet since it's a fresh launch.
+
+YOU MAY SHARE these general facts to build interest:
+- Location: near RTC X Roads, Hyderabad. RTC X Roads metro station just 2 mins away, Secunderabad Railway Station ~15 mins, airport ~50 mins.
+- Configurations: 3 and 4 BHK homes.
+- Scale: 3 towers, G+50 floors with 5 basements, spread over ~7.98 acres with ~75% open space.
+- Clubhouse: G+5 with ~86,000 sft of indoor amenities.
+- Amenities: full-size basketball court, pickle-ball courts, cricket nets, double-height indoor badminton court, futsal court, swimming pool and kids pool, gym plus yoga/aerobics, indoor games room, walking/jogging/cycling track, outdoor gym, salon and spa, guest rooms, co-working, pet park, clinic and physiotherapy, kids and toddlers play areas, amphitheatre, banquet halls.
+- Developer: ASBL (Ashoka Builders India Pvt. Ltd.).
+
+SITE-VISIT-ONLY (do NOT state these over chat; for EACH of these tell the customer our sales team will explain it in full detail at a site visit, physical or virtual):
+- Price, cost, or per-sft rate.
+- Exact unit sizes, carpet or built-up area.
+- Floor plans, unit plans, master plan, tower plans (NEVER attach any document for this project).
+- Possession or handover date.
+- Flat specifications and fittings.
+
+CTA: anyone seeking more detail on this launch should be warmly pushed to a SITE VISIT (physical or virtual). Frame it as "our sales team will walk you through everything in detail, pricing, plans, sizes and possession, right at the site." Offer to book the visit or add them to the early-access list.`;
 
 // ── Intent classifier (LLM-based, structured JSON output) ───────────────────
 // Calls the periskope_intent_classifier RAG agent on the Anandita server.
@@ -1385,7 +1407,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let docSent: DocSendInfo | null = null;
     let docBlocked: { reason: string } | null = null;
     let preflightHandled = false;
-    const isDocRequest = geminiOutput.docToSend !== null;
+    // NEW LAUNCH (LEGACY): never attach ANY document for the upcoming pre-RERA
+    // project — plans / price / specs are site-visit-only. Hard-block doc sends
+    // regardless of what Gemini set, so a mis-tagged catalog row can never leak.
+    if (project === "LEGACY" && geminiOutput.docToSend) {
+      console.log(`[Periskope Webhook] Doc-send suppressed for NEW LAUNCH (LEGACY): requested ${geminiOutput.docToSend}`);
+    }
+    const isDocRequest = geminiOutput.docToSend !== null && project !== "LEGACY";
 
     if (project && isDocRequest) {
       const docTypeFromMsg = geminiOutput.docToSend!;
