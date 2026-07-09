@@ -3011,7 +3011,10 @@ ${SHARED_STYLE}
       const results: any[] = [];
       for (const d of desired) {
         if (existingApis.has(d.api)) { results.push({ api: d.api, status: "already_exists" }); continue; }
-        const body = { fields: [{ field_label: d.label, data_type: "double", decimal_place: 2 }] };
+        // Zoho requires `length` alongside `decimal_place` for double fields
+        // (length = total digits incl. decimals, must be > decimal_place),
+        // else the create call 400s. 16 is Zoho's max for decimal fields.
+        const body = { fields: [{ field_label: d.label, data_type: "double", length: 16, decimal_place: 2 }] };
         const cr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
           method: "POST",
           headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
