@@ -50,6 +50,25 @@ function buildLead(body: any): NormalizedLead | null {
     detectProject(pick(body, "page_url", "pageUrl")) ??
     undefined;
 
+  // Per-section engagement time. Inncircles sends UPPER_SNAKE keys
+  // (HOME_TIMESPENT, …); accept lower/camel variants too. Undefined when
+  // absent so we don't write 0 for sources that don't send it.
+  const num = (...keys: string[]): number | undefined => {
+    const raw = pick(body, ...keys);
+    if (raw === "") return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  const section_timespent = {
+    home:          num("HOME_TIMESPENT", "home_timespent", "homeTimespent"),
+    plans:         num("PLANS_TIMESPENT", "plans_timespent", "plansTimespent"),
+    price:         num("PRICE_TIMESPENT", "price_timespent", "priceTimespent"),
+    location:      num("LOCATION_TIMESPENT", "location_timespent", "locationTimespent"),
+    specification: num("SPECIFICATION_TIMESPENT", "specification_timespent", "specificationTimespent"),
+    amenities:     num("AMENITIES_TIMESPENT", "amenities_timespent", "amenitiesTimespent"),
+    media:         num("MEDIA_TIMESPENT", "media_timespent", "mediaTimespent"),
+  };
+
   return {
     first_name,
     last_name,
@@ -79,6 +98,7 @@ function buildLead(body: any): NormalizedLead | null {
     total_page_views: Number(pick(body, "total_page_views", "page_views")) || 0,
     time_spent_minutes: Number(pick(body, "time_spent", "time_spent_minutes")) || 0,
     referrer_url: pick(body, "referrer", "referrer_url"),
+    section_timespent,
   };
 }
 

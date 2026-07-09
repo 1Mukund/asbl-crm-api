@@ -33,4 +33,15 @@ export interface NormalizedLead {
   total_page_views?: number;
   time_spent_minutes?: number;
   referrer_url?: string;
+
+  // Per-section engagement time (from Inncircles; typically seconds).
+  section_timespent?: {
+    home?: number;
+    plans?: number;
+    price?: number;
+    location?: number;
+    specification?: number;
+    amenities?: number;
+    media?: number;
+  };
 }
