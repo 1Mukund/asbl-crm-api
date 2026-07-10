@@ -293,11 +293,72 @@ export async function handleLeadCreated(input: OnLeadCreatedInput): Promise<{
   // 1. Stage/Status → New Lead / NA
   const state = await onLeadCreated(input.zoho_lead_id, input.lead);
 
-  // 2. Fire chatbot + AI call IN PARALLEL (per user spec)
-  const greeting = buildInitialChatbotGreeting(input);
-  const [chatbot, ai_call] = await Promise.all([
-    fireChatbotMessage(input.phone, greeting, input.project),
-    fireAiCall({
+  // ── Temporary ops toggles (bot_settings, editable without a deploy) ──
+  //   whatsapp_born_paused=true → skip the T=0 WhatsApp greeting entirely
+  //                               (proactive stop; reactive replies still run).
+  //   calls_delayed_batched=true → don't fire the T=0 call now; instead set
+  //                               Next_Call_At = born + delay so the cron fires
+  //                               it in throttled batches (see followup.ts).
+  let bornPaused = false;
+  let delayedBatched = false;
+  let firstCallDelayMs = CFG.FIRST_CALL_DELAY_MS;
+  try {
+    const { getBotSetting } = await import("./bot_settings");
+    bornPaused = (await getBotSetting("whatsapp_born_paused"))?.value === "true";
+    delayedBatched = (await getBotSetting("calls_delayed_batched"))?.value === "true";
+    const delayMin = Number((await getBotSetting("first_call_delay_min"))?.value);
+    if (Number.isFinite(delayMin) && delayMin > 0) firstCallDelayMs = delayMin * 60 * 1000;
+  } catch (err: any) {
+    console.warn(`[PRD Orch] toggle read failed (using defaults): ${err.message}`);
+  }
+
+  // 2a. Born WhatsApp greeting — skipped when proactive WhatsApp is paused.
+  let chatbot: { ok: boolean; error?: string };
+  if (bornPaused) {
+    chatbot = { ok: false, error: "skipped: whatsapp_born_paused" };
+    console.log(`[PRD Orch] T=0 born WhatsApp SKIPPED (whatsapp_born_paused) for lead ${input.zoho_lead_id}`);
+  } else {
+    const greeting = buildInitialChatbotGreeting(input);
+    chatbot = await fireChatbotMessage(input.phone, greeting, input.project);
+    // Bump chatbot counter ONLY if the WhatsApp send actually succeeded (a
+    // dead-Periskope failure must not climb the counter toward the cap with
+    // zero messages delivered — cron would wrongly think the lead is exhausted).
+    if (chatbot.ok) {
+      await incrementChatbotAttempt(input.zoho_lead_id, input.lead || {});
+    } else {
+      console.warn(
+        `[PRD Orch] T=0 chatbot send FAILED for lead ${input.zoho_lead_id} ` +
+        `(error=${chatbot.error || "unknown"}). Counter NOT bumped — will retry next cron tick.`,
+      );
+    }
+  }
+
+  // 2b. AI call — fire immediately (default) OR defer to born+delay so the
+  //     cron picks it up in a throttled batch (calls_delayed_batched mode).
+  //     Voice-call scheduling under v3 is owned by the posthook thereafter.
+  let ai_call: { ok: boolean; error?: string; response?: any };
+  if (delayedBatched) {
+    try {
+      const dueAt = new Date(Date.now() + firstCallDelayMs);
+      const [{ updateLead }, { mirrorLeadStateToMongo }, { zohoIso }] = await Promise.all([
+        import("./zoho"),
+        import("./supabase"),
+        import("./call_scheduling"),
+      ]);
+      const fields = { Next_Call_At: zohoIso(dueAt) };
+      await updateLead(input.zoho_lead_id, fields);
+      await mirrorLeadStateToMongo(input.zoho_lead_id, fields);
+      ai_call = { ok: true, response: { deferred_until: dueAt.toISOString() } };
+      console.log(
+        `[PRD Orch] T=0 call DEFERRED to ${dueAt.toISOString()} ` +
+        `(calls_delayed_batched) for lead ${input.zoho_lead_id}`,
+      );
+    } catch (err: any) {
+      ai_call = { ok: false, error: `defer-schedule failed: ${err.message}` };
+      console.error(`[PRD Orch] T=0 call defer failed for lead ${input.zoho_lead_id}: ${err.message}`);
+    }
+  } else {
+    ai_call = await fireAiCall({
       zoho_lead_id: input.zoho_lead_id,
       phone: input.phone,
       customer_name: input.customer_name,
@@ -306,31 +367,13 @@ export async function handleLeadCreated(input: OnLeadCreatedInput): Promise<{
       last_page_visited: input.last_page_visited,
       budget: input.budget,
       size_preference: input.size_preference,
-    }),
-  ]);
-
-  // 3. Bump chatbot counter ONLY if the WhatsApp send actually succeeded.
-  //    Previously this incremented unconditionally — when Periskope was
-  //    down (all senders dead, account issue), the counter would still
-  //    climb to the 50-attempt safety cap with zero actual messages
-  //    delivered, and cron would think the lead was exhausted. Silent
-  //    funnel failure. Now: chatbot.ok = false means no message went,
-  //    so counter stays put and cron will retry on the next tick.
-  //
-  //    Voice-call scheduling under v3 is owned entirely by the posthook
-  //    (writes Next_Call_At + Call_Status), so no SS-side counter here.
-  if (chatbot.ok) {
-    await incrementChatbotAttempt(input.zoho_lead_id, input.lead || {});
-  } else {
-    console.warn(
-      `[PRD Orch] T=0 chatbot send FAILED for lead ${input.zoho_lead_id} ` +
-      `(error=${chatbot.error || "unknown"}). Counter NOT bumped — will retry next cron tick.`,
-    );
+    });
   }
 
   console.log(
     `[PRD Orch] T=0 fanout for lead ${input.zoho_lead_id} — ` +
-    `chatbot=${chatbot.ok ? "OK" : "FAIL"} call=${ai_call.ok ? "OK" : "FAIL"}`,
+    `chatbot=${chatbot.ok ? "OK" : (bornPaused ? "SKIP" : "FAIL")} ` +
+    `call=${ai_call.ok ? (delayedBatched ? "DEFERRED" : "OK") : "FAIL"}`,
   );
   return { state, chatbot, ai_call };
 }

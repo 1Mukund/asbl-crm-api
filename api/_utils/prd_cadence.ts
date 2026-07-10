@@ -51,6 +51,16 @@ export const CFG = {
   /** Same customer-local hour window. */
   GHOST_HOURS_START: 7,
   GHOST_HOURS_END: 21,
+
+  // ─── FIRST-CALL batched mode (temporary ops toggle, 2026-07-10) ──────
+  /** When bot_settings.calls_delayed_batched="true", the T=0 call is NOT
+   *  fired at lead-born. Instead Next_Call_At is set this long after born,
+   *  so the cron picks it up and fires it in throttled batches.
+   *  Overridable per-run via bot_settings.first_call_delay_min. */
+  FIRST_CALL_DELAY_MS: 30 * 60 * 1000, // 30 min
+  /** Max FIRST-calls (never-called leads) the cron fires per tick in
+   *  batched mode. Overridable via bot_settings.first_call_batch_size. */
+  FIRST_CALL_BATCH_SIZE: 15,
 };
 
 // ─── Per-lead state ──────────────────────────────────────────────────────
