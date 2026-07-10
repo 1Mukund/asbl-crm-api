@@ -308,8 +308,11 @@ async function runPrdCadenceProcessor(): Promise<{
     try {
       const { getBotSetting } = await import("../_utils/bot_settings");
       callsDelayedBatched = (await getBotSetting("calls_delayed_batched"))?.value === "true";
-      const bs = Number((await getBotSetting("first_call_batch_size"))?.value);
-      if (Number.isFinite(bs) && bs > 0) firstCallBatchSize = Math.floor(bs);
+      // Floor FIRST, then require >= 1 — otherwise a fractional override like
+      // "0.5" floors to 0 and the cap (firstCallsFired >= 0) defers EVERY
+      // first-call forever. Sub-1 / non-numeric values fall back to the default.
+      const bs = Math.floor(Number((await getBotSetting("first_call_batch_size"))?.value));
+      if (Number.isFinite(bs) && bs >= 1) firstCallBatchSize = bs;
       if (callsDelayedBatched) console.log(`[PRD cron] Batched first-calls ON — max ${firstCallBatchSize} first-calls this tick`);
     } catch (err: any) {
       console.error(`[PRD cron] batched-calls flag read failed: ${err.message}`);
@@ -570,14 +573,18 @@ async function runPrdCadenceProcessor(): Promise<{
                 await updateLead(lead.id, { Next_Call_At: nextSlotIso });
                 await mirrorLeadStateToMongo(lead.id, { Next_Call_At: nextSlotIso });
                 const { fireAiCallDirect } = await import("../_utils/prd_orchestrator");
-                await fireAiCallDirect({
+                const callRes = await fireAiCallDirect({
                   zoho_lead_id: lead.id,
                   phone,
                   customer_name: fullName,
                   project: lead.ASBL_Project,
                 });
                 ssCallTicks++;
-                if (isFirstCall) firstCallsFiredThisTick++;
+                // Only consume batch capacity when the call actually dispatched.
+                // fireAiCallDirect returns {ok:false} (it does NOT throw) on a
+                // relay failure, so counting unconditionally would let failed
+                // attempts eat the 15/tick quota and defer other due first-calls.
+                if (isFirstCall && callRes.ok) firstCallsFiredThisTick++;
               } catch (err: any) {
                 console.error(`[PRD cron] call fire failed for ${lead.id}: ${err.message}`);
               }
