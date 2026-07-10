@@ -1648,6 +1648,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // secret-capable (so curl/automation still works).
       "portfolio-get", "portfolio-save", "callback-log", "zoho-lead-match-test",
       "storage-freshness", "cron-runs", "mongo-sync-leads", "set-followup-pause",
+      "set-ops-flag",
       "sender-stats", "message-rows",
     ]);
     const ADMIN_ONLY = new Set(["audit", "users", "approve-user", "reject-user"]);
@@ -1665,7 +1666,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "periskope-doc-diag", "portfolio-get", "portfolio-save",
       "callback-log", "zoho-lead-match-test", "storage-freshness",
       "cron-runs", "mongo-sync-leads", "set-followup-pause", "sender-stats",
-      "message-rows",
+      "message-rows", "set-ops-flag",
     ]);
     const incomingSecretTop =
       (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
@@ -6043,6 +6044,61 @@ ${SHARED_STYLE}
         note: paused
           ? "WhatsApp cold/ghost follow-ups PAUSED. Calls still run. Resume with &paused=false."
           : "WhatsApp follow-ups RESUMED.",
+        effective: "next prd-cadence tick (within ~15 min)",
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── set-ops-flag — generic toggle for the temporary ops switches ───────
+  //   GET  ?action=set-ops-flag&secret=...                → read all flags
+  //   GET  ?action=set-ops-flag&key=<k>&value=<v>&secret= → set one flag
+  //   Whitelisted keys only. Effective on the next prd-cadence tick (~15 min).
+  //     whatsapp_born_paused    true/false  — skip T=0 WhatsApp greeting
+  //     whatsapp_followups_paused true/false — skip cold/ghost follow-ups
+  //     calls_delayed_batched   true/false  — defer T=0 call to born+delay +
+  //                                           fire never-called leads in batches
+  //     first_call_delay_min    <int min>   — defer window (default 30)
+  //     first_call_batch_size   <int>       — first-calls per tick (default 15)
+  if (req.query.action === "set-ops-flag") {
+    const OPS_FLAGS = new Set([
+      "whatsapp_born_paused",
+      "whatsapp_followups_paused",
+      "calls_delayed_batched",
+      "first_call_delay_min",
+      "first_call_batch_size",
+    ]);
+    try {
+      const { getBotSetting, setBotSetting } = await import("./_utils/bot_settings");
+      const key = String(req.query.key || "").trim();
+      const value = req.query.value;
+      if (!key) {
+        const all: Record<string, string | null> = {};
+        for (const k of OPS_FLAGS) all[k] = (await getBotSetting(k))?.value ?? null;
+        return res.status(200).json({ ok: true, flags: all });
+      }
+      if (!OPS_FLAGS.has(key)) {
+        return res.status(400).json({ error: `unknown flag '${key}'`, allowed: [...OPS_FLAGS] });
+      }
+      if (value === undefined) {
+        return res.status(200).json({ ok: true, key, value: (await getBotSetting(key))?.value ?? null });
+      }
+      const v = String(value);
+      const result = await setBotSetting(key, v);
+      if (!result.ok) return res.status(500).json({ error: result.error });
+      // Audit-log the flag flip (this changes outbound behaviour). Only on a
+      // successful write; never block the toggle on an audit failure.
+      const { logAudit, clientIp } = await import("./_utils/audit");
+      await logAudit({
+        actor_email: (req as any)._session?.email || "curl(secret)",
+        action: "set-ops-flag",
+        target: `bot_settings/${key}`,
+        summary: `${key} = "${v}"`,
+        ip: clientIp(req),
+      }).catch(() => {});
+      return res.status(200).json({
+        ok: true, key, value: v,
         effective: "next prd-cadence tick (within ~15 min)",
       });
     } catch (err: any) {

@@ -179,6 +179,8 @@ async function runPrdCadenceProcessor(): Promise<{
   scanned: number;
   chatbot_ticks: number;
   ss_call_ticks: number;
+  first_calls_fired: number;
+  first_calls_deferred_to_next_tick: number;
   no_reply_transitions: number;
   exhaustion_closes: number;
   stalled_calls_rescheduled: number;
@@ -192,6 +194,8 @@ async function runPrdCadenceProcessor(): Promise<{
   let noReplyTransitions = 0;
   let exhaustionCloses = 0;
   let stalledRescheduled = 0;
+  let firstCallsFiredThisTick = 0;
+  let firstCallsDeferredThisTick = 0;
 
   try {
     const { getAccessToken, updateLead } = await import("../_utils/zoho");
@@ -254,7 +258,7 @@ async function runPrdCadenceProcessor(): Promise<{
       if (!data?.info?.more_records) break;
     }
     if (!leads.length) {
-      return { ms: Date.now() - start, scanned: 0, chatbot_ticks: 0, ss_call_ticks: 0, no_reply_transitions: 0, exhaustion_closes: 0, stalled_calls_rescheduled: 0, errors: [] };
+      return { ms: Date.now() - start, scanned: 0, chatbot_ticks: 0, ss_call_ticks: 0, first_calls_fired: 0, first_calls_deferred_to_next_tick: 0, no_reply_transitions: 0, exhaustion_closes: 0, stalled_calls_rescheduled: 0, errors: [] };
     }
 
     // Per-phone bot kill-switch lookup. The inbound webhook respects
@@ -291,6 +295,36 @@ async function runPrdCadenceProcessor(): Promise<{
       if (waFollowupsPaused) console.log("[PRD cron] WhatsApp follow-ups PAUSED — skipping chatbot ticks (calls still run)");
     } catch (err: any) {
       console.error(`[PRD cron] followup-pause lookup failed: ${err.message}`);
+    }
+
+    // BATCHED FIRST-CALL mode (temporary ops toggle, 2026-07-10).
+    // When calls_delayed_batched="true": the T=0 call is deferred to born+delay
+    // by the orchestrator (Next_Call_At set instead of firing), and THIS cron
+    // fires never-called leads in FIFO batches of first_call_batch_size per
+    // tick — "15 first, then next 15" every ~15 min. Already-contacted leads
+    // (follow-up calls on the slot grid) are NOT throttled.
+    let callsDelayedBatched = false;
+    let firstCallBatchSize = CFG.FIRST_CALL_BATCH_SIZE;
+    try {
+      const { getBotSetting } = await import("../_utils/bot_settings");
+      callsDelayedBatched = (await getBotSetting("calls_delayed_batched"))?.value === "true";
+      // Floor FIRST, then require >= 1 — otherwise a fractional override like
+      // "0.5" floors to 0 and the cap (firstCallsFired >= 0) defers EVERY
+      // first-call forever. Sub-1 / non-numeric values fall back to the default.
+      const bs = Math.floor(Number((await getBotSetting("first_call_batch_size"))?.value));
+      if (Number.isFinite(bs) && bs >= 1) firstCallBatchSize = bs;
+      if (callsDelayedBatched) console.log(`[PRD cron] Batched first-calls ON — max ${firstCallBatchSize} first-calls this tick`);
+    } catch (err: any) {
+      console.error(`[PRD cron] batched-calls flag read failed: ${err.message}`);
+    }
+    // FIFO: fire the oldest-born leads' first calls first. Ascending by
+    // Created_Time; leads with no Created_Time sort last.
+    if (callsDelayedBatched) {
+      leads.sort((a, b) => {
+        const ta = a?.Created_Time ? new Date(a.Created_Time).getTime() : Number.MAX_SAFE_INTEGER;
+        const tb = b?.Created_Time ? new Date(b.Created_Time).getTime() : Number.MAX_SAFE_INTEGER;
+        return ta - tb;
+      });
     }
 
     for (const lead of leads) {
@@ -518,28 +552,42 @@ async function runPrdCadenceProcessor(): Promise<{
           const nextSlotIso = nextSlot.nextCallAt ? schedIso(nextSlot.nextCallAt) : null;
 
           if (nextCallAtMs > 0 && nextCallAtMs <= now) {
-            try {
-              // SELF-HEAL (fix 2026-07-07): set Next_Call_At to the NEXT slot
-              // up front instead of null. Previously it was cleared to null and
-              // ONLY the posthook re-set it — so a single missed posthook
-              // (failed call / dropped call_completed webhook) stalled the lead
-              // forever with Next_Call_At=null and no more calls. Setting the
-              // next slot means the cadence self-recovers even if the posthook
-              // never lands; the posthook simply overwrites this with the
-              // outcome-accurate slot when it does arrive. (Slot is >= next grid
-              // hour, so no 15-min re-fire loop.)
-              await updateLead(lead.id, { Next_Call_At: nextSlotIso });
-              await mirrorLeadStateToMongo(lead.id, { Next_Call_At: nextSlotIso });
-              const { fireAiCallDirect } = await import("../_utils/prd_orchestrator");
-              await fireAiCallDirect({
-                zoho_lead_id: lead.id,
-                phone,
-                customer_name: fullName,
-                project: lead.ASBL_Project,
-              });
-              ssCallTicks++;
-            } catch (err: any) {
-              console.error(`[PRD cron] call fire failed for ${lead.id}: ${err.message}`);
+            // A never-called lead (no Last_Inhouse_Call_ID) is a FIRST call.
+            // In batched mode we cap first-calls per tick; once the cap is hit
+            // we leave Next_Call_At UNTOUCHED (still due) so the next tick fires
+            // it — that's how "15 now, next 15 in ~15 min" falls out.
+            const isFirstCall = !lead.Last_Inhouse_Call_ID;
+            if (callsDelayedBatched && isFirstCall && firstCallsFiredThisTick >= firstCallBatchSize) {
+              firstCallsDeferredThisTick++;
+            } else {
+              try {
+                // SELF-HEAL (fix 2026-07-07): set Next_Call_At to the NEXT slot
+                // up front instead of null. Previously it was cleared to null and
+                // ONLY the posthook re-set it — so a single missed posthook
+                // (failed call / dropped call_completed webhook) stalled the lead
+                // forever with Next_Call_At=null and no more calls. Setting the
+                // next slot means the cadence self-recovers even if the posthook
+                // never lands; the posthook simply overwrites this with the
+                // outcome-accurate slot when it does arrive. (Slot is >= next grid
+                // hour, so no 15-min re-fire loop.)
+                await updateLead(lead.id, { Next_Call_At: nextSlotIso });
+                await mirrorLeadStateToMongo(lead.id, { Next_Call_At: nextSlotIso });
+                const { fireAiCallDirect } = await import("../_utils/prd_orchestrator");
+                const callRes = await fireAiCallDirect({
+                  zoho_lead_id: lead.id,
+                  phone,
+                  customer_name: fullName,
+                  project: lead.ASBL_Project,
+                });
+                ssCallTicks++;
+                // Only consume batch capacity when the call actually dispatched.
+                // fireAiCallDirect returns {ok:false} (it does NOT throw) on a
+                // relay failure, so counting unconditionally would let failed
+                // attempts eat the 15/tick quota and defer other due first-calls.
+                if (isFirstCall && callRes.ok) firstCallsFiredThisTick++;
+              } catch (err: any) {
+                console.error(`[PRD cron] call fire failed for ${lead.id}: ${err.message}`);
+              }
             }
           } else if (nextCallAtMs === 0 && nextSlotIso && lead.Last_Inhouse_Call_ID) {
             // SAFETY-NET (fix 2026-07-07): the lead has already had a call but
@@ -570,6 +618,8 @@ async function runPrdCadenceProcessor(): Promise<{
     scanned,
     chatbot_ticks: chatbotTicks,
     ss_call_ticks: ssCallTicks,
+    first_calls_fired: firstCallsFiredThisTick,
+    first_calls_deferred_to_next_tick: firstCallsDeferredThisTick,
     no_reply_transitions: noReplyTransitions,
     exhaustion_closes: exhaustionCloses,
     stalled_calls_rescheduled: stalledRescheduled,
