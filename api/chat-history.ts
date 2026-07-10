@@ -6087,6 +6087,16 @@ ${SHARED_STYLE}
       const v = String(value);
       const result = await setBotSetting(key, v);
       if (!result.ok) return res.status(500).json({ error: result.error });
+      // Audit-log the flag flip (this changes outbound behaviour). Only on a
+      // successful write; never block the toggle on an audit failure.
+      const { logAudit, clientIp } = await import("./_utils/audit");
+      await logAudit({
+        actor_email: (req as any)._session?.email || "curl(secret)",
+        action: "set-ops-flag",
+        target: `bot_settings/${key}`,
+        summary: `${key} = "${v}"`,
+        ip: clientIp(req),
+      }).catch(() => {});
       return res.status(200).json({
         ok: true, key, value: v,
         effective: "next prd-cadence tick (within ~15 min)",
