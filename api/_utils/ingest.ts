@@ -94,6 +94,9 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
     ...(lead.section_timespent?.specification != null ? { Specification_Timespent: lead.section_timespent.specification } : {}),
     ...(lead.section_timespent?.amenities     != null ? { Amenities_Timespent:     lead.section_timespent.amenities }     : {}),
     ...(lead.section_timespent?.media         != null ? { Media_Timespent:         lead.section_timespent.media }         : {}),
+
+    // Manual-reactivation only: purple-row flag for the latest-project lead.
+    ...(lead.reactivation_is_latest != null ? { Reactivation_Is_Latest: lead.reactivation_is_latest } : {}),
   };
 
   // ── Step 3: Atomic dedupe via Mongo claim — closes ALL race windows ─────

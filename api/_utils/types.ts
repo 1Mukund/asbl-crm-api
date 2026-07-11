@@ -6,7 +6,11 @@ export interface NormalizedLead {
   email?: string;
 
   // Source
-  lead_source: "FIM Forms" | "Website Inquiry" | "WhatsApp" | "Channel Partner" | "Meta Ads" | "Inncircles M1";
+  lead_source: "FIM Forms" | "Website Inquiry" | "WhatsApp" | "Channel Partner" | "Meta Ads" | "Inncircles M1" | "Manual Reactivation";
+  /** Manual-reactivation only: true when this lead's project matches the
+   *  reactivation sheet's latest_project for this phone (drives the Zoho
+   *  purple-row flag). Undefined for non-reactivation leads. */
+  reactivation_is_latest?: boolean;
   source_lead_id?: string;  // Meta lead ID, form submission ID etc.
   campaign_name?: string;
   ad_set_name?: string;

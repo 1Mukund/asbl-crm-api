@@ -1648,7 +1648,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // secret-capable (so curl/automation still works).
       "portfolio-get", "portfolio-save", "callback-log", "zoho-lead-match-test",
       "storage-freshness", "cron-runs", "mongo-sync-leads", "set-followup-pause",
-      "set-ops-flag",
+      "set-ops-flag", "reactivation-upload", "reactivation-check",
+      "zoho-add-leadsource-option", "zoho-create-reactivation-field",
       "sender-stats", "message-rows",
     ]);
     const ADMIN_ONLY = new Set(["audit", "users", "approve-user", "reject-user"]);
@@ -1666,7 +1667,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "periskope-doc-diag", "portfolio-get", "portfolio-save",
       "callback-log", "zoho-lead-match-test", "storage-freshness",
       "cron-runs", "mongo-sync-leads", "set-followup-pause", "sender-stats",
-      "message-rows", "set-ops-flag",
+      "message-rows", "set-ops-flag", "reactivation-upload", "reactivation-check",
+      "zoho-add-leadsource-option", "zoho-create-reactivation-field",
     ]);
     const incomingSecretTop =
       (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
@@ -6101,6 +6103,122 @@ ${SHARED_STYLE}
         ok: true, key, value: v,
         effective: "next prd-cadence tick (within ~15 min)",
       });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── reactivation-upload — load the manual-reactivation phone allowlist ──
+  //   POST ?action=reactivation-upload&secret=...
+  //     body: { wipe?: true, rows: [{ phone, latest_project?, masterleadid? }, ...] }
+  //   Normalizes each phone; when an Inncircles-webhook lead's phone is on this
+  //   list, its source is flipped Inncircles M1 -> Manual Reactivation at ingest.
+  if (req.method === "POST" && req.query.action === "reactivation-upload") {
+    try {
+      const body = (req.body || {}) as any;
+      const rows: any[] = Array.isArray(body.rows) ? body.rows : (Array.isArray(body) ? body : []);
+      if (!rows.length) return res.status(400).json({ error: "rows[] required" });
+      const { loadReactivationList } = await import("./_utils/reactivation");
+      const out = await loadReactivationList(rows, { wipe: !!body.wipe, added_at: new Date().toISOString() });
+      return res.status(200).json({
+        ok: true,
+        received: rows.length,
+        inserted: out.inserted,
+        skipped_count: out.skipped.length,
+        skipped_sample: out.skipped.slice(0, 10),
+        wiped: out.wiped,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── reactivation-check — verify the list / test a phone ────────────────
+  //   GET ?action=reactivation-check&secret=...            → count + sample
+  //   GET ?action=reactivation-check&phone=<any>&secret=.. → is this phone on it?
+  if (req.method === "GET" && req.query.action === "reactivation-check") {
+    try {
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const col = await getCollection(COL.REACTIVATION_LIST);
+      const phone = String(req.query.phone || "").trim();
+      if (phone) {
+        const { getReactivationEntry } = await import("./_utils/reactivation");
+        const entry = await getReactivationEntry(phone);
+        return res.status(200).json({ ok: true, phone, on_list: !!entry, entry: entry || null });
+      }
+      const total = await col.estimatedDocumentCount();
+      const sample = await col.find({} as any).limit(5).toArray();
+      return res.status(200).json({ ok: true, total, sample });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── zoho-add-leadsource-option — add "Manual Reactivation" to the Zoho
+  //     Lead_Source picklist (idempotent; appends, preserving all existing
+  //     values). Run once before the reactivation push.
+  //   GET ?action=zoho-add-leadsource-option&secret=...
+  //       &value=Manual Reactivation   (defaults to that)
+  if (req.method === "GET" && req.query.action === "zoho-add-leadsource-option") {
+    try {
+      const optionVal = String(req.query.value || "Manual Reactivation").trim();
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+      const fr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+        headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      });
+      if (!fr.ok) return res.status(fr.status).json({ error: "field-list failed", body: (await fr.text()).slice(0, 400) });
+      const fj = (await fr.json()) as any;
+      const field = (fj?.fields || []).find((f: any) => f.api_name === "Lead_Source");
+      if (!field) return res.status(404).json({ error: "Lead_Source field not found" });
+      const existing: any[] = field.pick_list_values || [];
+      if (existing.some((v) => v.actual_value === optionVal || v.display_value === optionVal)) {
+        return res.status(200).json({ ok: true, status: "already_exists", value: optionVal, options: existing.map((v) => v.actual_value) });
+      }
+      const pick_list_values = existing
+        .map((v) => ({ display_value: v.display_value, actual_value: v.actual_value }))
+        .concat([{ display_value: optionVal, actual_value: optionVal }]);
+      const pr = await fetch(`${ZOHO_API_BASE}/settings/fields/${field.id}?module=Leads`, {
+        method: "PATCH",
+        headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ fields: [{ id: field.id, pick_list_values }] }),
+      });
+      const pj = await pr.json().catch(() => ({}));
+      const ok = pr.status >= 200 && pr.status < 300;
+      return res.status(ok ? 200 : pr.status).json({ ok, status: ok ? "added" : "failed", value: optionVal, http_status: pr.status, response: pj });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── zoho-create-reactivation-field — create the Reactivation_Is_Latest
+  //     checkbox on Leads (drives the purple row for the latest-project lead).
+  //     Idempotent. Run once before the reactivation push.
+  //   GET ?action=zoho-create-reactivation-field&secret=...
+  if (req.method === "GET" && req.query.action === "zoho-create-reactivation-field") {
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+      const fr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+        headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      });
+      if (!fr.ok) return res.status(fr.status).json({ error: "field-list failed", body: (await fr.text()).slice(0, 400) });
+      const fj = (await fr.json()) as any;
+      const existingApis = new Set((fj?.fields || []).map((f: any) => f.api_name));
+      if (existingApis.has("Reactivation_Is_Latest")) {
+        return res.status(200).json({ ok: true, status: "already_exists", api: "Reactivation_Is_Latest" });
+      }
+      const body = { fields: [{ field_label: "Reactivation Is Latest", data_type: "boolean" }] };
+      const cr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+        method: "POST",
+        headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const j = await cr.json().catch(() => ({}));
+      const ok = cr.status >= 200 && cr.status < 300;
+      return res.status(ok ? 200 : cr.status).json({ ok, status: ok ? "created" : "failed", api: "Reactivation_Is_Latest", http_status: cr.status, response: ok ? "ok" : j });
     } catch (err: any) {
       return res.status(500).json({ error: err.message });
     }

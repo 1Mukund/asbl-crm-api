@@ -129,12 +129,36 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       : Array.isArray(body) ? body
       : [body];
 
+    const { getReactivationEntry } = await import("../_utils/reactivation");
+
     const results: any[] = [];
     for (const item of items) {
       const lead = buildLead(item);
       if (!lead) {
         results.push({ status: "skipped", reason: "invalid or missing phone", raw_phone: item?.phone ?? item?.mobile ?? null });
         continue;
+      }
+      // MANUAL REACTIVATION (2026-07): existing customers are re-pushed through
+      // this same webhook. If the phone is on the reactivation allowlist, flip
+      // the source Inncircles M1 -> Manual Reactivation so Zoho reflects the
+      // real origin. Call routing / cadence is unchanged (webhook already sends
+      // the correct latest project; +30min / 15-per-tick batching still applies).
+      let reactivation: any = null;
+      try {
+        const entry = await getReactivationEntry(lead.mobile);
+        if (entry) {
+          lead.lead_source = "Manual Reactivation";
+          // Flag the lead whose project == the sheet's latest_project. Drives
+          // the Zoho purple-row marker (Reactivation_Is_Latest). A phone can
+          // arrive for several projects; only the latest one is flagged true.
+          const isLatest = !!(lead.project && entry.latest_project &&
+            lead.project.trim().toUpperCase() === entry.latest_project.trim().toUpperCase());
+          lead.reactivation_is_latest = isLatest;
+          reactivation = { matched: true, is_latest: isLatest, sheet_latest_project: entry.latest_project || null, incoming_project: lead.project || null };
+          console.log(`[Inncircles] Reactivation match ${lead.mobile} — source -> Manual Reactivation, is_latest=${isLatest} (sheet_proj=${entry.latest_project || "?"}, incoming_proj=${lead.project || "?"})`);
+        }
+      } catch (err: any) {
+        console.error(`[Inncircles] reactivation check failed for ${lead.mobile}: ${err.message}`);
       }
       try {
         const result = await ingestLead(lead);
@@ -169,6 +193,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           phone: lead.mobile,
           name: `${lead.first_name} ${lead.last_name}`.trim(),
           project: lead.project || null,
+          lead_source: lead.lead_source,
+          reactivation: reactivation || undefined,
           mlid: result.mlid,
           plid: result.plid,
           zoho_lead_id: result.zoho_lead_id,
