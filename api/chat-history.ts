@@ -6176,8 +6176,11 @@ ${SHARED_STYLE}
       if (existing.some((v) => v.actual_value === optionVal || v.display_value === optionVal)) {
         return res.status(200).json({ ok: true, status: "already_exists", value: optionVal, options: existing.map((v) => v.actual_value) });
       }
+      // Preserve each existing option OBJECT verbatim (incl. its id / sequence /
+      // colour) — Zoho matches existing picklist values by id. Rebuilding them
+      // as bare {display_value, actual_value} makes Zoho treat them as new.
       const pick_list_values = existing
-        .map((v) => ({ display_value: v.display_value, actual_value: v.actual_value }))
+        .map((v) => ({ ...v }))
         .concat([{ display_value: optionVal, actual_value: optionVal }]);
       const pr = await fetch(`${ZOHO_API_BASE}/settings/fields/${field.id}?module=Leads`, {
         method: "PATCH",
