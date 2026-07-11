@@ -144,6 +144,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // real origin. Call routing / cadence is unchanged (webhook already sends
       // the correct latest project; +30min / 15-per-tick batching still applies).
       let reactivation: any = null;
+      // Authoritative default on the reactivation source path: every Inncircles
+      // lead sends the flag (false here), so a re-push after the list changes
+      // clears any stale true — Zoho patch updates don't clear omitted fields.
+      lead.reactivation_is_latest = false;
       try {
         const entry = await getReactivationEntry(lead.mobile);
         if (entry) {

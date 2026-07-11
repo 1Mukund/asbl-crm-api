@@ -76,8 +76,10 @@ export async function loadReactivationList(
       updateOne: {
         filter: { _id: norm },
         update: {
+          // NOTE: never put _id in $set — it's immutable on matched docs and
+          // makes idempotent re-uploads throw. The filter sets it on insert.
+          $setOnInsert: { _id: norm },
           $set: {
-            _id: norm,
             phone: norm,
             latest_project: row?.latest_project != null ? String(row.latest_project).trim().toUpperCase() : undefined,
             masterleadid: row?.masterleadid != null ? String(row.masterleadid) : undefined,
