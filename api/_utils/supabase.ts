@@ -281,6 +281,9 @@ export async function upsertLead(
     total_page_views: lead.total_page_views ?? 0,
     time_spent_minutes: lead.time_spent_minutes ?? 0,
     referrer_url: lead.referrer_url ?? "",
+    // Manual-reactivation: mirror the latest-project flag into Mongo too (for
+    // the in-house CRM). null for non-reactivation leads, true/false otherwise.
+    reactivation_is_latest: lead.reactivation_is_latest ?? null,
     zoho_lead_id: zohoLeadId,
     zoho_synced: zohoSynced,
     zoho_synced_at: zohoSynced ? now : null,

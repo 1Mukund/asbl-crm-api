@@ -57,6 +57,10 @@ export const COL = {
    *  attempt: outcome + reason (no_lead / cooldown / voicebot_error / ok)
    *  so failures are visible instead of vanishing into Vercel logs. */
   CALLBACK_LOG:       "callback_log",
+  /** Manual-reactivation phone list (2026-07). _id = normalized phone;
+   *  when a lead arrives via the Inncircles webhook whose phone is here, its
+   *  Lead_Source is flipped from "Inncircles M1" to "Manual Reactivation". */
+  REACTIVATION_LIST:  "reactivation_list",
   /** Internal: monotonic counters used by getNextSequence() to mimic
    *  Postgres serial sequences atomically (e.g. for MLID/PLID + the
    *  round-robin sender index). */
