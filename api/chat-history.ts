@@ -6068,6 +6068,7 @@ ${SHARED_STYLE}
       "whatsapp_born_paused",
       "whatsapp_followups_paused",
       "calls_delayed_batched",
+      "calls_paused",
       "first_call_delay_min",
       "first_call_batch_size",
     ]);
