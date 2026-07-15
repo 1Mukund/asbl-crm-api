@@ -304,16 +304,22 @@ async function runPrdCadenceProcessor(): Promise<{
     // tick — "15 first, then next 15" every ~15 min. Already-contacted leads
     // (follow-up calls on the slot grid) are NOT throttled.
     let callsDelayedBatched = false;
+    let callsPaused = false;
     let firstCallBatchSize = CFG.FIRST_CALL_BATCH_SIZE;
     try {
       const { getBotSetting } = await import("../_utils/bot_settings");
       callsDelayedBatched = (await getBotSetting("calls_delayed_batched"))?.value === "true";
+      // Global CALL kill-switch. When calls_paused="true", THIS cron fires NO
+      // calls at all (first OR follow-up); Next_Call_At is left untouched so
+      // due leads simply fire once calls_paused is flipped back to false.
+      callsPaused = (await getBotSetting("calls_paused"))?.value === "true";
       // Floor FIRST, then require >= 1 — otherwise a fractional override like
       // "0.5" floors to 0 and the cap (firstCallsFired >= 0) defers EVERY
       // first-call forever. Sub-1 / non-numeric values fall back to the default.
       const bs = Math.floor(Number((await getBotSetting("first_call_batch_size"))?.value));
       if (Number.isFinite(bs) && bs >= 1) firstCallBatchSize = bs;
       if (callsDelayedBatched) console.log(`[PRD cron] Batched first-calls ON — max ${firstCallBatchSize} first-calls this tick`);
+      if (callsPaused) console.log("[PRD cron] CALLS PAUSED — no calls fired this tick (first or follow-up)");
     } catch (err: any) {
       console.error(`[PRD cron] batched-calls flag read failed: ${err.message}`);
     }
@@ -542,7 +548,10 @@ async function runPrdCadenceProcessor(): Promise<{
         //    Removed (2026-06-18): v1 SS-call tree (3 × 4h), v2 retry
         //    tree (10-min + 3h aggressive + 3-day exhaustion). v3 is just
         //    slot hours + 7-day lifetime cap.
-        {
+        //
+        //    calls_paused kill-switch: skip the ENTIRE call tick (no fire, no
+        //    reschedule). Next_Call_At stays as-is so leads resume cleanly.
+        if (!callsPaused) {
           const nextCallAtMs = lead.Next_Call_At ? new Date(lead.Next_Call_At).getTime() : 0;
           // Compute the next MISS-grid slot now (respects the 7-day cap — null
           // once the lead is past its lifetime). Used both as the SELF-HEAL
