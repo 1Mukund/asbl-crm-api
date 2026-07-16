@@ -31,6 +31,12 @@ import { NormalizedLead } from "../_utils/types";
 // picklist option, else Zoho rejects the create/update.
 const DEFAULT_SOURCE = "Inncircles M1";
 
+// Sources the code owns — callers must NOT be able to set these via the
+// payload. "Manual Reactivation" is assigned ONLY by the reactivation-allowlist
+// branch (a caller spoofing it would mislabel a non-allowlisted lead as a
+// reactivation and pollute reactivation reporting). Compared case-insensitively.
+const RESERVED_SOURCES = new Set(["manual reactivation"]);
+
 /** Pull the first non-empty value across a list of candidate keys. */
 function pick(body: any, ...keys: string[]): string {
   for (const k of keys) {
@@ -93,13 +99,22 @@ function buildLead(body: any): NormalizedLead | null {
     is_bulk_transfer:         flag("IsBulkTransfer", "IsBulk_Transfer", "is_bulk_transfer", "isBulkTransfer"),
   };
 
+  // Caller-supplied source wins, but reserved (code-owned) values are ignored
+  // so a caller can't spoof e.g. "Manual Reactivation" — that is set ONLY by
+  // the reactivation-allowlist branch in the handler.
+  const rawSource = pick(body, "source", "lead_source", "Lead_Source", "lead_source_name");
+  const leadSource = (rawSource && !RESERVED_SOURCES.has(rawSource.trim().toLowerCase()))
+    ? rawSource
+    : DEFAULT_SOURCE;
+
   return {
     first_name,
     last_name,
     mobile,
     email: pick(body, "email", "Email", "email_address"),
-    // Caller-supplied source wins; fall back to DEFAULT_SOURCE only if omitted.
-    lead_source: pick(body, "source", "lead_source", "Lead_Source", "lead_source_name") || DEFAULT_SOURCE,
+    // Caller-supplied source wins, EXCEPT reserved values (only the code may
+    // assign those). Falls back to DEFAULT_SOURCE when omitted or reserved.
+    lead_source: leadSource,
     source_lead_id: pick(body, "lead_id", "leadId", "id", "m1_lead_id", "inncircles_id", "submission_id"),
     campaign_name: pick(body, "campaign", "campaign_name", "utm_campaign"),
     utm_source: pick(body, "utm_source") || "inncircles",
