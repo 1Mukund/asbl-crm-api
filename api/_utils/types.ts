@@ -6,7 +6,10 @@ export interface NormalizedLead {
   email?: string;
 
   // Source
-  lead_source: "FIM Forms" | "Website Inquiry" | "WhatsApp" | "Channel Partner" | "Meta Ads" | "Inncircles M1" | "Manual Reactivation";
+  /** Known values below, but the Inncircles webhook now also honours a
+   *  caller-supplied `source` in the payload, so any string is allowed.
+   *  Whatever value is used MUST exist as a Zoho Lead_Source picklist option. */
+  lead_source: "FIM Forms" | "Website Inquiry" | "WhatsApp" | "Channel Partner" | "Meta Ads" | "Inncircles M1" | "Manual Reactivation" | (string & {});
   /** Manual-reactivation only: true when this lead's project matches the
    *  reactivation sheet's latest_project for this phone (drives the Zoho
    *  purple-row flag). Undefined for non-reactivation leads. */

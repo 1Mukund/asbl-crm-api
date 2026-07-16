@@ -24,7 +24,12 @@ import { normalizePhone, parseName, detectProject } from "../_utils/normalize";
 import { ingestLead } from "../_utils/ingest";
 import { NormalizedLead } from "../_utils/types";
 
-const LEAD_SOURCE = "Inncircles M1";
+// FALLBACK source only. The webhook now honours a caller-supplied `source`
+// in the payload (see buildLead) — whoever hits this endpoint sends its own
+// source. This value is used ONLY when the payload omits `source`.
+// NOTE: whatever source the caller sends must exist as a Zoho Lead_Source
+// picklist option, else Zoho rejects the create/update.
+const DEFAULT_SOURCE = "Inncircles M1";
 
 /** Pull the first non-empty value across a list of candidate keys. */
 function pick(body: any, ...keys: string[]): string {
@@ -77,7 +82,8 @@ function buildLead(body: any): NormalizedLead | null {
     last_name,
     mobile,
     email: pick(body, "email", "Email", "email_address"),
-    lead_source: LEAD_SOURCE,
+    // Caller-supplied source wins; fall back to DEFAULT_SOURCE only if omitted.
+    lead_source: pick(body, "source", "lead_source", "Lead_Source", "lead_source_name") || DEFAULT_SOURCE,
     source_lead_id: pick(body, "lead_id", "leadId", "id", "m1_lead_id", "inncircles_id", "submission_id"),
     campaign_name: pick(body, "campaign", "campaign_name", "utm_campaign"),
     utm_source: pick(body, "utm_source") || "inncircles",
@@ -213,7 +219,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const updated = results.filter((r) => r.action === "updated").length;
     return res.status(200).json({
       success: true,
-      source: LEAD_SOURCE,
+      default_source: DEFAULT_SOURCE,   // per-lead source is in results[].lead_source
       received: items.length,
       created,
       updated,
