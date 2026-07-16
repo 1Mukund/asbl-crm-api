@@ -284,6 +284,11 @@ export async function upsertLead(
     // Manual-reactivation: mirror the latest-project flag into Mongo too (for
     // the in-house CRM). null for non-reactivation leads, true/false otherwise.
     reactivation_is_latest: lead.reactivation_is_latest ?? null,
+    // Inncircles origin flags (mirror into Mongo for the in-house CRM).
+    is_reactivated: lead.inncircles_flags?.is_reactivated ?? null,
+    is_born_fresh: lead.inncircles_flags?.is_born_fresh ?? null,
+    is_born_in_other_project: lead.inncircles_flags?.is_born_in_other_project ?? null,
+    is_bulk_transfer: lead.inncircles_flags?.is_bulk_transfer ?? null,
     zoho_lead_id: zohoLeadId,
     zoho_synced: zohoSynced,
     zoho_synced_at: zohoSynced ? now : null,

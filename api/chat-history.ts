@@ -1650,6 +1650,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "storage-freshness", "cron-runs", "mongo-sync-leads", "set-followup-pause",
       "set-ops-flag", "reactivation-upload", "reactivation-check",
       "zoho-add-leadsource-option", "zoho-create-reactivation-field",
+      "zoho-create-inncircles-flag-fields",
       "sender-stats", "message-rows",
     ]);
     const ADMIN_ONLY = new Set(["audit", "users", "approve-user", "reject-user"]);
@@ -1669,6 +1670,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       "cron-runs", "mongo-sync-leads", "set-followup-pause", "sender-stats",
       "message-rows", "set-ops-flag", "reactivation-upload", "reactivation-check",
       "zoho-add-leadsource-option", "zoho-create-reactivation-field",
+      "zoho-create-inncircles-flag-fields",
     ]);
     const incomingSecretTop =
       (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
@@ -6223,6 +6225,48 @@ ${SHARED_STYLE}
       const j = await cr.json().catch(() => ({}));
       const ok = cr.status >= 200 && cr.status < 300;
       return res.status(ok ? 200 : cr.status).json({ ok, status: ok ? "created" : "failed", api: "Reactivation_Is_Latest", http_status: cr.status, response: ok ? "ok" : j });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── zoho-create-inncircles-flag-fields — create the 4 Inncircles origin
+  //     checkboxes on Leads (IsReactivated, IsBorn_Fresh, IsBorn_InOtherProject,
+  //     IsBulkTransfer). Idempotent. Run once before the ingest sends them.
+  //   GET ?action=zoho-create-inncircles-flag-fields&secret=...
+  if (req.method === "GET" && req.query.action === "zoho-create-inncircles-flag-fields") {
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+      const fr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+        headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      });
+      if (!fr.ok) return res.status(fr.status).json({ error: "field-list failed", body: (await fr.text()).slice(0, 400) });
+      const fj = (await fr.json()) as any;
+      const existingApis = new Set((fj?.fields || []).map((f: any) => f.api_name));
+      const desired = [
+        { api: "IsReactivated",         label: "IsReactivated" },
+        { api: "IsBorn_Fresh",          label: "IsBorn_Fresh" },
+        { api: "IsBorn_InOtherProject", label: "IsBorn_InOtherProject" },
+        { api: "IsBulkTransfer",        label: "IsBulkTransfer" },
+      ];
+      const results: any[] = [];
+      for (const d of desired) {
+        if (existingApis.has(d.api)) { results.push({ api: d.api, status: "already_exists" }); continue; }
+        const body = { fields: [{ field_label: d.label, data_type: "boolean" }] };
+        const cr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+          method: "POST",
+          headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const j = await cr.json().catch(() => ({}));
+        const ok = cr.status >= 200 && cr.status < 300;
+        // Report the api_name Zoho actually assigned so the ingest mapping can be verified.
+        const createdApi = j?.fields?.[0]?.details?.api_name || d.api;
+        results.push({ requested_api: d.api, created_api: createdApi, status: ok ? "created" : "failed", http_status: cr.status, response: ok ? "ok" : j });
+      }
+      return res.status(200).json({ ok: true, module: "Leads", results });
     } catch (err: any) {
       return res.status(500).json({ error: err.message });
     }

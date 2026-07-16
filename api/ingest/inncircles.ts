@@ -77,6 +77,22 @@ function buildLead(body: any): NormalizedLead | null {
     media:         num("MEDIA_TIMESPENT", "media_timespent", "mediaTimespent"),
   };
 
+  // Origin flags (0/1). Undefined when the caller omits the field so a
+  // re-ingest / other source doesn't overwrite an existing value.
+  const flag = (...keys: string[]): boolean | undefined => {
+    const raw = pick(body, ...keys).toLowerCase();
+    if (raw === "") return undefined;
+    if (["1", "true", "yes", "y"].includes(raw)) return true;
+    if (["0", "false", "no", "n"].includes(raw)) return false;
+    return undefined;
+  };
+  const inncircles_flags = {
+    is_reactivated:           flag("IsReactivated", "is_reactivated", "isReactivated"),
+    is_born_fresh:            flag("IsBorn_Fresh", "IsBornFresh", "is_born_fresh", "isBornFresh"),
+    is_born_in_other_project: flag("IsBorn_InOtherProject", "IsBornInOtherProject", "is_born_in_other_project", "isBornInOtherProject"),
+    is_bulk_transfer:         flag("IsBulkTransfer", "IsBulk_Transfer", "is_bulk_transfer", "isBulkTransfer"),
+  };
+
   return {
     first_name,
     last_name,
@@ -108,6 +124,7 @@ function buildLead(body: any): NormalizedLead | null {
     time_spent_minutes: Number(pick(body, "time_spent", "time_spent_minutes")) || 0,
     referrer_url: pick(body, "referrer", "referrer_url"),
     section_timespent,
+    inncircles_flags,
   };
 }
 

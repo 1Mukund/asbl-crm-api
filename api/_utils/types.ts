@@ -51,4 +51,13 @@ export interface NormalizedLead {
     amenities?: number;
     media?: number;
   };
+
+  /** Inncircles origin flags (payload booleans, 0/1). Undefined when the
+   *  caller omits the field so other sources / re-ingests don't overwrite. */
+  inncircles_flags?: {
+    is_reactivated?: boolean;          // IsReactivated — re-engaged existing lead
+    is_born_fresh?: boolean;           // IsBorn_Fresh — brand new, didn't exist in Inncircles
+    is_born_in_other_project?: boolean;// IsBorn_InOtherProject — was Not-Interested, new leadgen in another project
+    is_bulk_transfer?: boolean;        // IsBulkTransfer — part of a bulk transfer
+  };
 }
