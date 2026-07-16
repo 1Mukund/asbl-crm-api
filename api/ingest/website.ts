@@ -7,12 +7,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // ── CORS headers — allow any origin (website forms, local test, etc.) ──
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key");
 
   // Handle preflight
   if (req.method === "OPTIONS") return res.status(200).end();
 
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+
+  // ── Optional API-key auth ──────────────────────────────────────────────
+  // Enforced ONLY when WEBSITE_INGEST_KEY is set in env. Kept optional so the
+  // endpoint stays OPEN until the key is rolled out to every website
+  // integration (asblloft.com + asbllandmark.com) — set the env var only after
+  // BOTH sites are sending the key, else their leads get 401'd.
+  // Accepts: Authorization: Bearer <key>  |  x-api-key: <key>  |  ?key=<key>
+  const expectedKey = process.env.WEBSITE_INGEST_KEY || "";
+  if (expectedKey) {
+    const authHeader = String(req.headers["authorization"] || "");
+    const bearer = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7).trim() : "";
+    const got = bearer || String(req.headers["x-api-key"] || "") || String(req.query.key || "");
+    if (got !== expectedKey) {
+      return res.status(401).json({ error: "Unauthorized — missing or invalid API key" });
+    }
+  }
 
   try {
     const body = req.body;
