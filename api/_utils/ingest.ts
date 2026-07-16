@@ -97,6 +97,12 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
 
     // Manual-reactivation only: purple-row flag for the latest-project lead.
     ...(lead.reactivation_is_latest != null ? { Reactivation_Is_Latest: lead.reactivation_is_latest } : {}),
+
+    // Inncircles origin flags — only sent when the caller included them.
+    ...(lead.inncircles_flags?.is_reactivated           != null ? { IsReactivated:          lead.inncircles_flags.is_reactivated }           : {}),
+    ...(lead.inncircles_flags?.is_born_fresh            != null ? { IsBorn_Fresh:           lead.inncircles_flags.is_born_fresh }            : {}),
+    ...(lead.inncircles_flags?.is_born_in_other_project != null ? { IsBorn_InOtherProject:  lead.inncircles_flags.is_born_in_other_project } : {}),
+    ...(lead.inncircles_flags?.is_bulk_transfer         != null ? { IsBulkTransfer:         lead.inncircles_flags.is_bulk_transfer }         : {}),
   };
 
   // ── Step 3: Atomic dedupe via Mongo claim — closes ALL race windows ─────

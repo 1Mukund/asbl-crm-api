@@ -24,7 +24,18 @@ import { normalizePhone, parseName, detectProject } from "../_utils/normalize";
 import { ingestLead } from "../_utils/ingest";
 import { NormalizedLead } from "../_utils/types";
 
-const LEAD_SOURCE = "Inncircles M1";
+// FALLBACK source only. The webhook now honours a caller-supplied `source`
+// in the payload (see buildLead) — whoever hits this endpoint sends its own
+// source. This value is used ONLY when the payload omits `source`.
+// NOTE: whatever source the caller sends must exist as a Zoho Lead_Source
+// picklist option, else Zoho rejects the create/update.
+const DEFAULT_SOURCE = "Inncircles M1";
+
+// Sources the code owns — callers must NOT be able to set these via the
+// payload. "Manual Reactivation" is assigned ONLY by the reactivation-allowlist
+// branch (a caller spoofing it would mislabel a non-allowlisted lead as a
+// reactivation and pollute reactivation reporting). Compared case-insensitively.
+const RESERVED_SOURCES = new Set(["manual reactivation"]);
 
 /** Pull the first non-empty value across a list of candidate keys. */
 function pick(body: any, ...keys: string[]): string {
@@ -72,12 +83,38 @@ function buildLead(body: any): NormalizedLead | null {
     media:         num("MEDIA_TIMESPENT", "media_timespent", "mediaTimespent"),
   };
 
+  // Origin flags (0/1). Undefined when the caller omits the field so a
+  // re-ingest / other source doesn't overwrite an existing value.
+  const flag = (...keys: string[]): boolean | undefined => {
+    const raw = pick(body, ...keys).toLowerCase();
+    if (raw === "") return undefined;
+    if (["1", "true", "yes", "y"].includes(raw)) return true;
+    if (["0", "false", "no", "n"].includes(raw)) return false;
+    return undefined;
+  };
+  const inncircles_flags = {
+    is_reactivated:           flag("IsReactivated", "is_reactivated", "isReactivated"),
+    is_born_fresh:            flag("IsBorn_Fresh", "IsBornFresh", "is_born_fresh", "isBornFresh"),
+    is_born_in_other_project: flag("IsBorn_InOtherProject", "IsBornInOtherProject", "is_born_in_other_project", "isBornInOtherProject"),
+    is_bulk_transfer:         flag("IsBulkTransfer", "IsBulk_Transfer", "is_bulk_transfer", "isBulkTransfer"),
+  };
+
+  // Caller-supplied source wins, but reserved (code-owned) values are ignored
+  // so a caller can't spoof e.g. "Manual Reactivation" — that is set ONLY by
+  // the reactivation-allowlist branch in the handler.
+  const rawSource = pick(body, "source", "lead_source", "Lead_Source", "lead_source_name");
+  const leadSource = (rawSource && !RESERVED_SOURCES.has(rawSource.trim().toLowerCase()))
+    ? rawSource
+    : DEFAULT_SOURCE;
+
   return {
     first_name,
     last_name,
     mobile,
     email: pick(body, "email", "Email", "email_address"),
-    lead_source: LEAD_SOURCE,
+    // Caller-supplied source wins, EXCEPT reserved values (only the code may
+    // assign those). Falls back to DEFAULT_SOURCE when omitted or reserved.
+    lead_source: leadSource,
     source_lead_id: pick(body, "lead_id", "leadId", "id", "m1_lead_id", "inncircles_id", "submission_id"),
     campaign_name: pick(body, "campaign", "campaign_name", "utm_campaign"),
     utm_source: pick(body, "utm_source") || "inncircles",
@@ -102,6 +139,7 @@ function buildLead(body: any): NormalizedLead | null {
     time_spent_minutes: Number(pick(body, "time_spent", "time_spent_minutes")) || 0,
     referrer_url: pick(body, "referrer", "referrer_url"),
     section_timespent,
+    inncircles_flags,
   };
 }
 
@@ -213,7 +251,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const updated = results.filter((r) => r.action === "updated").length;
     return res.status(200).json({
       success: true,
-      source: LEAD_SOURCE,
+      default_source: DEFAULT_SOURCE,   // per-lead source is in results[].lead_source
       received: items.length,
       created,
       updated,
