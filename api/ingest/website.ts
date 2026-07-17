@@ -15,12 +15,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   // ── Optional API-key auth ──────────────────────────────────────────────
-  // Enforced ONLY when WEBSITE_INGEST_KEY is set in env. Kept optional so the
-  // endpoint stays OPEN until the key is rolled out to every website
-  // integration (asblloft.com + asbllandmark.com) — set the env var only after
-  // BOTH sites are sending the key, else their leads get 401'd.
+  // Shares ONE key with /api/ingest/inncircles via INGEST_API_KEY (falls back
+  // to the endpoint-specific WEBSITE_INGEST_KEY for back-compat). Enforced ONLY
+  // when a key is set, so the endpoint stays OPEN until the key is rolled out to
+  // every website integration (asblloft.com + asbllandmark.com) — set the env
+  // var only after BOTH sites are sending it, else their leads get 401'd.
   // Accepts: Authorization: Bearer <key>  |  x-api-key: <key>  |  ?key=<key>
-  const expectedKey = process.env.WEBSITE_INGEST_KEY || "";
+  const expectedKey = process.env.INGEST_API_KEY || process.env.WEBSITE_INGEST_KEY || "";
   if (expectedKey) {
     const authHeader = String(req.headers["authorization"] || "");
     const bearer = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7).trim() : "";
