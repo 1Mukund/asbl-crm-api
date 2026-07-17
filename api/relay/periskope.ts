@@ -12,6 +12,7 @@
  */
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { insertMessage as mongoInsertMessage } from "../_utils/whatsapp_messages";
+import { displayProject } from "../_utils/project_detection";
 
 const PERISKOPE_API_KEY  = process.env.PERISKOPE_API_KEY  || "";
 const PERISKOPE_API_URL  = "https://api.periskope.app/v1/messages/send";
@@ -63,9 +64,9 @@ function generateMessage(
 ): string {
   const name = firstName?.trim() || "there";
 
-  // Build enquiry detail line
+  // Build enquiry detail line. Never leak the new-launch codename (LEGACY).
   const details: string[] = [];
-  if (project)        details.push(project);
+  if (project)        details.push(displayProject(project));
   if (budget)         details.push(`budget ${budget}`);
   if (sizePreference) details.push(sizePreference);
 
