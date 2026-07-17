@@ -844,9 +844,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           if (!visitMs || visitMs <= now) continue;
           const phone = String(lead.Phone || lead.Mobile || "").replace(/\D/g, "");
           if (!phone || !fireChatbot) continue;
-          const { displayProject } = await import("../_utils/project_detection");
+          const { displayProject, displayName } = await import("../_utils/project_detection");
           const project = displayProject(lead.ASBL_Project, "ASBL");
-          const fullName = [lead.First_Name, lead.Last_Name].filter(Boolean).join(" ").trim() || "Sir";
+          const fullName = displayName([lead.First_Name, lead.Last_Name].filter(Boolean).join(" "), "Sir");
           const hoursOut = (visitMs - now) / 3600000;
           // 24h window: between 23h and 25h before visit
           if (hoursOut >= 23 && hoursOut <= 25 && visitMs < horizonHigh) {

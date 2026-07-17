@@ -29,7 +29,7 @@ import {
   incrementChatbotAttempt,
   incrementChatbotFollowup,
 } from "./prd_cadence";
-import { displayProject } from "./project_detection";
+import { displayProject, displayName } from "./project_detection";
 
 const PERISKOPE_API_KEY = process.env.PERISKOPE_API_KEY || "";
 const PERISKOPE_API_URL = "https://api.periskope.app/v1/messages/send";
@@ -381,7 +381,7 @@ export async function handleLeadCreated(input: OnLeadCreatedInput): Promise<{
 
 /** Build the initial WhatsApp greeting. Anandita-style, brief. */
 function buildInitialChatbotGreeting(input: OnLeadCreatedInput): string {
-  const name = (input.customer_name || "").trim() || "Sir/Ma'am";
+  const name = displayName(input.customer_name, "Sir");
   const project = displayProject(input.project, "our project");
 
   const contextBits: string[] = [];

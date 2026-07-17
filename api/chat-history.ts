@@ -6071,6 +6071,7 @@ ${SHARED_STYLE}
       "whatsapp_followups_paused",
       "calls_delayed_batched",
       "calls_paused",
+      "deluge_greeting_disabled",
       "first_call_delay_min",
       "first_call_batch_size",
     ]);

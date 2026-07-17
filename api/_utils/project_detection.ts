@@ -27,6 +27,19 @@ export function displayProject(project?: unknown, fallback = "our project"): str
   return p;
 }
 
+/** Customer-facing name for greetings. Falls back to a polite honorific when
+ *  the "name" is empty, a placeholder ("."), or looks like a phone number —
+ *  raw OR masked (e.g. "+917xxxxxxxx", "9876543210"). We never address a
+ *  customer by their own number. */
+export function displayName(name?: unknown, fallback = "Sir"): string {
+  const n = String(name ?? "").trim();
+  if (!n || n === ".") return fallback;
+  const compact = n.replace(/[\s\-().]/g, "");
+  // All digits / masked digits (x, *) with an optional leading + → phone-like.
+  if (/^\+?[\dxX*]{6,}$/.test(compact)) return fallback;
+  return n;
+}
+
 const KNOWN_PROJECTS: Project[] = ["LOFT", "SPECTRA", "BROADWAY", "LANDMARK"];
 
 const PROJECT_KEYWORDS: Record<Project, string[]> = {

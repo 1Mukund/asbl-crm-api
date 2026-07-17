@@ -29,7 +29,7 @@
  */
 import { NormalizedLead } from "./types";
 import { updateLead } from "./zoho";
-import { displayProject } from "./project_detection";
+import { displayProject, displayName } from "./project_detection";
 
 const PERISKOPE_API_KEY = process.env.PERISKOPE_API_KEY || "";
 const PERISKOPE_API_URL = "https://api.periskope.app/v1/messages/send";
@@ -109,9 +109,8 @@ async function pickSender(phone: string): Promise<string> {
 
 /** Pick the first non-empty value (handy for falling back across naming). */
 function firstName(lead: NormalizedLead): string {
-  const fn = (lead.first_name || "").trim();
-  if (fn && fn !== ".") return fn;
-  return "there";
+  // "Sir" when empty / placeholder / phone-like (never address by their number).
+  return displayName(lead.first_name, "Sir");
 }
 
 /** Build a brief context line for the History entry — kept on one line so

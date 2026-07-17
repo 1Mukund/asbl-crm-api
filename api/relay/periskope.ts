@@ -12,7 +12,7 @@
  */
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { insertMessage as mongoInsertMessage } from "../_utils/whatsapp_messages";
-import { displayProject } from "../_utils/project_detection";
+import { displayProject, displayName } from "../_utils/project_detection";
 
 const PERISKOPE_API_KEY  = process.env.PERISKOPE_API_KEY  || "";
 const PERISKOPE_API_URL  = "https://api.periskope.app/v1/messages/send";
@@ -62,7 +62,7 @@ function generateMessage(
   budget: string,
   sizePreference: string,
 ): string {
-  const name = firstName?.trim() || "there";
+  const name = displayName(firstName, "Sir");
 
   // Build enquiry detail line. Never leak the new-launch codename (LEGACY).
   const details: string[] = [];
@@ -191,6 +191,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     } = req.body || {};
 
     if (!phone) return res.status(400).json({ error: "phone required" });
+
+    // DELUGE GREETING KILL-SWITCH — the PRD born greeting (handleLeadCreated)
+    // now covers first-touch for every lead, so this Zoho-Deluge greeting was
+    // a DUPLICATE (customers got two "greetings" per project). When
+    // deluge_greeting_disabled="true", skip the send and ack 200 so Deluge
+    // doesn't error/retry. Toggle via ?action=set-ops-flag.
+    try {
+      const { getBotSetting } = await import("../_utils/bot_settings");
+      if ((await getBotSetting("deluge_greeting_disabled"))?.value === "true") {
+        console.log(`[Periskope] Deluge greeting DISABLED — skipping send for ${phone}`);
+        return res.status(200).json({ ok: true, skipped: true, reason: "deluge_greeting_disabled" });
+      }
+    } catch { /* on flag-read failure, fall through and send */ }
 
     // 1. Pick sender — sticky-per-phone (re-uses existing mapping if present,
     //    falls through to round-robin only for new phones). The send call
