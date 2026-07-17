@@ -966,6 +966,35 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     console.log(`[Periskope Webhook] Inbound from ${phone} | msg: ${message.slice(0, 80)}`);
 
+    // ── IDEMPOTENCY GUARD ───────────────────────────────────────────────────
+    // Our reply takes 6-10s (Gemini) and we only ack 200 at the very end, which
+    // can exceed Periskope's webhook timeout → Periskope RETRIES the delivery,
+    // and each retry re-ran Gemini and sent ANOTHER reply (customers received
+    // 4-5 near-duplicate messages). Atomically CLAIM this inbound message; if
+    // it's already claimed (a retry / duplicate delivery), ack and skip. Keyed
+    // on Periskope's message id when present; else a (phone + text + 2-min
+    // bucket) composite so retries collapse but a genuine later re-send still
+    // gets a reply. A 24h TTL index keeps the collection self-cleaning.
+    const inboundId = String(
+      data?.message_id || data?.id || data?._id || data?.unique_id || data?.key?.id || "",
+    ).trim();
+    const dedupeKey = inboundId || `${phone}:${message.slice(0, 80)}:${Math.floor(Date.now() / 120000)}`;
+    try {
+      const { getCollection } = await import("../_utils/mongo");
+      const dedupeCol = await getCollection("processed_inbound" as any);
+      if (!(globalThis as any).__inboundDedupeIdx) {
+        (globalThis as any).__inboundDedupeIdx = true;
+        dedupeCol.createIndex({ at: 1 }, { expireAfterSeconds: 86400 }).catch(() => {});
+      }
+      await dedupeCol.insertOne({ _id: dedupeKey as any, phone, msg: message.slice(0, 120), at: new Date() } as any);
+    } catch (err: any) {
+      if (err?.code === 11000 || /duplicate key|e11000/i.test(String(err?.message || ""))) {
+        console.log(`[Periskope Webhook] Duplicate inbound (${dedupeKey.slice(0, 60)}) — skipping to avoid a duplicate reply`);
+        return res.status(200).json({ skipped: true, reason: "duplicate" });
+      }
+      console.error(`[Periskope Webhook] dedupe insert error (continuing): ${err.message}`);
+    }
+
     // 1+2+3. Run Zoho lookup, conversation history fetch, AND user profile
     //         fetch in parallel — all independent, ~1.5-2s sequentially.
     const zohoTask: Promise<{ token: string; lead: LeadDetails | null }> = (async () => {
