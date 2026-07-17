@@ -18,8 +18,10 @@ export type Project = "LOFT" | "SPECTRA" | "BROADWAY" | "LANDMARK" | "LEGACY";
  *  to a customer — it always reads as "our new launch project". Named projects
  *  pass through unchanged. Use this everywhere a project name is interpolated
  *  into outbound copy (greeting, follow-ups, reminders, resubmission). */
-export function displayProject(project?: string | null, fallback = "our project"): string {
-  const p = (project || "").trim();
+export function displayProject(project?: unknown, fallback = "our project"): string {
+  // Coerce defensively — callers often pass req.body values (runtime `any`),
+  // so a non-string (object/number) must not throw on .trim().
+  const p = String(project ?? "").trim();
   if (!p) return fallback;
   if (p.toUpperCase() === "LEGACY") return "our new launch project";
   return p;
