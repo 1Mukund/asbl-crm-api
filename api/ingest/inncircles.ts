@@ -158,12 +158,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (expectedSecret) {
     const authHeader = String(req.headers["authorization"] || "");
     const bearer = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7).trim() : "";
-    const got = bearer
-      || String(req.headers["x-api-key"] || "")
-      || String(req.headers["x-webhook-secret"] || "")
-      || String(req.query.key || "")
-      || String(req.query.secret || "");
-    if (got !== expectedSecret) {
+    // Authorize if ANY supplied credential matches — a request may carry several
+    // auth inputs (e.g. a stale Bearer + a valid x-api-key); don't 401 just
+    // because the first non-empty one is wrong.
+    const candidates = [
+      bearer,
+      String(req.headers["x-api-key"] || ""),
+      String(req.headers["x-webhook-secret"] || ""),
+      String(req.query.key || ""),
+      String(req.query.secret || ""),
+    ];
+    if (!candidates.includes(expectedSecret)) {
       return res.status(401).json({ error: "Unauthorized — missing or invalid API key" });
     }
   }

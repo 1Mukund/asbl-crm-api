@@ -25,8 +25,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (expectedKey) {
     const authHeader = String(req.headers["authorization"] || "");
     const bearer = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7).trim() : "";
-    const got = bearer || String(req.headers["x-api-key"] || "") || String(req.query.key || "");
-    if (got !== expectedKey) {
+    // Authorize if ANY supplied credential matches (don't 401 on a stale first input).
+    const candidates = [bearer, String(req.headers["x-api-key"] || ""), String(req.query.key || "")];
+    if (!candidates.includes(expectedKey)) {
       return res.status(401).json({ error: "Unauthorized — missing or invalid API key" });
     }
   }
