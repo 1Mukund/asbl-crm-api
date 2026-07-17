@@ -29,6 +29,7 @@ import {
   incrementChatbotAttempt,
   incrementChatbotFollowup,
 } from "./prd_cadence";
+import { displayProject } from "./project_detection";
 
 const PERISKOPE_API_KEY = process.env.PERISKOPE_API_KEY || "";
 const PERISKOPE_API_URL = "https://api.periskope.app/v1/messages/send";
@@ -381,7 +382,7 @@ export async function handleLeadCreated(input: OnLeadCreatedInput): Promise<{
 /** Build the initial WhatsApp greeting. Anandita-style, brief. */
 function buildInitialChatbotGreeting(input: OnLeadCreatedInput): string {
   const name = (input.customer_name || "").trim() || "Sir/Ma'am";
-  const project = input.project || "our project";
+  const project = displayProject(input.project, "our project");
 
   const contextBits: string[] = [];
   if (input.budget)          contextBits.push(`budget ${input.budget}`);
@@ -528,7 +529,7 @@ export function detectsNotInterestedIntent(msg: string | null | undefined): bool
  *  feel robotic. Index wraps around so attempt #7 = #1 again. */
 function buildFollowupMessage(customerName: string, project: string | undefined, idx: number): string {
   const name = (customerName || "").trim() || "Sir/Ma'am";
-  const proj = project || "ASBL";
+  const proj = displayProject(project, "ASBL");
   // ENGLISH ONLY — all follow-ups must go in English regardless of customer
   // language (product directive 2026-06-29). Warm, human, no em-dash.
   const messages = [
@@ -570,7 +571,7 @@ export function buildReengagementMessage(
   lastInboundText: string = "",
 ): string {
   const name = (customerName || "").trim() || "Sir/Ma'am";
-  const proj = project || "ASBL";
+  const proj = displayProject(project, "ASBL");
 
   // Build a context phrase quoting the customer's last message. Trim to
   // a short readable excerpt + strip media placeholders + escape WhatsApp

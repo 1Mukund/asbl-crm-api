@@ -29,6 +29,7 @@
  */
 import { NormalizedLead } from "./types";
 import { updateLead } from "./zoho";
+import { displayProject } from "./project_detection";
 
 const PERISKOPE_API_KEY = process.env.PERISKOPE_API_KEY || "";
 const PERISKOPE_API_URL = "https://api.periskope.app/v1/messages/send";
@@ -154,7 +155,8 @@ function appendHistory(prev: string, line: string): string {
  *  Anandita (we assume the lead has had at least one prior touch). */
 function buildWhatsAppMessage(lead: NormalizedLead, count: number): string {
   const name = firstName(lead);
-  const project = lead.project || "our projects";
+  // Never leak the new-launch codename (LEGACY) — reads as "our new launch project".
+  const project = displayProject(lead.project, "our projects");
 
   const contextBits: string[] = [];
   if (typeof lead.time_spent_minutes === "number" && lead.time_spent_minutes >= 1) {
