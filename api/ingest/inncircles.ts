@@ -146,16 +146,25 @@ function buildLead(body: any): NormalizedLead | null {
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-webhook-secret");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, x-webhook-secret");
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  // Optional shared-secret gate (only enforced when the env var is set).
-  const expectedSecret = process.env.INNCIRCLES_WEBHOOK_SECRET || "";
+  // API-key gate. Shares ONE key with /api/ingest/website via INGEST_API_KEY
+  // (falls back to the endpoint-specific INNCIRCLES_WEBHOOK_SECRET for
+  // back-compat). Enforced only when a key is set. Accepts the same forms as
+  // the website endpoint plus the legacy webhook-secret header/query.
+  const expectedSecret = process.env.INGEST_API_KEY || process.env.INNCIRCLES_WEBHOOK_SECRET || "";
   if (expectedSecret) {
-    const got = (req.query.secret as string) || (req.headers["x-webhook-secret"] as string) || "";
+    const authHeader = String(req.headers["authorization"] || "");
+    const bearer = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7).trim() : "";
+    const got = bearer
+      || String(req.headers["x-api-key"] || "")
+      || String(req.headers["x-webhook-secret"] || "")
+      || String(req.query.key || "")
+      || String(req.query.secret || "");
     if (got !== expectedSecret) {
-      return res.status(401).json({ error: "Unauthorized — invalid or missing webhook secret" });
+      return res.status(401).json({ error: "Unauthorized — missing or invalid API key" });
     }
   }
 
