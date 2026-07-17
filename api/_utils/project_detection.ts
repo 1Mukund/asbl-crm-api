@@ -13,6 +13,18 @@ import { getRecentProjectMessages } from "./whatsapp_messages";
 
 export type Project = "LOFT" | "SPECTRA" | "BROADWAY" | "LANDMARK" | "LEGACY";
 
+/** Customer-facing project label for any PROACTIVE / templated message. The
+ *  upcoming launch's internal codename "LEGACY" must NEVER appear in a message
+ *  to a customer — it always reads as "our new launch project". Named projects
+ *  pass through unchanged. Use this everywhere a project name is interpolated
+ *  into outbound copy (greeting, follow-ups, reminders, resubmission). */
+export function displayProject(project?: string | null, fallback = "our project"): string {
+  const p = (project || "").trim();
+  if (!p) return fallback;
+  if (p.toUpperCase() === "LEGACY") return "our new launch project";
+  return p;
+}
+
 const KNOWN_PROJECTS: Project[] = ["LOFT", "SPECTRA", "BROADWAY", "LANDMARK"];
 
 const PROJECT_KEYWORDS: Record<Project, string[]> = {
