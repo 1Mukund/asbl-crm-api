@@ -79,6 +79,10 @@ function isDeadSenderResponse(status: number, body: string): boolean {
   // 401 from Periskope on a per-x-phone send almost always means the phone
   // is offline (not the API key — we'd see that on every request, not one).
   if (status === 401) return true;
+  // Periskope's backend/phone-server for this sender is unreachable (it returned
+  // 500 with an internal connection error, e.g. "connect ECONNREFUSED ...").
+  // Treat as dead so we fall through to another sender instead of giving up.
+  if (/econnrefused|econnreset|etimedout|ehostunreach|socket hang up|network|refused/.test(b)) return true;
   return false;
 }
 

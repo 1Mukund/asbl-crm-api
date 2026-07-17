@@ -221,6 +221,8 @@ function isDeadSenderResponse(status: number, body: string): boolean {
   if (b.includes("/phone/restart")) return true;
   if (b.includes("unauthorized_error")) return true;
   if (status === 401) return true;
+  // Sender's Periskope backend/phone-server unreachable → fall through to next.
+  if (/econnrefused|econnreset|etimedout|ehostunreach|socket hang up|network|refused/.test(b)) return true;
   return false;
 }
 
