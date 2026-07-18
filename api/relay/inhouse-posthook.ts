@@ -326,7 +326,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     };
     const transition = transitionMap[callStatus];
     if (transition) {
-      triggerBlueprintTransition(lead.id, transition).catch((err) =>
+      // MUST await — same fire-and-forget trap; the Lead_Status blueprint move
+      // (e.g. "Site Visit Confirmed") was being killed on handler return.
+      await triggerBlueprintTransition(lead.id, transition).catch((err) =>
         console.error(`[InHouse Posthook] Blueprint '${transition}' failed:`, err.message)
       );
     }
@@ -353,7 +355,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         finalOutcome = "answered_wants_site_visit";
         details.visitDate = extracted.site_visit_requested.date;
       }
-      handleCallPosthook({
+      // MUST await — this writes PRD_Stage (e.g. -> "Pre Site Visit" for a
+      // site-visit outcome). Fire-and-forget got killed when the handler
+      // returned 200, so most site-visit leads were never marked in Zoho
+      // (only the odd one whose write happened to finish in time). The .catch
+      // keeps a PRD failure from breaking the rest of the posthook.
+      await handleCallPosthook({
         zoho_lead_id: lead.id,
         lead,
         outcome: finalOutcome as any,
