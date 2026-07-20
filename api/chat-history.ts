@@ -2536,6 +2536,130 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── Call activity report: per-lead # of calls + when ───────────────────
+  // GET ?action=call-report&secret=<INHOUSE_POSTHOOK_SECRET>&since=YYYY-MM-DD
+  //     [&maxPages=N]
+  // The reliable call count comes from the per-call Notes the posthook writes
+  // onto each lead ("… Call — <uuid>" + recording/transcript sub-notes). The
+  // Calls module records carry NO lead link in this Zoho org, and the per-lead
+  // counter fields (SS_Call_Attempt_Count / Last_Inhouse_Call_ID) are empty —
+  // so Notes are the only source of truth. Distinct uuid per lead = # of calls;
+  // each note's Created_Time = when. Enriched with lead + Calls-module result.
+  if (req.method === "GET" && req.query.action === "call-report") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=" });
+    }
+    const since = String(req.query.since || "2026-06-01");
+    const sinceMs = new Date(`${since}T00:00:00+05:30`).getTime();
+    const maxNotePages = Math.min(300, Math.max(1, Number(req.query.maxPages) || 150));
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZBASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+      const authH = { Authorization: `Zoho-oauthtoken ${token}` };
+      const UUID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+
+      // 1. Page through Notes newest-first; keep only call notes.
+      //    perLead: leadId -> { name, calls: Map<uuid, earliestTimeMs> }
+      const perLead = new Map<string, { name: string; calls: Map<string, number> }>();
+      const allUuidTimes = new Map<string, number>(); // uuid -> earliest note time (for calls-module join)
+      let notePage = 1;
+      let stop = false;
+      while (notePage <= maxNotePages && !stop) {
+        const r = await fetch(
+          `${ZBASE}/Notes?fields=Note_Title,Created_Time,Parent_Id&per_page=200&page=${notePage}&sort_by=Created_Time&sort_order=desc`,
+          { headers: authH },
+        );
+        if (r.status === 204) break;
+        if (!r.ok) {
+          const t = await r.text();
+          return res.status(500).json({ error: `Zoho Notes ${r.status}: ${t.slice(0, 200)}`, notePage });
+        }
+        const data = (await r.json()) as any;
+        const rowsN = (data?.data || []) as any[];
+        if (!rowsN.length) break;
+        for (const n of rowsN) {
+          const created = String(n.Created_Time || "");
+          const tMs = created ? new Date(created).getTime() : 0;
+          if (tMs && tMs < sinceMs) { stop = true; continue; }
+          const title = String(n.Note_Title || "");
+          if (!/call/i.test(title)) continue;
+          const m = title.match(UUID_RE);
+          if (!m) continue;
+          const uuid = m[1].toLowerCase();
+          const parent = n.Parent_Id;
+          const leadId = parent && (parent.id || (typeof parent === "string" ? parent : null));
+          if (!leadId) continue;
+          const leadName = (parent && parent.name) || "";
+          let entry = perLead.get(String(leadId));
+          if (!entry) { entry = { name: leadName, calls: new Map() }; perLead.set(String(leadId), entry); }
+          if (leadName && !entry.name) entry.name = leadName;
+          const prev = entry.calls.get(uuid);
+          if (prev === undefined || (tMs && tMs < prev)) entry.calls.set(uuid, tMs || prev || 0);
+          const prevU = allUuidTimes.get(uuid);
+          if (prevU === undefined || (tMs && tMs < prevU)) allUuidTimes.set(uuid, tMs || prevU || 0);
+        }
+        const oldest = rowsN[rowsN.length - 1]?.Created_Time;
+        if (oldest && new Date(oldest).getTime() < sinceMs) stop = true;
+        if (data?.info?.more_records === false) break;
+        notePage++;
+      }
+
+      // 2. Enrich leads (batch by id, 100 at a time).
+      const leadIds = Array.from(perLead.keys());
+      const leadInfo = new Map<string, any>();
+      for (let i = 0; i < leadIds.length; i += 100) {
+        const chunk = leadIds.slice(i, i + 100);
+        const r = await fetch(
+          `${ZBASE}/Leads?ids=${chunk.join(",")}&fields=First_Name,Last_Name,Mobile,ASBL_Project,Lead_Source,Lead_Status,Call_Status,Next_Call_At,Total_Call_Duration_Secs,Created_Time`,
+          { headers: authH },
+        );
+        if (!r.ok) continue;
+        const data = (await r.json()) as any;
+        for (const l of (data?.data || [])) leadInfo.set(String(l.id), l);
+      }
+
+      // 3. Build per-lead rows (sorted by # calls desc).
+      const iso = (ms: number) => (ms ? new Date(ms + 5.5 * 3600 * 1000).toISOString().replace("T", " ").slice(0, 16) + " IST" : "");
+      const leads = leadIds.map((id) => {
+        const e = perLead.get(id)!;
+        const info = leadInfo.get(id) || {};
+        const times = Array.from(e.calls.values()).filter(Boolean).sort((a, b) => a - b);
+        const name = [info.First_Name, info.Last_Name].filter(Boolean).join(" ").trim() || e.name || "";
+        return {
+          lead_id: id,
+          name,
+          phone: info.Mobile || "",
+          project: info.ASBL_Project || "",
+          source: info.Lead_Source || "",
+          lead_status: info.Lead_Status || "",
+          call_status: info.Call_Status || "",
+          num_calls: e.calls.size,
+          call_times: times.map(iso),
+          first_call: iso(times[0] || 0),
+          last_call: iso(times[times.length - 1] || 0),
+          next_call_at: info.Next_Call_At || "",
+          total_call_duration_secs: info.Total_Call_Duration_Secs ?? "",
+          created: info.Created_Time || "",
+        };
+      }).sort((a, b) => b.num_calls - a.num_calls);
+
+      return res.status(200).json({
+        since,
+        generated_at: new Date().toISOString(),
+        total_leads_called: leads.length,
+        total_calls: leads.reduce((s, r) => s + r.num_calls, 0),
+        note_pages_scanned: notePage - 1,
+        hit_page_cap: notePage > maxNotePages,
+        leads,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── Zoho lead inspector (debug) ────────────────────────────────────────
   // GET ?action=zoho-lead&id=<lead_id> OR &phone=<+91...>
   // Returns the raw lead record + recent Notes + recent Calls for diagnosis.
