@@ -837,6 +837,61 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ── Backfill Pre-Site-Visit stage (one-shot) ─────────────────────────────
+  // The posthook used to fire-and-forget handleCallPosthook, so leads whose
+  // voice call ended in "Pre Site" / "Virtual Tour" got Call_Status set but
+  // PRD_Stage never moved to "Pre Site Visit" (blueprint/Lead_Status too).
+  // This sweep finds those and applies the milestone. Conservative: skips
+  // leads already closed as Not Interested (sales may have closed them) and
+  // reports that count so they can be reviewed separately.
+  if (req.query.task === "backfill-presite-stage") {
+    const start = Date.now();
+    const result: any = { ms: 0, matched: 0, marked: 0, already_ok: 0, skipped_not_interested: 0, errors: 0 };
+    try {
+      const { getAccessToken, triggerBlueprintTransition } = await import("../_utils/zoho");
+      const { onSiteVisitBooked } = await import("../_utils/prd_state_machine");
+      const token = await getAccessToken();
+      const ZBASE = "https://www.zohoapis.in/crm/v3";
+      const fields = "id,First_Name,Last_Name,Call_Status,PRD_Stage,ASBL_Project";
+      const criteria = "((Call_Status:equals:Pre Site)or(Call_Status:equals:Virtual Tour))";
+      const matched: any[] = [];
+      for (let page = 1; page <= 20; page++) {
+        const r = await fetch(
+          `${ZBASE}/Leads/search?criteria=${encodeURIComponent(criteria)}&fields=${encodeURIComponent(fields)}&per_page=200&page=${page}`,
+          { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
+        );
+        if (r.status === 204) break;
+        if (!r.ok) throw new Error(`Zoho search ${r.status}: ${(await r.text()).slice(0, 200)}`);
+        const j = (await r.json()) as any;
+        const rows = (j?.data || []) as any[];
+        matched.push(...rows);
+        if (!j?.info?.more_records) break;
+      }
+      result.matched = matched.length;
+      for (const lead of matched) {
+        const stage = String(lead.PRD_Stage || "");
+        if (stage === "Pre Site Visit") { result.already_ok++; continue; }
+        if (stage === "Not Interested") { result.skipped_not_interested++; continue; }
+        try {
+          await onSiteVisitBooked(lead.id, lead);
+          const bp = String(lead.Call_Status) === "Virtual Tour" ? "Virtual Tour Scheduled" : "Site Visit Confirmed";
+          await triggerBlueprintTransition(lead.id, bp).catch(() => {});
+          result.marked++;
+        } catch {
+          result.errors++;
+        }
+      }
+      result.ms = Date.now() - start;
+      await logCronRun("backfill-presite-stage", result.ms, result, result.errors ? `${result.errors} errors` : null);
+      return res.status(200).json({ task: "backfill-presite-stage", ...result });
+    } catch (err: any) {
+      result.ms = Date.now() - start;
+      console.error("[Backfill Pre-Site Stage] Fatal:", err.message);
+      await logCronRun("backfill-presite-stage", result.ms, result, err.message);
+      return res.status(500).json({ error: err.message, ...result });
+    }
+  }
+
   // ── Mongo lead sync (every 15 min) — Zoho -> Mongo, for in-house CRM ────
   // PURELY ADDITIVE. Keeps the Mongo `leads` collection a complete + fresh
   // copy of Zoho (incl. leads created directly in Zoho + sales manual edits)

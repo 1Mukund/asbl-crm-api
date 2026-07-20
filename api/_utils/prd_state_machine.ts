@@ -104,6 +104,25 @@ export async function transitionStage(input: TransitionInput): Promise<Transitio
   let targetStatus: Status | null = input.newStatus ?? DEFAULT_STATUS_PER_STAGE[targetStage] ?? null;
   const effectiveReason = input.reason;
 
+  // ── Milestone protection: never auto-downgrade OUT of "Pre Site Visit" ────
+  // Once a lead has booked a site visit (the furthest automated milestone), a
+  // later call/chatbot outcome must NOT push it back to Lead Initiated / New
+  // Lead / Not Interested — the max milestone is preserved so a "not
+  // interested" on a follow-up call doesn't erase a scheduled site visit.
+  // (Sales can still change it manually in Zoho; this only guards our
+  // automated transitions, which always pass existingLead.)
+  const currentStage = input.existingLead?.PRD_Stage as Stage | undefined;
+  if (currentStage === "Pre Site Visit" && targetStage !== "Pre Site Visit") {
+    console.log(
+      `[PRD State] Lead ${input.leadId}: stage move "${currentStage}" → "${targetStage}" ` +
+      `BLOCKED (milestone preserved; reason=${effectiveReason}). Recording audit only.`,
+    );
+    targetStage = "Pre Site Visit";
+    if (!targetStatus || !VALID_STATUS_PER_STAGE["Pre Site Visit"].has(targetStatus)) {
+      targetStatus = DEFAULT_STATUS_PER_STAGE["Pre Site Visit"] ?? "NA";
+    }
+  }
+
   // ── Status validity (skip for Not Interested — terminal) ─────────────
   if (targetStage !== "Not Interested") {
     const validSet = VALID_STATUS_PER_STAGE[targetStage];

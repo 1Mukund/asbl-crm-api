@@ -25,6 +25,23 @@ export function displayProject(project?: string | null, fallback = "our project"
   return p;
 }
 
+/** Customer-facing display NAME for proactive messages + voice calls. Many
+ *  leads land with a phone-number-shaped or placeholder "name" (e.g.
+ *  "+918xxxxxxxx", "9876543210", "."), and the voice agent literally reads
+ *  that out as the customer's name on the call. Collapse those to a neutral
+ *  fallback so the agent never pronounces a phone number. Real names pass
+ *  through unchanged. */
+export function displayName(name?: string | null, fallback = "Sir"): string {
+  const raw = String(name ?? "").trim();
+  if (!raw) return fallback;
+  // Strip spacing/formatting chars; an all-digits / x-masked / +prefixed
+  // token (6+ chars) is a phone-like placeholder, not a real name.
+  const collapsed = raw.replace(/[\s\-().]/g, "");
+  if (!collapsed || collapsed === ".") return fallback;
+  if (/^\+?[\dxX*]{6,}$/.test(collapsed)) return fallback;
+  return raw;
+}
+
 const KNOWN_PROJECTS: Project[] = ["LOFT", "SPECTRA", "BROADWAY", "LANDMARK"];
 
 const PROJECT_KEYWORDS: Record<Project, string[]> = {

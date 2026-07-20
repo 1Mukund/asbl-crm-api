@@ -326,7 +326,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     };
     const transition = transitionMap[callStatus];
     if (transition) {
-      triggerBlueprintTransition(lead.id, transition).catch((err) =>
+      // MUST await — Vercel kills un-awaited promises when the handler returns
+      // 200, so the Lead_Status blueprint move (e.g. "Site Visit Confirmed")
+      // was silently lost. That's why site-visit leads had Call_Status set but
+      // Lead_Status/PRD_Stage stayed empty in Zoho.
+      await triggerBlueprintTransition(lead.id, transition).catch((err) =>
         console.error(`[InHouse Posthook] Blueprint '${transition}' failed:`, err.message)
       );
     }
@@ -353,7 +357,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         finalOutcome = "answered_wants_site_visit";
         details.visitDate = extracted.site_visit_requested.date;
       }
-      handleCallPosthook({
+      // MUST await — same fire-and-forget trap. This is what writes
+      // PRD_Stage="Pre Site Visit" (via onSiteVisitBooked); un-awaited it was
+      // killed on handler return, so PRD_Stage stayed empty for every
+      // site-visit lead.
+      await handleCallPosthook({
         zoho_lead_id: lead.id,
         lead,
         outcome: finalOutcome as any,
