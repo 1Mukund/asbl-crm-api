@@ -2553,6 +2553,9 @@ ${SHARED_STYLE}
     }
     const since = String(req.query.since || "2026-06-01");
     const sinceMs = new Date(`${since}T00:00:00+05:30`).getTime();
+    if (!Number.isFinite(sinceMs)) {
+      return res.status(400).json({ error: "Invalid since — use YYYY-MM-DD" });
+    }
     const maxNotePages = Math.min(300, Math.max(1, Number(req.query.maxPages) || 150));
     try {
       const { getAccessToken } = await import("./_utils/zoho");
@@ -2566,6 +2569,7 @@ ${SHARED_STYLE}
       const perLead = new Map<string, { name: string; calls: Map<string, number> }>();
       const allUuidTimes = new Map<string, number>(); // uuid -> earliest note time (for calls-module join)
       let notePage = 1;
+      let pagesScanned = 0;
       let stop = false;
       while (notePage <= maxNotePages && !stop) {
         const r = await fetch(
@@ -2580,6 +2584,7 @@ ${SHARED_STYLE}
         const data = (await r.json()) as any;
         const rowsN = (data?.data || []) as any[];
         if (!rowsN.length) break;
+        pagesScanned++;
         for (const n of rowsN) {
           const created = String(n.Created_Time || "");
           const tMs = created ? new Date(created).getTime() : 0;
@@ -2651,7 +2656,7 @@ ${SHARED_STYLE}
         generated_at: new Date().toISOString(),
         total_leads_called: leads.length,
         total_calls: leads.reduce((s, r) => s + r.num_calls, 0),
-        note_pages_scanned: notePage - 1,
+        note_pages_scanned: pagesScanned,
         hit_page_cap: notePage > maxNotePages,
         leads,
       });
