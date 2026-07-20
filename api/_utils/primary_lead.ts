@@ -87,10 +87,44 @@ export function otherProjectsForContext(records: any[], excludeProject?: string)
   return out;
 }
 
-/** Fetch every Zoho lead record for a phone — used by the T=0 born flow to
- *  check for an already-active sibling + gather sibling projects. Best-effort:
- *  returns [] on any Zoho failure so it never blocks the ingest path. */
+/** Every lead record for a phone — used by the T=0 born flow to check for an
+ *  already-active sibling + gather sibling projects. Reads from Mongo FIRST
+ *  (avoids a Zoho API search on every new lead — big saving during bulk lead
+ *  bursts); falls back to a Zoho search only if Mongo has nothing. The
+ *  sibling-check signals it relies on (Last_Inhouse_Call_ID, Chatbot_*,
+ *  Total_Call_Duration_Secs, Next_Call_At) are all mirrored to Mongo, so an
+ *  active sibling is still detected. Best-effort: [] on total failure. */
 export async function fetchLeadRecordsByPhone(phone: string): Promise<any[]> {
+  const key = normPhoneKey(phone);
+  if (!key) return [];
+  try {
+    const { getCollection, COL } = await import("./mongo");
+    const col = await getCollection<any>(COL.LEADS);
+    const docs = await col.find({ mobile: key } as any).limit(50).toArray();
+    if (docs.length) {
+      // Map Mongo snake_case → the Zoho-cased shape the helpers above read.
+      return docs.map((d: any) => ({
+        id: d.zoho_lead_id || d._id,
+        Mobile: d.mobile,
+        ASBL_Project: d.project || d.asbl_project || "",
+        PRD_Stage: d.prd_stage ?? null,
+        Next_Call_At: d.next_call_at ?? null,
+        Last_Inhouse_Call_ID: d.last_inhouse_call_id ?? null,
+        Chatbot_Attempt_Count: d.chatbot_attempt_count ?? 0,
+        Chatbot_Follow_up_Count: d.chatbot_follow_up_count ?? 0,
+        Total_Call_Duration_Secs: d.total_call_duration_secs ?? 0,
+        Created_Time: d.created_time || d.created_at || null,
+      }));
+    }
+  } catch (err) {
+    // fall through to Zoho
+  }
+  return fetchLeadRecordsByPhoneZoho(phone);
+}
+
+/** Zoho-search fallback for fetchLeadRecordsByPhone (leads not yet in Mongo).
+ *  Best-effort: returns [] on any Zoho failure so it never blocks ingest. */
+async function fetchLeadRecordsByPhoneZoho(phone: string): Promise<any[]> {
   const cleaned = String(phone || "").replace(/^\+/, "").replace(/\D/g, "");
   if (!cleaned) return [];
   try {

@@ -11,7 +11,7 @@
     },
     {
       "path": "/api/cron/followup?task=mark-unique-leads",
-      "schedule": "7 * * * *"
+      "schedule": "7 22 * * *"
     },
     {
       "path": "/api/cron/followup?task=pre-site-visit-reminders",

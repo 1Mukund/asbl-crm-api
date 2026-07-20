@@ -325,6 +325,10 @@ const ZOHO_TO_MONGO_PRD_FIELD_MAP: Record<string, string> = {
   Call_Status:              "call_status",
   Call_Duration:            "call_duration",
   Total_Call_Duration_Secs: "total_call_duration_secs",
+  Next_Call_At:             "next_call_at",   // call-timing gate — must mirror
+                                              // in real-time (not just 15-min
+                                              // sync) so Mongo-based reads see
+                                              // the current schedule.
   Last_Inhouse_Call_ID:     "last_inhouse_call_id",
   Last_Arrowhead_Call_ID:   "last_arrowhead_call_id",
   Lead_Status:              "lead_status",
