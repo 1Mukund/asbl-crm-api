@@ -149,8 +149,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // Pass everything Deluge gave us (project, mlid, plid, etc.) as
     // metadata so the voice-bot's LLM session has full context.
     const dynVars = body.retell_llm_dynamic_variables || {};
+    // Other projects the SAME person enquired about (multi-project lead). The
+    // person is called only ONCE (for one project) but the voice agent gets
+    // the others as context so it can acknowledge them. Accepts an array
+    // (enquired_projects) or the comma-string dynamic var (other_projects).
+    const enquiredProjects: string = Array.isArray(body.enquired_projects)
+      ? body.enquired_projects.filter(Boolean).join(", ")
+      : String(dynVars.other_projects || "");
     const metadata: Record<string, any> = {
       project: dynVars.project_name || body.project || "",
+      enquired_projects: enquiredProjects,
       plid: dynVars.plid || "",
       mlid: dynVars.mlid || "",
       customer_phone: dynVars.customer_phone || phone,
