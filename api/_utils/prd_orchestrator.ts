@@ -29,7 +29,7 @@ import {
   incrementChatbotAttempt,
   incrementChatbotFollowup,
 } from "./prd_cadence";
-import { displayProject } from "./project_detection";
+import { displayProject, displayName } from "./project_detection";
 
 const PERISKOPE_API_KEY = process.env.PERISKOPE_API_KEY || "";
 const PERISKOPE_API_URL = "https://api.periskope.app/v1/messages/send";
@@ -228,6 +228,10 @@ async function fireAiCall(opts: {
 }): Promise<{ ok: boolean; error?: string; response?: any }> {
   const SELF_BASE_URL = process.env.SELF_PUBLIC_URL || "https://asbl-crm-api.vercel.app";
   const externalScheduleId = `prd-${opts.zoho_lead_id}-${Date.now()}`;
+  // Sanitize the name: many leads land with a phone-number-shaped "name"
+  // (e.g. "+918xxxxxxxx") and the voice agent otherwise reads the digits out
+  // loud as the customer's name. Collapse those to a neutral fallback.
+  const safeName = displayName(opts.customer_name, "Sir");
   // Other projects the SAME person enquired about (already masked for LEGACY
   // by the caller). Passed so the voice agent knows this is a multi-project
   // lead and can talk about it.
@@ -235,13 +239,13 @@ async function fireAiCall(opts: {
   const payload: Record<string, any> = {
     _zoho_lead_id: opts.zoho_lead_id,
     phone_number: opts.phone,
-    customer_full_name: opts.customer_name,
-    customer_name: opts.customer_name,
+    customer_full_name: safeName,
+    customer_name: safeName,
     external_schedule_id: externalScheduleId,
     external_customer_id: opts.zoho_lead_id,
     ...(enquiredProjects.length ? { enquired_projects: enquiredProjects } : {}),
     retell_llm_dynamic_variables: {
-      customer_name: opts.customer_name,
+      customer_name: safeName,
       customer_phone: opts.phone,
       project_name: opts.project || "",
       other_projects: enquiredProjects.join(", "),
