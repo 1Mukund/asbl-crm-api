@@ -209,6 +209,7 @@ export async function fireAiCallDirect(opts: {
   phone: string;
   customer_name: string;
   project?: string;
+  other_projects?: string[];
 }): Promise<{ ok: boolean; error?: string; response?: any }> {
   return fireAiCall(opts);
 }
@@ -218,6 +219,7 @@ async function fireAiCall(opts: {
   phone: string;
   customer_name: string;
   project?: string;
+  other_projects?: string[];
   is_resubmission?: boolean;
   last_page_visited?: string;
   budget?: string;
@@ -226,6 +228,10 @@ async function fireAiCall(opts: {
 }): Promise<{ ok: boolean; error?: string; response?: any }> {
   const SELF_BASE_URL = process.env.SELF_PUBLIC_URL || "https://asbl-crm-api.vercel.app";
   const externalScheduleId = `prd-${opts.zoho_lead_id}-${Date.now()}`;
+  // Other projects the SAME person enquired about (already masked for LEGACY
+  // by the caller). Passed so the voice agent knows this is a multi-project
+  // lead and can talk about it.
+  const enquiredProjects = (opts.other_projects || []).filter(Boolean);
   const payload: Record<string, any> = {
     _zoho_lead_id: opts.zoho_lead_id,
     phone_number: opts.phone,
@@ -233,10 +239,13 @@ async function fireAiCall(opts: {
     customer_name: opts.customer_name,
     external_schedule_id: externalScheduleId,
     external_customer_id: opts.zoho_lead_id,
+    ...(enquiredProjects.length ? { enquired_projects: enquiredProjects } : {}),
     retell_llm_dynamic_variables: {
       customer_name: opts.customer_name,
       customer_phone: opts.phone,
       project_name: opts.project || "",
+      other_projects: enquiredProjects.join(", "),
+      multi_project: enquiredProjects.length ? "true" : "false",
       is_resubmission: opts.is_resubmission ? "true" : "false",
       last_page_visited: opts.last_page_visited || "",
       budget: opts.budget || "",
@@ -293,6 +302,38 @@ export async function handleLeadCreated(input: OnLeadCreatedInput): Promise<{
 }> {
   // 1. Stage/Status → New Lead / NA
   const state = await onLeadCreated(input.zoho_lead_id, input.lead);
+
+  // ── Per-person de-dup (first-claimer): a phone with N project records must
+  //    get only ONE call track. If another record for this phone is already
+  //    running an outreach track, THIS new project record is a silent sibling —
+  //    skip the T=0 greeting + call. The active record keeps calling; the cron
+  //    surfaces this project to the caller as context. Also gather the sibling
+  //    projects so — if this DOES fire — the voice agent has the context.
+  let siblingProjects: string[] = [];
+  try {
+    const { fetchLeadRecordsByPhone, isOutreachEligible, hasStartedOutreach, otherProjectsForContext } =
+      await import("./primary_lead");
+    const records = await fetchLeadRecordsByPhone(input.phone);
+    siblingProjects = otherProjectsForContext(records, input.project);
+    const siblingActive = records.some((r) =>
+      String(r.id) !== String(input.zoho_lead_id) &&
+      isOutreachEligible(r) &&
+      hasStartedOutreach(r),
+    );
+    if (siblingActive) {
+      console.log(
+        `[PRD Orch] T=0 SUPPRESSED — multi-project sibling already active for ` +
+        `${input.phone} (lead ${input.zoho_lead_id}); staying silent, primary keeps calling.`,
+      );
+      return {
+        state,
+        chatbot: { ok: false, error: "suppressed: multi-project sibling active" },
+        ai_call: { ok: false, error: "suppressed: multi-project sibling active" },
+      };
+    }
+  } catch (err: any) {
+    console.warn(`[PRD Orch] sibling-check failed (proceeding as primary): ${err.message}`);
+  }
 
   // ── Temporary ops toggles (bot_settings, editable without a deploy) ──
   //   whatsapp_born_paused=true → skip the T=0 WhatsApp greeting entirely
@@ -364,6 +405,7 @@ export async function handleLeadCreated(input: OnLeadCreatedInput): Promise<{
       phone: input.phone,
       customer_name: input.customer_name,
       project: input.project,
+      other_projects: siblingProjects,
       is_resubmission: input.is_resubmission,
       last_page_visited: input.last_page_visited,
       budget: input.budget,

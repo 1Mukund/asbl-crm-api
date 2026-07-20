@@ -184,6 +184,7 @@ async function runPrdCadenceProcessor(): Promise<{
   no_reply_transitions: number;
   exhaustion_closes: number;
   stalled_calls_rescheduled: number;
+  siblings_silenced: number;
   errors: any[];
 }> {
   const start = Date.now();
@@ -196,6 +197,7 @@ async function runPrdCadenceProcessor(): Promise<{
   let stalledRescheduled = 0;
   let firstCallsFiredThisTick = 0;
   let firstCallsDeferredThisTick = 0;
+  let siblingsSilenced = 0;
 
   try {
     const { getAccessToken, updateLead } = await import("../_utils/zoho");
@@ -258,7 +260,7 @@ async function runPrdCadenceProcessor(): Promise<{
       if (!data?.info?.more_records) break;
     }
     if (!leads.length) {
-      return { ms: Date.now() - start, scanned: 0, chatbot_ticks: 0, ss_call_ticks: 0, first_calls_fired: 0, first_calls_deferred_to_next_tick: 0, no_reply_transitions: 0, exhaustion_closes: 0, stalled_calls_rescheduled: 0, errors: [] };
+      return { ms: Date.now() - start, scanned: 0, chatbot_ticks: 0, ss_call_ticks: 0, first_calls_fired: 0, first_calls_deferred_to_next_tick: 0, no_reply_transitions: 0, exhaustion_closes: 0, stalled_calls_rescheduled: 0, siblings_silenced: 0, errors: [] };
     }
 
     // Per-phone bot kill-switch lookup. The inbound webhook respects
@@ -333,6 +335,25 @@ async function runPrdCadenceProcessor(): Promise<{
       });
     }
 
+    // ── Per-person de-dup: ONE primary-caller record per phone ───────────────
+    // A phone with N project records must get only ONE call track + ONE
+    // proactive follow-up track. Group the fetched leads by phone and pick a
+    // single stable primary; every non-primary sibling is silenced in the loop
+    // below (Next_Call_At cleared, no call, no follow-up). The primary's call
+    // still carries the sibling projects as context for the voice agent.
+    const { leadPhoneKey, pickPrimaryLeadId, otherProjectsForContext } =
+      await import("../_utils/primary_lead");
+    const recordsByPhone = new Map<string, any[]>();
+    for (const l of leads) {
+      const k = leadPhoneKey(l);
+      if (!k) continue;
+      let arr = recordsByPhone.get(k);
+      if (!arr) { arr = []; recordsByPhone.set(k, arr); }
+      arr.push(l);
+    }
+    const primaryByPhone = new Map<string, string | null>();
+    recordsByPhone.forEach((arr, k) => primaryByPhone.set(k, pickPrimaryLeadId(arr)));
+
     for (const lead of leads) {
       if (!lead.PRD_Stage) continue;            // not on PRD flow yet
       if (lead.PRD_Stage === "Not Interested") continue;
@@ -374,6 +395,31 @@ async function runPrdCadenceProcessor(): Promise<{
         const phone = String(lead.Phone || lead.Mobile || "").replace(/\D/g, "");
         if (!phone) continue;
         const fullName = [lead.First_Name, lead.Last_Name].filter(Boolean).join(" ").trim() || "Sir";
+
+        // Per-person de-dup: only the primary record for this phone does
+        // proactive outreach. A non-primary sibling (same person, other
+        // project) is silenced — no follow-up, no call — and any stale
+        // Next_Call_At it carries is cleared so the cron never fires it.
+        const phoneKey = leadPhoneKey(lead);
+        const primaryId = phoneKey ? primaryByPhone.get(phoneKey) : null;
+        const isPrimaryCaller = !primaryId || String(primaryId) === String(lead.id);
+        if (!isPrimaryCaller) {
+          if (lead.Next_Call_At) {
+            try {
+              await updateLead(lead.id, { Next_Call_At: null });
+              await mirrorLeadStateToMongo(lead.id, { Next_Call_At: null });
+            } catch (err: any) {
+              console.error(`[PRD cron] sibling Next_Call_At clear failed for ${lead.id}: ${err.message}`);
+            }
+          }
+          siblingsSilenced++;
+          continue;
+        }
+        // Other projects the same person enquired about — passed to the voice
+        // agent when this primary fires a call (masked for LEGACY upstream).
+        const otherProjects = phoneKey
+          ? otherProjectsForContext(recordsByPhone.get(phoneKey) || [], lead.ASBL_Project)
+          : [];
 
         const lastActionTime = lead.PRD_Last_Action_Time
           ? new Date(lead.PRD_Last_Action_Time).getTime()
@@ -587,6 +633,7 @@ async function runPrdCadenceProcessor(): Promise<{
                   phone,
                   customer_name: fullName,
                   project: lead.ASBL_Project,
+                  other_projects: otherProjects,
                 });
                 ssCallTicks++;
                 // Only consume batch capacity when the call actually dispatched.
@@ -632,6 +679,7 @@ async function runPrdCadenceProcessor(): Promise<{
     no_reply_transitions: noReplyTransitions,
     exhaustion_closes: exhaustionCloses,
     stalled_calls_rescheduled: stalledRescheduled,
+    siblings_silenced: siblingsSilenced,
     errors: errors.slice(0, 10),
   };
 }
@@ -766,6 +814,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     } catch (err: any) {
       console.error("[Mark Unique Leads Cron] Fatal:", err.message);
       await logCronRun("mark-unique-leads", 0, {}, err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ── Per-person call de-dup backfill (one-shot / occasional) ───────────────
+  // Across ALL leads: for every phone with >1 record, clear Next_Call_At on
+  // the non-primary siblings so only the ONE primary keeps its call cadence.
+  // Cleans up existing multi-project leads that each had their own call track.
+  // The prd-cadence tick enforces this going forward; this task backfills the
+  // existing corpus in one pass. Idempotent.
+  if (req.query.task === "dedup-call-primaries") {
+    try {
+      const { dedupCallPrimariesSweep } = await import("../_utils/primary_lead");
+      const result = await dedupCallPrimariesSweep();
+      await logCronRun("dedup-call-primaries", result.ms, result, result.errors ? `${result.errors} errors` : null);
+      return res.status(200).json({ task: "dedup-call-primaries", ...result });
+    } catch (err: any) {
+      console.error("[Dedup Call Primaries] Fatal:", err.message);
+      await logCronRun("dedup-call-primaries", 0, {}, err.message);
       return res.status(500).json({ error: err.message });
     }
   }
