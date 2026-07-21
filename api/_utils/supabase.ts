@@ -293,6 +293,9 @@ export async function upsertLead(
     zoho_synced: zohoSynced,
     zoho_synced_at: zohoSynced ? now : null,
     lead_received_at: lead.lead_received_at,
+    // Original born date at source (caller-supplied); falls back to the
+    // CRM-entry date so the in-house CRM always has a value.
+    born_date: lead.born_date ?? lead.lead_received_at.slice(0, 10),
     updated_at: now,
   };
 
