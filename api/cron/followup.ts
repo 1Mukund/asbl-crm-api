@@ -355,20 +355,21 @@ async function runPrdCadenceProcessor(): Promise<{
     const primaryByPhone = new Map<string, string | null>();
     recordsByPhone.forEach((arr, k) => primaryByPhone.set(k, pickPrimaryLeadId(arr)));
 
-    // Lead_Status is the SOURCE OF TRUTH for a lead's stage. Keep PRD_Stage in
-    // lockstep with it and let it decide whether the cadence runs — so a lead
-    // that reached a milestone (Pre Site / Virtual Tour) or was closed (Not
-    // Interested), whether via a call outcome OR a sales edit in Zoho, stops
-    // getting cadenced even if PRD_Stage lagged.
-    const { mapLeadStatusToStage, isTerminalLeadStatus, isSiteVisitMilestone } =
+    // PRD_Stage is the ONE field every call / follow-up decision gates on.
+    // We keep it accurate from BOTH sides: the posthook writes it on every call
+    // outcome (handleCallPosthook → transitionStage), and here we reconcile it
+    // from Lead_Status (mapped onto PRD_Stage's clean vocabulary, STICKILY — a
+    // reached milestone never downgrades). After that, the cadence gates on
+    // PRD_Stage ONLY — so there's one source of truth and no extra-call /
+    // extra-follow-up leakage.
+    const { mapLeadStatusToStage, isSiteVisitMilestone } =
       await import("../_utils/prd_state_machine");
 
     for (const lead of leads) {
-      // Mirror Lead_Status → PRD_Stage's clean vocabulary (mapped, not verbatim),
-      // but STICKILY: never downgrade OUT of a reached milestone (Pre Site Visit
-      // / Not Interested). Once a lead books a site visit, a later "busy"/"not
-      // connected" call that regresses Lead_Status must NOT drag PRD_Stage back
-      // and resume the cadence.
+      // Reconcile PRD_Stage ← mapped(Lead_Status), but never downgrade OUT of a
+      // reached milestone (Pre Site Visit / Not Interested): once a lead books a
+      // site visit, a later "busy"/"not connected" call that regresses
+      // Lead_Status must NOT drag PRD_Stage back and resume the cadence.
       const mapped = mapLeadStatusToStage(lead.Lead_Status);
       if (mapped && lead.PRD_Stage !== mapped) {
         const isDowngrade =
@@ -384,13 +385,12 @@ async function runPrdCadenceProcessor(): Promise<{
           lead.PRD_Stage = mapped;
         }
       }
-      // Terminal / milestone → stop the cadence. Gate on the STICKY PRD_Stage
-      // (never downgrades) AND the raw Lead_Status, so a booked/closed lead is
-      // never cadenced regardless of which field carries the signal.
-      if (isTerminalLeadStatus(lead.PRD_Stage) || isTerminalLeadStatus(lead.Lead_Status)) continue;
 
-      if (!lead.PRD_Stage) continue;            // not on any flow yet
-      if (lead.PRD_Stage === "Spam") continue;  // sales-marked spam — never follow up
+      // ── Cadence gates — PRD_Stage ONLY ──────────────────────────────────
+      if (!lead.PRD_Stage) continue;                       // not on the flow yet
+      if (lead.PRD_Stage === "Not Interested") continue;   // closed
+      if (lead.PRD_Stage === "Spam") continue;             // sales-marked spam
+      if (lead.PRD_Stage === "Pre Site Visit") continue;   // milestone — reminder cron owns it
 
       // Bot kill-switch — skip phones where sales has disabled the bot.
       const leadPhoneNorm = String(lead.Phone || lead.Mobile || "").replace(/\D/g, "");
