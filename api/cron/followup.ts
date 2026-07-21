@@ -360,28 +360,27 @@ async function runPrdCadenceProcessor(): Promise<{
     // that reached a milestone (Pre Site / Virtual Tour) or was closed (Not
     // Interested), whether via a call outcome OR a sales edit in Zoho, stops
     // getting cadenced even if PRD_Stage lagged.
-    const { mapLeadStatusToStage, isTerminalLeadStatus } = await import("../_utils/prd_state_machine");
+    const { isTerminalLeadStatus } = await import("../_utils/prd_state_machine");
 
     for (const lead of leads) {
-      // Heal drift: force PRD_Stage to match the Lead_Status truth.
-      const truthStage = mapLeadStatusToStage(lead.Lead_Status);
-      if (truthStage && lead.PRD_Stage !== truthStage) {
+      // Keep PRD_Stage a VERBATIM mirror of Lead_Status (the source of truth) —
+      // same string, no mapping, so the two never drift.
+      const ls = String(lead.Lead_Status || "").trim();
+      if (ls && lead.PRD_Stage !== ls) {
         try {
-          await updateLead(lead.id, { PRD_Stage: truthStage });
-          await mirrorLeadStateToMongo(lead.id, { PRD_Stage: truthStage });
+          await updateLead(lead.id, { PRD_Stage: ls });
+          await mirrorLeadStateToMongo(lead.id, { PRD_Stage: ls });
         } catch (err: any) {
           console.error(`[PRD cron] PRD_Stage reconcile failed for ${lead.id}: ${err.message}`);
         }
-        lead.PRD_Stage = truthStage;
+        lead.PRD_Stage = ls;
       }
-      // Terminal / milestone Lead_Status → stop the cadence (the fix for booked
-      // or closed leads that were still being contacted).
-      if (isTerminalLeadStatus(lead.Lead_Status)) continue;
+      // Terminal / milestone status → stop the cadence (fix for booked / closed
+      // leads still being contacted). Works on either field now (they match).
+      if (isTerminalLeadStatus(ls) || isTerminalLeadStatus(lead.PRD_Stage)) continue;
 
-      if (!lead.PRD_Stage) continue;            // not on PRD flow yet
-      if (lead.PRD_Stage === "Not Interested") continue;
-      if (lead.PRD_Stage === "Spam") continue;             // sales-marked spam — never follow up
-      if (lead.PRD_Stage === "Pre Site Visit") continue;  // reminder cron is separate concern
+      if (!lead.PRD_Stage) continue;            // not on any flow yet
+      if (lead.PRD_Stage === "Spam") continue;  // sales-marked spam — never follow up
 
       // Bot kill-switch — skip phones where sales has disabled the bot.
       const leadPhoneNorm = String(lead.Phone || lead.Mobile || "").replace(/\D/g, "");
@@ -924,11 +923,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // prd-cadence tick keeps them in lockstep going forward. Idempotent.
   if (req.query.task === "reconcile-stage-from-status") {
     const start = Date.now();
-    const result: any = { ms: 0, scanned: 0, reconciled: 0, already_ok: 0, unmapped: 0, errors: 0 };
+    const result: any = { ms: 0, scanned: 0, reconciled: 0, already_ok: 0, no_status: 0, errors: 0 };
     try {
       const { getAccessToken, updateLead } = await import("../_utils/zoho");
       const { mirrorLeadStateToMongo } = await import("../_utils/supabase");
-      const { mapLeadStatusToStage } = await import("../_utils/prd_state_machine");
       const token = await getAccessToken();
       const ZBASE = "https://www.zohoapis.in/crm/v3";
       const all: any[] = [];
@@ -947,8 +945,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
       result.scanned = all.length;
       for (const lead of all) {
-        const target = mapLeadStatusToStage(lead.Lead_Status);
-        if (!target) { result.unmapped++; continue; }
+        // VERBATIM: PRD_Stage := Lead_Status (same string). Requires the
+        // PRD_Stage picklist to carry the Lead_Status values (run
+        // ?action=zoho-sync-prd-stage-picklist first).
+        const target = String(lead.Lead_Status || "").trim();
+        if (!target) { result.no_status++; continue; }
         if (lead.PRD_Stage === target) { result.already_ok++; continue; }
         try {
           await updateLead(lead.id, { PRD_Stage: target });

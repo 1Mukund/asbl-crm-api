@@ -68,34 +68,29 @@ const DEFAULT_STATUS_PER_STAGE: Partial<Record<Stage, Status>> = {
   // Not Interested: no Status
 };
 
-// ─── Lead_Status is the SOURCE OF TRUTH; PRD_Stage mirrors it ──────────────
+// ─── Lead_Status is the SOURCE OF TRUTH; PRD_Stage is a VERBATIM mirror ─────
 // Zoho's Lead_Status (sales-facing, also sales-editable) is authoritative for
-// where a lead actually is. PRD_Stage must stay in lockstep with it, and the
-// cadence must obey it. These two helpers translate the Lead_Status vocabulary
-// (Fresh / Contacted / Lead Initiated / Pre Site / Virtual Tour / Not
-// Interested / …) into our automation's decisions.
+// where a lead actually is. PRD_Stage is kept EQUAL to it (same string, once
+// the PRD_Stage picklist carries the Lead_Status values), so any logic keyed
+// on either field sees the same value — no drift, no leakage. The cadence obeys
+// these helpers, which work on either field since they now hold the same value.
 
-/** Map a Zoho Lead_Status → the equivalent PRD_Stage so the two stay equal.
- *  Returns null for unknown/empty values (leave PRD_Stage untouched). */
-export function mapLeadStatusToStage(leadStatus: string | null | undefined): string | null {
-  const ls = String(leadStatus || "").trim().toLowerCase();
-  if (!ls) return null;
-  if (ls === "fresh" || ls === "new" || ls === "new lead") return "New Lead";
-  if (ls === "contacted" || ls === "lead initiated" || ls === "attempted" || ls === "attempting") return "Lead Initiated";
-  if (/pre.?site|site visit|virtual tour/.test(ls)) return "Pre Site Visit";
-  if (/not interested|lost|dead/.test(ls)) return "Not Interested";
-  if (/spam|junk/.test(ls)) return "Spam";
-  return null; // e.g. Won / Booked / Customer — no PRD equivalent, cadence still
-               // stops via isTerminalLeadStatus below.
+/** A value that means a site-visit milestone was reached — in either vocabulary
+ *  (legacy PRD "Pre Site Visit" or Lead_Status "Pre Site" / "Virtual Tour").
+ *  Used to protect the milestone from an automated downgrade. */
+export function isSiteVisitMilestone(value: string | null | undefined): boolean {
+  const v = String(value || "").trim().toLowerCase();
+  if (!v) return false;
+  return /pre.?site|site visit|virtual tour/.test(v);
 }
 
-/** A Lead_Status that means "stop the cadence" — a milestone was reached (site
- *  visit booked) or the lead is closed (not interested / won / junk). Broader
- *  than the map so unmapped terminal statuses still halt outreach. */
-export function isTerminalLeadStatus(leadStatus: string | null | undefined): boolean {
-  const ls = String(leadStatus || "").trim().toLowerCase();
-  if (!ls) return false;
-  return /not interested|pre.?site|site visit|virtual tour|won|booked|junk|spam|lost|closed|customer|dead/.test(ls);
+/** A value that means "stop the cadence" — a site-visit milestone was reached
+ *  or the lead is closed (not interested / won / junk). Works on Lead_Status
+ *  OR PRD_Stage since they now mirror each other. */
+export function isTerminalLeadStatus(value: string | null | undefined): boolean {
+  const v = String(value || "").trim().toLowerCase();
+  if (!v) return false;
+  return /not interested|pre.?site|site visit|virtual tour|won|booked|junk|spam|lost|closed|customer|dead/.test(v);
 }
 
 // ─── Input to every transition ───────────────────────────────────────────
@@ -141,22 +136,25 @@ export async function transitionStage(input: TransitionInput): Promise<Transitio
   // interested" on a follow-up call doesn't erase a scheduled site visit.
   // (Sales can still change it manually in Zoho; this only guards our
   // automated transitions, which always pass existingLead.)
-  const currentStage = input.existingLead?.PRD_Stage as Stage | undefined;
-  if (currentStage === "Pre Site Visit" && targetStage !== "Pre Site Visit") {
+  const currentStage = input.existingLead?.PRD_Stage as string | undefined;
+  if (isSiteVisitMilestone(currentStage) && !isSiteVisitMilestone(targetStage)) {
     console.log(
       `[PRD State] Lead ${input.leadId}: stage move "${currentStage}" → "${targetStage}" ` +
-      `BLOCKED (milestone preserved; reason=${effectiveReason}). Recording audit only.`,
+      `BLOCKED (site-visit milestone preserved; reason=${effectiveReason}). Recording audit only.`,
     );
-    targetStage = "Pre Site Visit";
-    if (!targetStatus || !VALID_STATUS_PER_STAGE["Pre Site Visit"].has(targetStatus)) {
-      targetStatus = DEFAULT_STATUS_PER_STAGE["Pre Site Visit"] ?? "NA";
+    targetStage = currentStage as Stage;   // keep whatever milestone value it holds
+    if (!targetStatus || !VALID_STATUS_PER_STAGE[targetStage]?.has(targetStatus)) {
+      targetStatus = DEFAULT_STATUS_PER_STAGE[targetStage] ?? "NA";
     }
   }
 
   // ── Status validity (skip for Not Interested — terminal) ─────────────
+  // validSet is undefined for a Lead_Status-vocabulary stage (Fresh / Pre Site
+  // / Virtual Tour…) that PRD_Stage now also carries — guard against it so an
+  // unknown stage doesn't throw.
   if (targetStage !== "Not Interested") {
     const validSet = VALID_STATUS_PER_STAGE[targetStage];
-    if (targetStatus && !validSet.has(targetStatus)) {
+    if (validSet && targetStatus && !validSet.has(targetStatus)) {
       console.warn(
         `[PRD State] Invalid Status "${targetStatus}" for Stage "${targetStage}". ` +
         `Falling back to default "${DEFAULT_STATUS_PER_STAGE[targetStage]}".`,

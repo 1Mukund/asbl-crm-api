@@ -6198,6 +6198,64 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── zoho-sync-prd-stage-picklist — copy every Lead_Status picklist value
+  //     into the PRD_Stage picklist so PRD_Stage can hold the Lead_Status value
+  //     VERBATIM (the two become the same field, no mapping). Idempotent — run
+  //     once before the reconcile-stage-from-status backfill.
+  //   GET ?action=zoho-sync-prd-stage-picklist&secret=$INHOUSE_POSTHOOK_SECRET
+  if (req.method === "GET" && req.query.action === "zoho-sync-prd-stage-picklist") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=" });
+    }
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+      const fr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
+        headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      });
+      if (!fr.ok) return res.status(fr.status).json({ error: "field-list failed", body: (await fr.text()).slice(0, 400) });
+      const fj = (await fr.json()) as any;
+      const fields = fj?.fields || [];
+      const leadStatusField = fields.find((f: any) => f.api_name === "Lead_Status");
+      const prdStageField = fields.find((f: any) => f.api_name === "PRD_Stage");
+      if (!leadStatusField) return res.status(404).json({ error: "Lead_Status field not found" });
+      if (!prdStageField) return res.status(404).json({ error: "PRD_Stage field not found" });
+
+      const lsValues: string[] = (leadStatusField.pick_list_values || [])
+        .map((v: any) => String(v.actual_value ?? v.display_value ?? "").trim())
+        .filter(Boolean);
+      const prdExisting: any[] = prdStageField.pick_list_values || [];
+      const prdValuesSet = new Set(prdExisting.map((v) => String(v.actual_value ?? v.display_value ?? "").trim()));
+
+      const toAdd = lsValues.filter((v) => !prdValuesSet.has(v));
+      if (!toAdd.length) {
+        return res.status(200).json({ ok: true, status: "already_synced", lead_status_values: lsValues, prd_stage_values: Array.from(prdValuesSet) });
+      }
+      // Preserve existing PRD_Stage option objects verbatim (id / sequence /
+      // colour) so Zoho matches them by id; append the missing Lead_Status ones.
+      const pick_list_values = prdExisting
+        .map((v) => ({ ...v }))
+        .concat(toAdd.map((v) => ({ display_value: v, actual_value: v })));
+      const pr = await fetch(`${ZOHO_API_BASE}/settings/fields/${prdStageField.id}?module=Leads`, {
+        method: "PATCH",
+        headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ fields: [{ id: prdStageField.id, pick_list_values }] }),
+      });
+      const pj = await pr.json().catch(() => ({}));
+      const ok = pr.status >= 200 && pr.status < 300;
+      return res.status(ok ? 200 : pr.status).json({
+        ok, status: ok ? "added" : "failed", added: toAdd,
+        prd_stage_values_now: pick_list_values.map((v: any) => v.actual_value ?? v.display_value),
+        http_status: pr.status, response: ok ? undefined : pj,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── zoho-create-reactivation-field — create the Reactivation_Is_Latest
   //     checkbox on Leads (drives the purple row for the latest-project lead).
   //     Idempotent. Run once before the reactivation push.
