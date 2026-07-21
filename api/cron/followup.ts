@@ -233,6 +233,7 @@ async function runPrdCadenceProcessor(): Promise<{
      // well over current volume).
     const FIELDS =
       `id,First_Name,Last_Name,Mobile,Phone,ASBL_Project,Created_Time,` +
+      `Lead_Status,` +               // SOURCE OF TRUTH for stage — cadence gates on this
       `PRD_Stage,PRD_Status,PRD_Last_Action_Time,PRD_Last_Action,` +
       `Chatbot_Attempt_Count,Chatbot_Follow_up_Count,` +
       `Total_Call_Duration_Secs,` +  // needed for 7-day silence check
@@ -354,7 +355,29 @@ async function runPrdCadenceProcessor(): Promise<{
     const primaryByPhone = new Map<string, string | null>();
     recordsByPhone.forEach((arr, k) => primaryByPhone.set(k, pickPrimaryLeadId(arr)));
 
+    // Lead_Status is the SOURCE OF TRUTH for a lead's stage. Keep PRD_Stage in
+    // lockstep with it and let it decide whether the cadence runs — so a lead
+    // that reached a milestone (Pre Site / Virtual Tour) or was closed (Not
+    // Interested), whether via a call outcome OR a sales edit in Zoho, stops
+    // getting cadenced even if PRD_Stage lagged.
+    const { mapLeadStatusToStage, isTerminalLeadStatus } = await import("../_utils/prd_state_machine");
+
     for (const lead of leads) {
+      // Heal drift: force PRD_Stage to match the Lead_Status truth.
+      const truthStage = mapLeadStatusToStage(lead.Lead_Status);
+      if (truthStage && lead.PRD_Stage !== truthStage) {
+        try {
+          await updateLead(lead.id, { PRD_Stage: truthStage });
+          await mirrorLeadStateToMongo(lead.id, { PRD_Stage: truthStage });
+        } catch (err: any) {
+          console.error(`[PRD cron] PRD_Stage reconcile failed for ${lead.id}: ${err.message}`);
+        }
+        lead.PRD_Stage = truthStage;
+      }
+      // Terminal / milestone Lead_Status → stop the cadence (the fix for booked
+      // or closed leads that were still being contacted).
+      if (isTerminalLeadStatus(lead.Lead_Status)) continue;
+
       if (!lead.PRD_Stage) continue;            // not on PRD flow yet
       if (lead.PRD_Stage === "Not Interested") continue;
       if (lead.PRD_Stage === "Spam") continue;             // sales-marked spam — never follow up
@@ -888,6 +911,60 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       result.ms = Date.now() - start;
       console.error("[Backfill Pre-Site Stage] Fatal:", err.message);
       await logCronRun("backfill-presite-stage", result.ms, result, err.message);
+      return res.status(500).json({ error: err.message, ...result });
+    }
+  }
+
+  // ── Reconcile PRD_Stage from Lead_Status (one-shot) ──────────────────────
+  // Lead_Status is the source of truth for the lead's stage; PRD_Stage must
+  // mirror it. Historically they drifted (fire-and-forget writes + sales manual
+  // Lead_Status edits that never touched PRD_Stage) — leaving milestone/closed
+  // leads with a stale PRD_Stage that kept them in the cadence. This sweep
+  // aligns PRD_Stage to Lead_Status across the whole corpus in one pass; the
+  // prd-cadence tick keeps them in lockstep going forward. Idempotent.
+  if (req.query.task === "reconcile-stage-from-status") {
+    const start = Date.now();
+    const result: any = { ms: 0, scanned: 0, reconciled: 0, already_ok: 0, unmapped: 0, errors: 0 };
+    try {
+      const { getAccessToken, updateLead } = await import("../_utils/zoho");
+      const { mirrorLeadStateToMongo } = await import("../_utils/supabase");
+      const { mapLeadStatusToStage } = await import("../_utils/prd_state_machine");
+      const token = await getAccessToken();
+      const ZBASE = "https://www.zohoapis.in/crm/v3";
+      const all: any[] = [];
+      for (let page = 1; page <= 30; page++) {
+        const r = await fetch(
+          `${ZBASE}/Leads?fields=id,Lead_Status,PRD_Stage&per_page=200&page=${page}&sort_by=Modified_Time&sort_order=desc`,
+          { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
+        );
+        if (r.status === 204) break;
+        if (!r.ok) throw new Error(`Zoho list ${r.status}: ${(await r.text()).slice(0, 200)}`);
+        const j = (await r.json()) as any;
+        const rows = (j?.data || []) as any[];
+        if (!rows.length) break;
+        all.push(...rows);
+        if (!j?.info?.more_records) break;
+      }
+      result.scanned = all.length;
+      for (const lead of all) {
+        const target = mapLeadStatusToStage(lead.Lead_Status);
+        if (!target) { result.unmapped++; continue; }
+        if (lead.PRD_Stage === target) { result.already_ok++; continue; }
+        try {
+          await updateLead(lead.id, { PRD_Stage: target });
+          await mirrorLeadStateToMongo(lead.id, { PRD_Stage: target });
+          result.reconciled++;
+        } catch {
+          result.errors++;
+        }
+      }
+      result.ms = Date.now() - start;
+      await logCronRun("reconcile-stage-from-status", result.ms, result, result.errors ? `${result.errors} errors` : null);
+      return res.status(200).json({ task: "reconcile-stage-from-status", ...result });
+    } catch (err: any) {
+      result.ms = Date.now() - start;
+      console.error("[Reconcile Stage] Fatal:", err.message);
+      await logCronRun("reconcile-stage-from-status", result.ms, result, err.message);
       return res.status(500).json({ error: err.message, ...result });
     }
   }
