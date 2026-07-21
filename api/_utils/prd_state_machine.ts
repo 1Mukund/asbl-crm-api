@@ -68,20 +68,37 @@ const DEFAULT_STATUS_PER_STAGE: Partial<Record<Stage, Status>> = {
   // Not Interested: no Status
 };
 
-// ─── Lead_Status is the SOURCE OF TRUTH; PRD_Stage is a VERBATIM mirror ─────
-// Zoho's Lead_Status (sales-facing, also sales-editable) is authoritative for
-// where a lead actually is. PRD_Stage is kept EQUAL to it (same string, once
-// the PRD_Stage picklist carries the Lead_Status values), so any logic keyed
-// on either field sees the same value — no drift, no leakage. The cadence obeys
-// these helpers, which work on either field since they now hold the same value.
+// ─── Lead_Status drives the stage; PRD_Stage MIRRORS it (mapped, sticky) ────
+// Zoho's Lead_Status (sales-facing, also sales-editable, and set by the voice
+// bot's blueprint) is authoritative for where a lead is. Its data vocabulary is
+// messy (Fresh / First Touch / Pre Site / Virtual Tour / Post Site Visit / …
+// and inconsistent with its own picklist), so instead of copying it verbatim we
+// MAP it onto PRD_Stage's clean 4-value vocabulary. The cadence gates on the
+// result, and the mapping is applied STICKILY — a lead never downgrades out of
+// a reached milestone (see the milestone guard), so a later "busy" call can't
+// resume the cadence after a site visit was booked.
+
+/** Map a messy Lead_Status value → PRD_Stage's clean vocabulary. Returns null
+ *  for unknown / empty values (leave PRD_Stage untouched). Terminal buckets are
+ *  checked first so e.g. "Post Site Visit" resolves to the milestone. */
+export function mapLeadStatusToStage(leadStatus: string | null | undefined): string | null {
+  const ls = String(leadStatus || "").trim().toLowerCase();
+  if (!ls) return null;
+  if (/pre.?site|post.?site|site visit|virtual tour/.test(ls)) return "Pre Site Visit";
+  if (/not interested|not qualif|disqualif|lost|junk|dead/.test(ls)) return "Not Interested";
+  if (/spam/.test(ls)) return "Spam";
+  if (/contacted|lead initiated|attempt|pre.?qualif|contact in future|in future/.test(ls)) return "Lead Initiated";
+  if (/fresh|first touch|^new|not contacted|uncontacted/.test(ls)) return "New Lead";
+  return null;
+}
 
 /** A value that means a site-visit milestone was reached — in either vocabulary
- *  (legacy PRD "Pre Site Visit" or Lead_Status "Pre Site" / "Virtual Tour").
- *  Used to protect the milestone from an automated downgrade. */
+ *  (PRD "Pre Site Visit" or Lead_Status "Pre Site" / "Virtual Tour" / "Post Site
+ *  Visit"). Used to protect the milestone from an automated downgrade. */
 export function isSiteVisitMilestone(value: string | null | undefined): boolean {
   const v = String(value || "").trim().toLowerCase();
   if (!v) return false;
-  return /pre.?site|site visit|virtual tour/.test(v);
+  return /pre.?site|post.?site|site visit|virtual tour/.test(v);
 }
 
 /** A value that means "stop the cadence" — a site-visit milestone was reached

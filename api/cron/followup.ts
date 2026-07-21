@@ -360,24 +360,34 @@ async function runPrdCadenceProcessor(): Promise<{
     // that reached a milestone (Pre Site / Virtual Tour) or was closed (Not
     // Interested), whether via a call outcome OR a sales edit in Zoho, stops
     // getting cadenced even if PRD_Stage lagged.
-    const { isTerminalLeadStatus } = await import("../_utils/prd_state_machine");
+    const { mapLeadStatusToStage, isTerminalLeadStatus, isSiteVisitMilestone } =
+      await import("../_utils/prd_state_machine");
 
     for (const lead of leads) {
-      // Keep PRD_Stage a VERBATIM mirror of Lead_Status (the source of truth) —
-      // same string, no mapping, so the two never drift.
-      const ls = String(lead.Lead_Status || "").trim();
-      if (ls && lead.PRD_Stage !== ls) {
-        try {
-          await updateLead(lead.id, { PRD_Stage: ls });
-          await mirrorLeadStateToMongo(lead.id, { PRD_Stage: ls });
-        } catch (err: any) {
-          console.error(`[PRD cron] PRD_Stage reconcile failed for ${lead.id}: ${err.message}`);
+      // Mirror Lead_Status → PRD_Stage's clean vocabulary (mapped, not verbatim),
+      // but STICKILY: never downgrade OUT of a reached milestone (Pre Site Visit
+      // / Not Interested). Once a lead books a site visit, a later "busy"/"not
+      // connected" call that regresses Lead_Status must NOT drag PRD_Stage back
+      // and resume the cadence.
+      const mapped = mapLeadStatusToStage(lead.Lead_Status);
+      if (mapped && lead.PRD_Stage !== mapped) {
+        const isDowngrade =
+          (isSiteVisitMilestone(lead.PRD_Stage) && !isSiteVisitMilestone(mapped)) ||
+          (lead.PRD_Stage === "Not Interested" && mapped !== "Not Interested");
+        if (!isDowngrade) {
+          try {
+            await updateLead(lead.id, { PRD_Stage: mapped });
+            await mirrorLeadStateToMongo(lead.id, { PRD_Stage: mapped });
+          } catch (err: any) {
+            console.error(`[PRD cron] PRD_Stage reconcile failed for ${lead.id}: ${err.message}`);
+          }
+          lead.PRD_Stage = mapped;
         }
-        lead.PRD_Stage = ls;
       }
-      // Terminal / milestone status → stop the cadence (fix for booked / closed
-      // leads still being contacted). Works on either field now (they match).
-      if (isTerminalLeadStatus(ls) || isTerminalLeadStatus(lead.PRD_Stage)) continue;
+      // Terminal / milestone → stop the cadence. Gate on the STICKY PRD_Stage
+      // (never downgrades) AND the raw Lead_Status, so a booked/closed lead is
+      // never cadenced regardless of which field carries the signal.
+      if (isTerminalLeadStatus(lead.PRD_Stage) || isTerminalLeadStatus(lead.Lead_Status)) continue;
 
       if (!lead.PRD_Stage) continue;            // not on any flow yet
       if (lead.PRD_Stage === "Spam") continue;  // sales-marked spam — never follow up
@@ -923,10 +933,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // prd-cadence tick keeps them in lockstep going forward. Idempotent.
   if (req.query.task === "reconcile-stage-from-status") {
     const start = Date.now();
-    const result: any = { ms: 0, scanned: 0, reconciled: 0, already_ok: 0, no_status: 0, errors: 0 };
+    const result: any = { ms: 0, scanned: 0, reconciled: 0, already_ok: 0, no_status: 0, kept_milestone: 0, errors: 0 };
     try {
       const { getAccessToken, updateLead } = await import("../_utils/zoho");
       const { mirrorLeadStateToMongo } = await import("../_utils/supabase");
+      const { mapLeadStatusToStage, isSiteVisitMilestone } = await import("../_utils/prd_state_machine");
       const token = await getAccessToken();
       const ZBASE = "https://www.zohoapis.in/crm/v3";
       const all: any[] = [];
@@ -945,12 +956,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
       result.scanned = all.length;
       for (const lead of all) {
-        // VERBATIM: PRD_Stage := Lead_Status (same string). Requires the
-        // PRD_Stage picklist to carry the Lead_Status values (run
-        // ?action=zoho-sync-prd-stage-picklist first).
-        const target = String(lead.Lead_Status || "").trim();
+        // MAPPED (not verbatim): Lead_Status → PRD_Stage's clean vocabulary.
+        const target = mapLeadStatusToStage(lead.Lead_Status);
         if (!target) { result.no_status++; continue; }
         if (lead.PRD_Stage === target) { result.already_ok++; continue; }
+        // STICKY: never downgrade out of a reached milestone.
+        const isDowngrade =
+          (isSiteVisitMilestone(lead.PRD_Stage) && !isSiteVisitMilestone(target)) ||
+          (lead.PRD_Stage === "Not Interested" && target !== "Not Interested");
+        if (isDowngrade) { result.kept_milestone++; continue; }
         try {
           await updateLead(lead.id, { PRD_Stage: target });
           await mirrorLeadStateToMongo(lead.id, { PRD_Stage: target });
