@@ -933,38 +933,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // prd-cadence tick keeps them in lockstep going forward. Idempotent.
   if (req.query.task === "reconcile-stage-from-status") {
     const start = Date.now();
-    const result: any = { ms: 0, scanned: 0, reconciled: 0, already_ok: 0, no_status: 0, kept_milestone: 0, errors: 0 };
+    // Write-cap per call so we finish well under Vercel's function timeout even
+    // when thousands of leads drift — the task is idempotent (already-aligned
+    // leads are skipped), so re-run until capped=false.
+    const maxWrites = Math.min(3000, Math.max(100, Number(req.query.maxWrites) || 1200));
+    const result: any = { ms: 0, scanned: 0, reconciled: 0, already_ok: 0, no_status: 0, kept_milestone: 0, errors: 0, capped: false };
     try {
       const { getAccessToken, updateLead } = await import("../_utils/zoho");
       const { mirrorLeadStateToMongo } = await import("../_utils/supabase");
       const { mapLeadStatusToStage, isSiteVisitMilestone } = await import("../_utils/prd_state_machine");
       const token = await getAccessToken();
       const ZBASE = "https://www.zohoapis.in/crm/v3";
-      const all: any[] = [];
-      for (let page = 1; page <= 30; page++) {
-        const r = await fetch(
-          `${ZBASE}/Leads?fields=id,Lead_Status,PRD_Stage&per_page=200&page=${page}&sort_by=Modified_Time&sort_order=desc`,
-          { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
-        );
-        if (r.status === 204) break;
-        if (!r.ok) throw new Error(`Zoho list ${r.status}: ${(await r.text()).slice(0, 200)}`);
-        const j = (await r.json()) as any;
-        const rows = (j?.data || []) as any[];
-        if (!rows.length) break;
-        all.push(...rows);
-        if (!j?.info?.more_records) break;
-      }
-      result.scanned = all.length;
-      for (const lead of all) {
-        // MAPPED (not verbatim): Lead_Status → PRD_Stage's clean vocabulary.
+      const authH = { Authorization: `Zoho-oauthtoken ${token}` };
+      // page_token pagination — Zoho's page= param caps at 2000 records; the
+      // corpus is larger, so we page via info.next_page_token instead.
+      let pageToken: string | null = null;
+      let guard = 0;
+      const reconcileOne = async (lead: any) => {
         const target = mapLeadStatusToStage(lead.Lead_Status);
-        if (!target) { result.no_status++; continue; }
-        if (lead.PRD_Stage === target) { result.already_ok++; continue; }
+        if (!target) { result.no_status++; return; }
+        if (lead.PRD_Stage === target) { result.already_ok++; return; }
         // STICKY: never downgrade out of a reached milestone.
         const isDowngrade =
           (isSiteVisitMilestone(lead.PRD_Stage) && !isSiteVisitMilestone(target)) ||
           (lead.PRD_Stage === "Not Interested" && target !== "Not Interested");
-        if (isDowngrade) { result.kept_milestone++; continue; }
+        if (isDowngrade) { result.kept_milestone++; return; }
         try {
           await updateLead(lead.id, { PRD_Stage: target });
           await mirrorLeadStateToMongo(lead.id, { PRD_Stage: target });
@@ -972,6 +965,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         } catch {
           result.errors++;
         }
+      };
+      while (guard < 120) {
+        guard++;
+        const url = `${ZBASE}/Leads?fields=id,Lead_Status,PRD_Stage&per_page=200` +
+          (pageToken ? `&page_token=${encodeURIComponent(pageToken)}` : "");
+        const r = await fetch(url, { headers: authH });
+        if (r.status === 204) break;
+        if (!r.ok) throw new Error(`Zoho list ${r.status}: ${(await r.text()).slice(0, 200)}`);
+        const j = (await r.json()) as any;
+        const rows = (j?.data || []) as any[];
+        result.scanned += rows.length;
+        for (const lead of rows) {
+          await reconcileOne(lead);
+          if (result.reconciled >= maxWrites) { result.capped = true; break; }
+        }
+        pageToken = j?.info?.next_page_token || null;
+        if (result.capped || !pageToken || j?.info?.more_records === false) break;
       }
       result.ms = Date.now() - start;
       await logCronRun("reconcile-stage-from-status", result.ms, result, result.errors ? `${result.errors} errors` : null);
