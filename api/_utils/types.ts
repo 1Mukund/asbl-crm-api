@@ -24,6 +24,10 @@ export interface NormalizedLead {
   utm_content?: string;
   utm_term?: string;
   lead_received_at: string; // ISO datetime
+  born_date?: string;       // caller-supplied ORIGINAL born date (YYYY-MM-DD) —
+                            // when the lead was born at source (may predate CRM
+                            // entry for bulk transfers / reactivations). Falls
+                            // back to lead_received_at's date when omitted.
 
   // Project Interest
   project?: string;

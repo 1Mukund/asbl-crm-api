@@ -99,6 +99,18 @@ function buildLead(body: any): NormalizedLead | null {
     is_bulk_transfer:         flag("IsBulkTransfer", "IsBulk_Transfer", "is_bulk_transfer", "isBulkTransfer"),
   };
 
+  // Caller-supplied ORIGINAL born date — when the lead was born at source
+  // (Inncircles). For bulk transfers / reactivations this predates the lead's
+  // arrival in our CRM. Normalise to Zoho's YYYY-MM-DD; ignore unparseable
+  // values so downstream falls back to the CRM-entry date. Expected format:
+  // YYYY-MM-DD (or full ISO).
+  const bornRaw = pick(body, "born_date", "bornDate", "born_at", "bornAt", "lead_born_date", "leadBornDate", "created_date", "createdDate", "origin_date");
+  let born_date: string | undefined;
+  if (bornRaw) {
+    const d = new Date(bornRaw);
+    if (!Number.isNaN(d.getTime())) born_date = d.toISOString().slice(0, 10);
+  }
+
   // Caller-supplied source wins, but reserved (code-owned) values are ignored
   // so a caller can't spoof e.g. "Manual Reactivation" — that is set ONLY by
   // the reactivation-allowlist branch in the handler.
@@ -116,6 +128,7 @@ function buildLead(body: any): NormalizedLead | null {
     // assign those). Falls back to DEFAULT_SOURCE when omitted or reserved.
     lead_source: leadSource,
     source_lead_id: pick(body, "lead_id", "leadId", "id", "m1_lead_id", "inncircles_id", "submission_id"),
+    born_date,
     campaign_name: pick(body, "campaign", "campaign_name", "utm_campaign"),
     utm_source: pick(body, "utm_source") || "inncircles",
     utm_medium: pick(body, "utm_medium"),
