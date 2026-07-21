@@ -15,6 +15,7 @@
  */
 import { normPhoneKey } from "./unique_leads";
 import { displayProject } from "./project_detection";
+import { isTerminalLeadStatus } from "./prd_state_machine";
 
 /** Phone key for a lead record (Phone falls back to Mobile), normalised so
  *  cross-format dupes collapse. Empty string when there's no usable phone. */
@@ -25,6 +26,10 @@ export function leadPhoneKey(lead: any): string {
 /** Still an active outreach candidate? Mirrors the cron's own skip gates so a
  *  closed / converted / spam record is never chosen as the primary caller. */
 export function isOutreachEligible(lead: any): boolean {
+  // Lead_Status is the source of truth — a terminal / milestone status (site
+  // visit booked, not interested, won, …) means no more outreach, even if
+  // PRD_Stage lagged behind it.
+  if (isTerminalLeadStatus(lead?.Lead_Status)) return false;
   const stage = String(lead?.PRD_Stage || "");
   if (!stage) return false;
   if (stage === "Not Interested" || stage === "Spam" || stage === "Pre Site Visit") return false;
@@ -107,6 +112,7 @@ export async function fetchLeadRecordsByPhone(phone: string): Promise<any[]> {
         id: d.zoho_lead_id || d._id,
         Mobile: d.mobile,
         ASBL_Project: d.project || d.asbl_project || "",
+        Lead_Status: d.lead_status ?? null,
         PRD_Stage: d.prd_stage ?? null,
         Next_Call_At: d.next_call_at ?? null,
         Last_Inhouse_Call_ID: d.last_inhouse_call_id ?? null,
@@ -131,7 +137,7 @@ async function fetchLeadRecordsByPhoneZoho(phone: string): Promise<any[]> {
     const { getAccessToken } = await import("./zoho");
     const token = await getAccessToken();
     const fields = [
-      "id", "Mobile", "Phone", "ASBL_Project", "PRD_Stage", "Next_Call_At",
+      "id", "Mobile", "Phone", "ASBL_Project", "Lead_Status", "PRD_Stage", "Next_Call_At",
       "Last_Inhouse_Call_ID", "Chatbot_Attempt_Count", "Chatbot_Follow_up_Count",
       "Total_Call_Duration_Secs", "Created_Time", "Master_Lead_ID",
     ].join(",");
@@ -160,7 +166,7 @@ export async function dedupCallPrimariesSweep(maxRecords = 6000): Promise<{
   const { mirrorLeadStateToMongo } = await import("./supabase");
   const token = await getAccessToken();
   const fields =
-    "id,Mobile,Phone,ASBL_Project,PRD_Stage,Next_Call_At,Last_Inhouse_Call_ID," +
+    "id,Mobile,Phone,ASBL_Project,Lead_Status,PRD_Stage,Next_Call_At,Last_Inhouse_Call_ID," +
     "Chatbot_Attempt_Count,Chatbot_Follow_up_Count,Total_Call_Duration_Secs,Created_Time";
   const all: any[] = [];
   let page = 1;

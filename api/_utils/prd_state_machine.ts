@@ -68,6 +68,36 @@ const DEFAULT_STATUS_PER_STAGE: Partial<Record<Stage, Status>> = {
   // Not Interested: no Status
 };
 
+// ─── Lead_Status is the SOURCE OF TRUTH; PRD_Stage mirrors it ──────────────
+// Zoho's Lead_Status (sales-facing, also sales-editable) is authoritative for
+// where a lead actually is. PRD_Stage must stay in lockstep with it, and the
+// cadence must obey it. These two helpers translate the Lead_Status vocabulary
+// (Fresh / Contacted / Lead Initiated / Pre Site / Virtual Tour / Not
+// Interested / …) into our automation's decisions.
+
+/** Map a Zoho Lead_Status → the equivalent PRD_Stage so the two stay equal.
+ *  Returns null for unknown/empty values (leave PRD_Stage untouched). */
+export function mapLeadStatusToStage(leadStatus: string | null | undefined): string | null {
+  const ls = String(leadStatus || "").trim().toLowerCase();
+  if (!ls) return null;
+  if (ls === "fresh" || ls === "new" || ls === "new lead") return "New Lead";
+  if (ls === "contacted" || ls === "lead initiated" || ls === "attempted" || ls === "attempting") return "Lead Initiated";
+  if (/pre.?site|site visit|virtual tour/.test(ls)) return "Pre Site Visit";
+  if (/not interested|lost|dead/.test(ls)) return "Not Interested";
+  if (/spam|junk/.test(ls)) return "Spam";
+  return null; // e.g. Won / Booked / Customer — no PRD equivalent, cadence still
+               // stops via isTerminalLeadStatus below.
+}
+
+/** A Lead_Status that means "stop the cadence" — a milestone was reached (site
+ *  visit booked) or the lead is closed (not interested / won / junk). Broader
+ *  than the map so unmapped terminal statuses still halt outreach. */
+export function isTerminalLeadStatus(leadStatus: string | null | undefined): boolean {
+  const ls = String(leadStatus || "").trim().toLowerCase();
+  if (!ls) return false;
+  return /not interested|pre.?site|site visit|virtual tour|won|booked|junk|spam|lost|closed|customer|dead/.test(ls);
+}
+
 // ─── Input to every transition ───────────────────────────────────────────
 export interface TransitionInput {
   leadId: string;
