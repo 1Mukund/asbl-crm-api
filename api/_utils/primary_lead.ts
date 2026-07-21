@@ -15,7 +15,6 @@
  */
 import { normPhoneKey } from "./unique_leads";
 import { displayProject } from "./project_detection";
-import { isTerminalLeadStatus } from "./prd_state_machine";
 
 /** Phone key for a lead record (Phone falls back to Mobile), normalised so
  *  cross-format dupes collapse. Empty string when there's no usable phone. */
@@ -23,13 +22,11 @@ export function leadPhoneKey(lead: any): string {
   return normPhoneKey(String(lead?.Phone || lead?.Mobile || ""));
 }
 
-/** Still an active outreach candidate? Mirrors the cron's own skip gates so a
- *  closed / converted / spam record is never chosen as the primary caller. */
+/** Still an active outreach candidate? Gates on PRD_Stage ONLY — the single
+ *  stage field the whole cadence keys on (kept accurate by the posthook + the
+ *  cron's Lead_Status→PRD_Stage reconcile). A closed / converted / spam record
+ *  is never chosen as the primary caller. */
 export function isOutreachEligible(lead: any): boolean {
-  // Lead_Status is the source of truth — a terminal / milestone status (site
-  // visit booked, not interested, won, …) means no more outreach, even if
-  // PRD_Stage lagged behind it.
-  if (isTerminalLeadStatus(lead?.Lead_Status)) return false;
   const stage = String(lead?.PRD_Stage || "");
   if (!stage) return false;
   if (stage === "Not Interested" || stage === "Spam" || stage === "Pre Site Visit") return false;
