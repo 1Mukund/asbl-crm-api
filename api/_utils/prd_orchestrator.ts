@@ -227,6 +227,56 @@ async function fireAiCall(opts: {
   preferred_call_time?: string;
 }): Promise<{ ok: boolean; error?: string; response?: any }> {
   const SELF_BASE_URL = process.env.SELF_PUBLIC_URL || "https://asbl-crm-api.vercel.app";
+
+  // ── EXECUTION-TIME SAFETY GUARD (last line of defence) ───────────────────
+  // Re-validate from Mongo right before dialing — the cadence's stage stop +
+  // primary-caller checks are enforced at SCHEDULING time only, so a stale /
+  // re-armed Next_Call_At, a cron pagination race, the self-heal / safety-net
+  // reschedule, a retry, or a manual re-fire could otherwise reach this dial.
+  // EVERY proactive dial (cron follow-up, self-heal, safety-net, retry, T=0)
+  // funnels through fireAiCall, so this one check covers them all:
+  //   ISSUE 1 — abort if the lead reached Pre Site Visit / Not Interested /
+  //             Spam / any site-visit milestone since it was scheduled.
+  //   ISSUE 2 — abort if this record is not the LATEST-born primary caller for
+  //             its phone (a sibling project must stay silent).
+  // On block we also clear the landmine Next_Call_At (Zoho + Mongo) so no
+  // scheduler re-fires this record. Guard failures fail OPEN — the guard must
+  // never silence the funnel; the scheduling-time gates remain the first line.
+  if (opts.zoho_lead_id) {
+    try {
+      const { assertProactiveCallAllowed } = await import("./call_guard");
+      const guard = await assertProactiveCallAllowed({
+        zohoLeadId: opts.zoho_lead_id,
+        phone: opts.phone,
+      });
+      if (!guard.allowed) {
+        console.warn(
+          `[PRD Orch] AI call ABORTED by dial-time guard (blockedBy=${guard.blockedBy}) — ${guard.reason}`,
+        );
+        try {
+          const [{ updateLead }, { mirrorLeadStateToMongo }] = await Promise.all([
+            import("./zoho"),
+            import("./supabase"),
+          ]);
+          await Promise.allSettled([
+            updateLead(opts.zoho_lead_id, { Next_Call_At: null }),
+            mirrorLeadStateToMongo(opts.zoho_lead_id, { Next_Call_At: null }),
+          ]);
+        } catch (clearErr: any) {
+          console.error(`[PRD Orch] guard Next_Call_At clear failed for ${opts.zoho_lead_id}: ${clearErr.message}`);
+        }
+        return {
+          ok: false,
+          error: `dial blocked: ${guard.blockedBy || "guard"}`,
+          response: { blocked: true, blocked_by: guard.blockedBy, reason: guard.reason },
+        };
+      }
+    } catch (guardErr: any) {
+      // Guard itself threw — fail OPEN so a guard bug never stops all calls.
+      console.error(`[PRD Orch] dial-time guard threw (proceeding with call): ${guardErr.message}`);
+    }
+  }
+
   const externalScheduleId = `prd-${opts.zoho_lead_id}-${Date.now()}`;
   // Sanitize the name: many leads land with a phone-number-shaped "name"
   // (e.g. "+918xxxxxxxx") and the voice agent otherwise reads the digits out
