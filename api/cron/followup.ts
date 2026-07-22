@@ -233,6 +233,7 @@ async function runPrdCadenceProcessor(): Promise<{
      // well over current volume).
     const FIELDS =
       `id,First_Name,Last_Name,Mobile,Phone,ASBL_Project,Created_Time,` +
+      `Born_Date,Inncircles_Born_Date,` +  // per-person primary = LATEST-born project
       `Lead_Status,` +               // SOURCE OF TRUTH for stage — cadence gates on this
       `PRD_Stage,PRD_Status,PRD_Last_Action_Time,PRD_Last_Action,` +
       `Chatbot_Attempt_Count,Chatbot_Follow_up_Count,` +

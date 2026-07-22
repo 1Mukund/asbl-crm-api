@@ -6304,15 +6304,16 @@ ${SHARED_STYLE}
       const fj = (await fr.json()) as any;
       const existingApis = new Set((fj?.fields || []).map((f: any) => f.api_name));
       const desired = [
-        { api: "IsReactivated",         label: "IsReactivated" },
-        { api: "IsBorn_Fresh",          label: "IsBorn_Fresh" },
-        { api: "IsBorn_InOtherProject", label: "IsBorn_InOtherProject" },
-        { api: "IsBulkTransfer",        label: "IsBulkTransfer" },
+        { api: "IsReactivated",         label: "IsReactivated",         type: "boolean" },
+        { api: "IsBorn_Fresh",          label: "IsBorn_Fresh",          type: "boolean" },
+        { api: "IsBorn_InOtherProject", label: "IsBorn_InOtherProject", type: "boolean" },
+        { api: "IsBulkTransfer",        label: "IsBulkTransfer",        type: "boolean" },
+        { api: "Inncircles_Born_Date",  label: "Inncircles Born Date",  type: "date"    },
       ];
       const results: any[] = [];
       for (const d of desired) {
         if (existingApis.has(d.api)) { results.push({ api: d.api, status: "already_exists" }); continue; }
-        const body = { fields: [{ field_label: d.label, data_type: "boolean" }] };
+        const body = { fields: [{ field_label: d.label, data_type: d.type }] };
         const cr = await fetch(`${ZOHO_API_BASE}/settings/fields?module=Leads`, {
           method: "POST",
           headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },

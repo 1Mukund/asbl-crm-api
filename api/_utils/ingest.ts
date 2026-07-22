@@ -70,6 +70,9 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
     // available — may predate CRM entry for bulk transfers / reactivations),
     // else the CRM-entry date as fallback. YYYY-MM-DD for Zoho's date field.
     Born_Date: lead.born_date || lead.lead_received_at.slice(0, 10),
+    // Dedicated Inncircles-supplied born date (only when the caller sent one).
+    // Drives the per-person "latest-born project = the one we call" selection.
+    ...(lead.born_date ? { Inncircles_Born_Date: lead.born_date } : {}),
 
     // Project & Interest
     ASBL_Project: lead.project ?? "",
@@ -167,10 +170,10 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
   let resubmission: IngestResult["resubmission"] = undefined;
 
   if (existingLead) {
-    // Don't overwrite Born_Date on resubmissions — it should reflect the
-    // ORIGINAL CRM creation date, not the date of the latest resubmit.
+    // Don't overwrite Born_Date / Inncircles_Born_Date on resubmissions — they
+    // should reflect the ORIGINAL born date, not the latest resubmit.
     // (Resubmission timing is captured separately on Last_Resubmission_At.)
-    const { Born_Date: _ignored, ...payloadForUpdate } = zohoPayload;
+    const { Born_Date: _ignored, Inncircles_Born_Date: _ignored2, ...payloadForUpdate } = zohoPayload;
     await updateLead(existingLead.id, payloadForUpdate);
     zohoLeadId = existingLead.id;
     action = "updated";
