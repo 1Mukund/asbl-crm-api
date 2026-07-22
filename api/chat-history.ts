@@ -7832,7 +7832,7 @@ ${SHARED_STYLE}
 
       // Resolve sender list
       const sendersEnv = (process.env.PERISKOPE_SENDERS || "").split(/[\s,]+/).map((s) => s.replace(/\D/g, "")).filter((s) => s.length >= 10);
-      const hardcoded = ["919063141693","917794028484","917396077334","919059555164","918977537630","917207048181","917396130606","917386023002","919247524774","917995284040"];
+      const hardcoded = ["917793952828","919247598804","919247597422","919247597421","919247597423","919247597420","919247597418","919247597426","919247597419","919247597417"];
       const senderSource = sendersEnv.length ? "PERISKOPE_SENDERS env" : "hardcoded";
       const pool = sendersEnv.length ? sendersEnv : hardcoded;
       const senders = body.sender ? [String(body.sender).replace(/\D/g, "")] : (body.all_senders ? pool : [pool[0]]);
@@ -8062,7 +8062,7 @@ ${SHARED_STYLE}
           sender = (await ops.getSenderForPhone(phone)) || "";
         } catch {}
       }
-      if (!sender) sender = "919063141693"; // pool[0] fallback
+      if (!sender) sender = "917793952828"; // pool[0] fallback
       const { sendDocumentTool } = await import("./_utils/doc_send_tool");
       const result = await sendDocumentTool({
         request: {

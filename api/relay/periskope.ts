@@ -22,18 +22,18 @@ const SUPABASE_URL       = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY       = process.env.SUPABASE_SECRET_KEY || "";
 
 // Round-robin sender numbers (stored without + prefix)
-// All 10 connected Periskope senders — Anandita LLM RM team
+// All 10 connected Periskope senders — Anandita RM team (updated 2026-07-22)
 const SENDER_NUMBERS = [
-  "919063141693", // Angad
-  "917794028484", // Kapil
-  "917396077334", // Bala SK
-  "919059555164", // Reddy
-  "918977537630",
-  "917207048181", // Varun
-  "917396130606", // Mayur
-  "917386023002",
-  "919247524774",
-  "917995284040", // Anandita
+  "917793952828",
+  "919247598804",
+  "919247597422",
+  "919247597421",
+  "919247597423",
+  "919247597420",
+  "919247597418",
+  "919247597426",
+  "919247597419",
+  "919247597417",
 ];
 
 // Phone-sticky sender pick — if this phone already has a sender mapped
