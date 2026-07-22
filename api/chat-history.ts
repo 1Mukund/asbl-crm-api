@@ -6288,6 +6288,24 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── test-teams-alert — verify the Teams webhook + Adaptive Card render ──
+  //   GET ?action=test-teams-alert&secret=$INHOUSE_POSTHOOK_SECRET
+  if (req.method === "GET" && req.query.action === "test-teams-alert") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=" });
+    }
+    const { alertOps } = await import("./_utils/alerting");
+    await alertOps({
+      title: "Test alert",
+      message: "Test alert from ASBL CRM — agar ye card dikh raha hai to Teams alerting kaam kar rahi hai.",
+      context: { source: "manual test", time: new Date().toISOString() },
+      dedupeKey: `test:${Date.now()}`,
+    });
+    return res.status(200).json({ ok: true, teams_webhook_configured: !!process.env.TEAMS_WEBHOOK_URL });
+  }
+
   // ─── zoho-create-inncircles-flag-fields — create the 4 Inncircles origin
   //     checkboxes on Leads (IsReactivated, IsBorn_Fresh, IsBorn_InOtherProject,
   //     IsBulkTransfer). Idempotent. Run once before the ingest sends them.
