@@ -39,26 +39,36 @@ async function sendTeams(opts: {
   title: string; message: string; severity: string; context?: Record<string, any>;
 }): Promise<void> {
   if (!TEAMS_WEBHOOK_URL) return;
-  const color = opts.severity === "warning" ? "E0A800" : "D93F3F";
+  const color = opts.severity === "warning" ? "Warning" : "Attention";
   const facts = Object.entries(opts.context || {})
     .filter(([, v]) => v !== undefined && v !== null && String(v) !== "")
-    .map(([k, v]) => ({ name: k, value: String(v).slice(0, 400) }));
-  const card = {
-    "@type": "MessageCard",
-    "@context": "http://schema.org/extensions",
-    themeColor: color,
-    summary: `ASBL CRM alert: ${opts.title}`,
-    title: `🚨 ASBL CRM — ${opts.title}`,
-    sections: [{
-      activitySubtitle: new Date().toISOString(),
-      text: (opts.message || "").slice(0, 2000),
-      facts,
+    .map(([k, v]) => ({ title: k, value: String(v).slice(0, 400) }));
+  const cardBody: any[] = [
+    { type: "TextBlock", size: "Medium", weight: "Bolder", color, wrap: true, text: `🚨 ASBL CRM — ${opts.title}` },
+    { type: "TextBlock", wrap: true, spacing: "Small", text: (opts.message || "").slice(0, 2000) },
+    { type: "TextBlock", isSubtle: true, size: "Small", spacing: "Small", text: new Date().toISOString() },
+  ];
+  if (facts.length) cardBody.push({ type: "FactSet", facts });
+  // Adaptive Card wrapped for the Teams "Post to a channel when a webhook
+  // request is received" workflow (Power Automate) — the modern replacement for
+  // the retired Office 365 "Incoming Webhook" connector.
+  const payload = {
+    type: "message",
+    attachments: [{
+      contentType: "application/vnd.microsoft.card.adaptive",
+      content: {
+        $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
+        type: "AdaptiveCard",
+        version: "1.4",
+        msteams: { width: "Full" },
+        body: cardBody,
+      },
     }],
   };
   await fetch(TEAMS_WEBHOOK_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(card),
+    body: JSON.stringify(payload),
   }).catch(() => {});
 }
 
