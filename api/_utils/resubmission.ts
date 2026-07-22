@@ -55,16 +55,16 @@ const SELF_BASE_URL = process.env.SELF_PUBLIC_URL || "https://asbl-crm-api.verce
 // Same 10-sender pool as api/relay/periskope.ts — kept in sync so a returning
 // lead gets paired with the same RM-pool variety they saw on first contact.
 const SENDER_NUMBERS = [
-  "919063141693",
-  "917794028484",
-  "917396077334",
-  "919059555164",
-  "918977537630",
-  "917207048181",
-  "917396130606",
-  "917386023002",
-  "919247524774",
-  "917995284040",
+  "917793952828",
+  "919247598804",
+  "919247597422",
+  "919247597421",
+  "919247597423",
+  "919247597420",
+  "919247597418",
+  "919247597426",
+  "919247597419",
+  "919247597417",
 ];
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

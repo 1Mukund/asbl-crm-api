@@ -250,9 +250,9 @@ export async function getDocumentFor(
 // Set PERISKOPE_SENDERS in Vercel to the SAME value the calling agent uses
 // on Render to guarantee the senders are live.
 const HARDCODED_DOC_SENDERS = [
-  "919063141693", "917794028484", "917396077334", "919059555164",
-  "918977537630", "917207048181", "917396130606", "917386023002",
-  "919247524774", "917995284040",
+  "917793952828", "919247598804", "919247597422", "919247597421",
+  "919247597423", "919247597420", "919247597418", "919247597426",
+  "919247597419", "919247597417",
 ];
 const DOC_SENDER_POOL = (() => {
   const raw = process.env.PERISKOPE_SENDERS || "";
