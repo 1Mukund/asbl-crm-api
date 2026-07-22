@@ -280,8 +280,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     //            nextCallAfterMiss → next slot in [9am, 10am, 11am, 1pm,
     //            2pm, 4pm, 5pm, 7pm, 8pm] customer-TZ. Loops until pickup.
     //            (No more miss-counter / aggressive tree / 3-day exhaustion.)
-    const PICKUP_STATUSES = new Set(["Connected", "Pre Site", "Virtual Tour"]);
-    const STOP_STATUSES = new Set(["Not Interested"]);
+    // A site-visit milestone ("Pre Site" / "Virtual Tour") STOPS the call
+    // cadence exactly like an explicit "Not Interested": once a lead has booked
+    // a visit we must NOT schedule another call. Previously these were treated
+    // as PICKUP → nextCallAfterPickup re-armed Next_Call_At with a fresh future
+    // slot, so a just-booked lead carried a LIVE scheduled call (ISSUE 1). Only
+    // a plain "Connected" answer (engaged, not yet booked) reschedules.
+    const PICKUP_STATUSES = new Set(["Connected"]);
+    const STOP_STATUSES = new Set(["Not Interested", "Pre Site", "Virtual Tour"]);
     const isPickup = PICKUP_STATUSES.has(callStatus);
     const isStop = STOP_STATUSES.has(callStatus);
 
@@ -296,7 +302,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       ? {
           nextCallAt: null,
           phase: "STOPPED" as const,
-          reason: "customer declined — no further calls",
+          reason:
+            callStatus === "Not Interested"
+              ? "customer declined — no further calls"
+              : "site-visit milestone reached — no further calls",
         }
       : isPickup
       ? nextCallAfterPickup({ phone, preferredCallbackTime, createdAt })
