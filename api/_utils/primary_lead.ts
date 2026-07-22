@@ -45,11 +45,6 @@ export function hasStartedOutreach(lead: any): boolean {
   );
 }
 
-function createdMs(lead: any): number {
-  const t = lead?.Created_Time ? new Date(lead.Created_Time).getTime() : 0;
-  return Number.isFinite(t) && t > 0 ? t : Number.MAX_SAFE_INTEGER;
-}
-
 /** Pick the ONE primary-caller record for a phone's group of records:
  *    1. only eligible records
  *    2. prefer the one already mid-outreach (stable — don't hop projects)
@@ -60,12 +55,19 @@ function createdMs(lead: any): number {
 export function pickPrimaryLeadId(records: any[]): string | null {
   const eligible = records.filter(isOutreachEligible);
   if (!eligible.length) return null;
+  // The LATEST-born project wins — call for the freshest interest, not the
+  // others (per directive: "jisme latest born hai usi project ke lie call
+  // karo"). Born date = Inncircles_Born_Date (source-supplied), else Born_Date,
+  // else Created_Time.
+  const bornMs = (l: any): number => {
+    const raw = l?.Inncircles_Born_Date || l?.Born_Date || l?.born_date ||
+                l?.inncircles_born_date || l?.Created_Time;
+    const t = raw ? new Date(raw).getTime() : 0;
+    return Number.isFinite(t) && t > 0 ? t : 0;
+  };
   eligible.sort((a, b) => {
-    const sa = hasStartedOutreach(a) ? 0 : 1;
-    const sb = hasStartedOutreach(b) ? 0 : 1;
-    if (sa !== sb) return sa - sb;                       // already-started first
-    const ca = createdMs(a), cb = createdMs(b);
-    if (ca !== cb) return ca - cb;                       // else earliest born
+    const ba = bornMs(a), bb = bornMs(b);
+    if (ba !== bb) return bb - ba;                       // LATEST born first
     return String(a.id).localeCompare(String(b.id));     // stable tiebreak
   });
   return String(eligible[0].id);
@@ -110,6 +112,8 @@ export async function fetchLeadRecordsByPhone(phone: string): Promise<any[]> {
         Mobile: d.mobile,
         ASBL_Project: d.project || d.asbl_project || "",
         Lead_Status: d.lead_status ?? null,
+        Born_Date: d.born_date ?? null,
+        Inncircles_Born_Date: d.inncircles_born_date ?? d.born_date ?? null,
         PRD_Stage: d.prd_stage ?? null,
         Next_Call_At: d.next_call_at ?? null,
         Last_Inhouse_Call_ID: d.last_inhouse_call_id ?? null,
@@ -134,7 +138,7 @@ async function fetchLeadRecordsByPhoneZoho(phone: string): Promise<any[]> {
     const { getAccessToken } = await import("./zoho");
     const token = await getAccessToken();
     const fields = [
-      "id", "Mobile", "Phone", "ASBL_Project", "Lead_Status", "PRD_Stage", "Next_Call_At",
+      "id", "Mobile", "Phone", "ASBL_Project", "Lead_Status", "Born_Date", "Inncircles_Born_Date", "PRD_Stage", "Next_Call_At",
       "Last_Inhouse_Call_ID", "Chatbot_Attempt_Count", "Chatbot_Follow_up_Count",
       "Total_Call_Duration_Secs", "Created_Time", "Master_Lead_ID",
     ].join(",");
@@ -163,7 +167,7 @@ export async function dedupCallPrimariesSweep(maxRecords = 6000): Promise<{
   const { mirrorLeadStateToMongo } = await import("./supabase");
   const token = await getAccessToken();
   const fields =
-    "id,Mobile,Phone,ASBL_Project,Lead_Status,PRD_Stage,Next_Call_At,Last_Inhouse_Call_ID," +
+    "id,Mobile,Phone,ASBL_Project,Lead_Status,Born_Date,Inncircles_Born_Date,PRD_Stage,Next_Call_At,Last_Inhouse_Call_ID," +
     "Chatbot_Attempt_Count,Chatbot_Follow_up_Count,Total_Call_Duration_Secs,Created_Time";
   const all: any[] = [];
   let page = 1;
