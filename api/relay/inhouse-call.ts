@@ -259,6 +259,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
   } catch (err: any) {
     console.error("[InHouse Call] Unexpected error:", err.message);
+    const { alertOps } = await import("../_utils/alerting");
+    await alertOps({ title: "Call trigger failed", message: err.message, context: { path: "inhouse-call" }, dedupeKey: `call:${String(err.message).slice(0, 60)}` });
     return res.status(500).json({ error: err.message });
   }
 }

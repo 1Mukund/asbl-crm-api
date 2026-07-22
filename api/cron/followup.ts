@@ -732,6 +732,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({ task: "prd-cadence", ...result });
     } catch (err: any) {
       console.error("[PRD Cadence Cron] Fatal:", err.message);
+      const { alertOps } = await import("../_utils/alerting");
+      await alertOps({ title: "Cron prd-cadence fatal", message: err.message, context: { task: "prd-cadence" }, dedupeKey: `cron:${String(err.message).slice(0, 60)}` });
       return res.status(500).json({ error: err.message });
     }
   }
