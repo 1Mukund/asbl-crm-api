@@ -6288,6 +6288,37 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── site-visit-bookings — every site-visit / virtual-tour a call booked ──
+  //   GET ?action=site-visit-bookings&secret=$INHOUSE_POSTHOOK_SECRET
+  //       [&project=SPECTRA] [&limit=100]
+  //   Reads the site_visit_bookings collection (project + date + time per lead).
+  if (req.method === "GET" && req.query.action === "site-visit-bookings") {
+    const incomingSecret = (req.query.secret as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=" });
+    }
+    try {
+      const { getCollection } = await import("./_utils/mongo");
+      const col = await getCollection("site_visit_bookings" as any);
+      const q: any = {};
+      if (req.query.project) q.project = String(req.query.project);
+      if (req.query.type) q.type = String(req.query.type);
+      const limit = Math.min(1000, Math.max(1, Number(req.query.limit) || 200));
+      const rows = await col.find(q).sort({ booked_at: -1 } as any).limit(limit).toArray();
+      return res.status(200).json({
+        count: rows.length,
+        bookings: rows.map((r: any) => ({
+          customer_name: r.customer_name, phone: r.phone, project: r.project,
+          type: r.type, visit_date: r.visit_date, visit_time: r.visit_time,
+          booked_at: r.booked_at, zoho_lead_id: r.zoho_lead_id,
+        })),
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── zoho-create-inncircles-flag-fields — create the 4 Inncircles origin
   //     checkboxes on Leads (IsReactivated, IsBorn_Fresh, IsBorn_InOtherProject,
   //     IsBulkTransfer). Idempotent. Run once before the ingest sends them.

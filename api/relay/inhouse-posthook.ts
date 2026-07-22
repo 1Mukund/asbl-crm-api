@@ -367,6 +367,44 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         outcome: finalOutcome as any,
         details,
       }).catch((err) => console.error(`[InHouse Posthook → PRD] failed: ${err.message}`));
+
+      // ── Site-visit booking log → Mongo ─────────────────────────────────
+      // When a call books a site visit / virtual tour, record WHICH project +
+      // date + time in a dedicated `site_visit_bookings` collection so ops can
+      // see every booking at a glance. Upsert per lead (latest booking wins).
+      const isSiteVisitBooking =
+        callStatus === "Pre Site" || callStatus === "Virtual Tour" ||
+        !!extracted.site_visit_requested;
+      if (isSiteVisitBooking) {
+        try {
+          const svr = (extracted.site_visit_requested || {}) as any;
+          const { getCollection } = await import("../_utils/mongo");
+          const col = await getCollection("site_visit_bookings" as any);
+          await col.updateOne(
+            { _id: String(lead.id) as any },
+            { $set: {
+                zoho_lead_id: lead.id,
+                phone,
+                customer_name: leadName || null,
+                project: lead.ASBL_Project || null,
+                type: callStatus === "Virtual Tour" ? "virtual_tour" : "site_visit",
+                visit_date: svr.date || details.visitDate || null,
+                visit_time: svr.time || svr.slot || svr.preferred_time || null,
+                visit_raw: svr,
+                call_id: callId,
+                call_status: callStatus,
+                booked_at: new Date().toISOString(),
+              } },
+            { upsert: true },
+          );
+          console.log(
+            `[InHouse Posthook] site-visit booking logged — lead=${lead.id} ` +
+            `project=${lead.ASBL_Project || "?"} date=${svr.date || details.visitDate || "?"} time=${svr.time || "?"}`,
+          );
+        } catch (err: any) {
+          console.error(`[InHouse Posthook] site-visit booking log failed: ${err.message}`);
+        }
+      }
     } catch (err: any) {
       console.error(`[InHouse Posthook → PRD] orchestrator import failed: ${err.message}`);
     }
