@@ -2050,6 +2050,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   } catch (err: any) {
     console.error("[Periskope Webhook] Error:", err.message);
+    const { alertOps } = await import("../_utils/alerting");
+    await alertOps({ title: "WhatsApp inbound webhook failed", message: err.message, context: { path: "periskope-webhook" }, dedupeKey: `webhook:${String(err.message).slice(0, 60)}` });
     return res.status(500).json({ error: err.message });
   }
 }

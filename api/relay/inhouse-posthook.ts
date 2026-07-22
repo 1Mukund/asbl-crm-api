@@ -419,6 +419,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
   } catch (err: any) {
     console.error("[InHouse Posthook] Error:", err.message);
+    const { alertOps } = await import("../_utils/alerting");
+    await alertOps({ title: "Posthook failed", message: err.message, context: { path: "inhouse-posthook" }, dedupeKey: `posthook:${String(err.message).slice(0, 60)}` });
     return res.status(500).json({ error: err.message });
   }
 }
