@@ -14,12 +14,48 @@ const {
 let cachedToken: string | null = null;
 let tokenExpiry = 0;
 
-export async function getAccessToken(): Promise<string> {
-  if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
+// Shared token cache key in Mongo `bot_settings`. The SAME key the Periskope
+// webhook uses (getZohoToken) — so the WHOLE app shares ONE Zoho access token
+// across every serverless instance and both code paths.
+//
+// Why this matters (root cause of the ingest INVALID_TOKEN + rate-limit storm):
+// each Vercel instance used to mint + cache its OWN token. Under burst ingest
+// (100s of leads → many concurrent instances) that (a) issued many tokens so
+// Zoho invalidated the older ones → `INVALID_TOKEN` on createLead, and (b)
+// hammered the /token endpoint → `Access Denied: too many requests`. A single
+// shared token removes both: instances READ the shared token and only ONE
+// refresh happens when it actually expires.
+const ZOHO_TOKEN_KEY = "zoho_access_token_v1";
 
-  // Retry on transient network errors (ETIMEDOUT / ECONNRESET) — Zoho's
-  // accounts.zoho.in occasionally times out on initial connect. Up to 3
-  // attempts with 500ms backoff before throwing.
+export async function getAccessToken(forceRefresh = false): Promise<string> {
+  const now = Date.now();
+
+  // 1. Module cache (warm instance) — skip on a forced refresh.
+  if (!forceRefresh && cachedToken && now < tokenExpiry) return cachedToken;
+
+  const failedToken = cachedToken; // the token that was just rejected (forceRefresh)
+
+  // 2. Shared cache in Mongo bot_settings. On a forced refresh, a DIFFERENT
+  //    still-valid shared token means another instance already refreshed after
+  //    the invalidation → adopt it WITHOUT calling /token (kills the refresh
+  //    stampede that caused the rate-limit).
+  try {
+    const { getBotSetting } = await import("./bot_settings");
+    const row = await getBotSetting(ZOHO_TOKEN_KEY);
+    if (row?.value) {
+      const parsed = JSON.parse(row.value);
+      const stillValid = parsed?.token && parsed?.expiry && now < parsed.expiry - 60_000;
+      const isDifferent = parsed?.token && parsed.token !== failedToken;
+      if (stillValid && (!forceRefresh || isDifferent)) {
+        cachedToken = parsed.token;
+        tokenExpiry = parsed.expiry;
+        return parsed.token;
+      }
+    }
+  } catch {}
+
+  // 3. Refresh from Zoho, then write to BOTH caches. Retry on transient network
+  //    errors (ETIMEDOUT / ECONNRESET) — accounts.zoho.in occasionally times out.
   let lastErr: any;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -36,7 +72,14 @@ export async function getAccessToken(): Promise<string> {
         throw new Error(`Zoho token error: ${JSON.stringify(res.data)}`);
       }
       cachedToken = res.data.access_token;
-      tokenExpiry = Date.now() + (res.data.expires_in - 60) * 1000;
+      const expiresInSec = Number(res.data.expires_in) || 3600;
+      // Pad by 2 min so we (and the shared cache) never serve a token about to die.
+      tokenExpiry = now + (expiresInSec - 120) * 1000;
+      // Persist to the shared cache so other instances stop minting their own.
+      try {
+        const { setBotSetting } = await import("./bot_settings");
+        await setBotSetting(ZOHO_TOKEN_KEY, JSON.stringify({ token: cachedToken, expiry: tokenExpiry }));
+      } catch {}
       return cachedToken!;
     } catch (err: any) {
       lastErr = err;
@@ -203,56 +246,92 @@ export async function triggerBlueprintTransition(
 
 // ─── Create / Update Lead ────────────────────────────────────────────────────
 
+/** True when a Zoho error is an expired/invalid access token — the cached token
+ *  was invalidated by Zoho (its concurrent-token cap) before our local TTL
+ *  lapsed. Recover by force-refreshing the token and retrying the call once.
+ *  This is the fix for the "success but INVALID_TOKEN" ingest failures where
+ *  50-60 leads silently never landed in Zoho. */
+export function isInvalidTokenError(err: any): boolean {
+  if (err?.response?.status === 401) return true;
+  const body = err?.response?.data;
+  const s = (typeof body === "string" ? body : JSON.stringify(body ?? err?.message ?? "")).toLowerCase();
+  return (
+    s.includes("invalid_token") ||
+    s.includes("invalid oauth token") ||
+    s.includes("authentication_failure") ||
+    s.includes("oauthtoken")
+  );
+}
+
 export async function createLead(data: Record<string, any>): Promise<string> {
-  const token = await getAccessToken();
-  try {
-    const res = await axios.post(
-      `${ZOHO_API_BASE}/Leads`,
-      { data: [data] },
-      { headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" } }
-    );
-    return res.data?.data?.[0]?.details?.id;
-  } catch (err: any) {
-    const detail = err.response?.data ?? err.message;
-    throw new Error(`Zoho createLead failed: ${JSON.stringify(detail)}`);
+  // Two attempts: the 2nd force-refreshes the token so an INVALID_TOKEN (Zoho
+  // invalidated our cached token before its local TTL) self-heals instead of
+  // dropping the lead.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const token = await getAccessToken(attempt === 2);
+    try {
+      const res = await axios.post(
+        `${ZOHO_API_BASE}/Leads`,
+        { data: [data] },
+        { headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" } }
+      );
+      return res.data?.data?.[0]?.details?.id;
+    } catch (err: any) {
+      if (attempt === 1 && isInvalidTokenError(err)) {
+        console.warn("[Zoho createLead] INVALID_TOKEN — force-refreshing token + retrying once");
+        continue;
+      }
+      const detail = err.response?.data ?? err.message;
+      throw new Error(`Zoho createLead failed: ${JSON.stringify(detail)}`);
+    }
   }
+  throw new Error("Zoho createLead failed: token refresh did not recover INVALID_TOKEN");
 }
 
 const URL_FIELDS = ["First_Page_Visited", "Last_Page_Visited", "Referrer_URL"];
 
 export async function updateLead(id: string, data: Record<string, any>): Promise<void> {
-  const token = await getAccessToken();
-  try {
-    await axios.patch(
-      `${ZOHO_API_BASE}/Leads`,
-      { data: [{ id, ...data }] },
-      { headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" } }
-    );
-  } catch (err: any) {
-    const detail = err.response?.data ?? err.message;
-    // If INVALID_DATA on a URL field, retry without URL fields
-    const hasUrlError = Array.isArray(err.response?.data?.data) &&
-      err.response.data.data.some((d: any) =>
-        d.code === "INVALID_DATA" && URL_FIELDS.includes(d.details?.api_name)
+  // Outer loop: attempt 2 force-refreshes the token to self-heal INVALID_TOKEN.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const token = await getAccessToken(attempt === 2);
+    try {
+      await axios.patch(
+        `${ZOHO_API_BASE}/Leads`,
+        { data: [{ id, ...data }] },
+        { headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" } }
       );
-    if (hasUrlError) {
-      const cleanData = { ...data };
-      URL_FIELDS.forEach(f => delete cleanData[f]);
-      console.warn(`Retrying updateLead without URL fields for lead ${id}`);
-      try {
-        await axios.patch(
-          `${ZOHO_API_BASE}/Leads`,
-          { data: [{ id, ...cleanData }] },
-          { headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" } }
-        );
-        return;
-      } catch (retryErr: any) {
-        const retryDetail = retryErr.response?.data ?? retryErr.message;
-        throw new Error(`Zoho updateLead failed (retry): ${JSON.stringify(retryDetail)}`);
+      return;
+    } catch (err: any) {
+      if (attempt === 1 && isInvalidTokenError(err)) {
+        console.warn(`[Zoho updateLead] INVALID_TOKEN for ${id} — force-refreshing token + retrying`);
+        continue;
       }
+      const detail = err.response?.data ?? err.message;
+      // If INVALID_DATA on a URL field, retry without URL fields
+      const hasUrlError = Array.isArray(err.response?.data?.data) &&
+        err.response.data.data.some((d: any) =>
+          d.code === "INVALID_DATA" && URL_FIELDS.includes(d.details?.api_name)
+        );
+      if (hasUrlError) {
+        const cleanData = { ...data };
+        URL_FIELDS.forEach(f => delete cleanData[f]);
+        console.warn(`Retrying updateLead without URL fields for lead ${id}`);
+        try {
+          await axios.patch(
+            `${ZOHO_API_BASE}/Leads`,
+            { data: [{ id, ...cleanData }] },
+            { headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" } }
+          );
+          return;
+        } catch (retryErr: any) {
+          const retryDetail = retryErr.response?.data ?? retryErr.message;
+          throw new Error(`Zoho updateLead failed (retry): ${JSON.stringify(retryDetail)}`);
+        }
+      }
+      throw new Error(`Zoho updateLead failed: ${JSON.stringify(detail)}`);
     }
-    throw new Error(`Zoho updateLead failed: ${JSON.stringify(detail)}`);
   }
+  throw new Error(`Zoho updateLead failed: token refresh did not recover INVALID_TOKEN for ${id}`);
 }
 
 // ─── Create Call Log (Calls module — shows in lead detail view) ──────────────

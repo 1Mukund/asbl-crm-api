@@ -7030,6 +7030,91 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── reconcile-zoho-pending — re-create in Zoho the leads captured in Mongo
+  //     whose Zoho createLead failed (INVALID_TOKEN storm / rate-limit / CRM
+  //     Plus trial expired). Mongo-first durability means they were NOT lost;
+  //     this syncs them once Zoho is healthy. Idempotent, spaced, batched.
+  //   POST ?action=reconcile-zoho-pending&secret=<INHOUSE_POSTHOOK_SECRET>&limit=25[&fanout=true]
+  if (req.method === "POST" && req.query.action === "reconcile-zoho-pending") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    try {
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const { createLead, updateLead } = await import("./_utils/zoho");
+      const col = await getCollection(COL.LEADS);
+      const limit = Math.min(Number(req.query.limit) || 25, 200);
+      const fanout = String(req.query.fanout || "") === "true";
+
+      const pendingQ: any = { zoho_synced: false, zoho_lead_id: null, zoho_payload_pending: { $exists: true } };
+      const pending = (await col.find(pendingQ).sort({ zoho_queued_at: 1 }).limit(limit).toArray()) as any[];
+
+      let synced = 0, stillFailing = 0, fannedOut = 0;
+      const results: any[] = [];
+      for (const doc of pending) {
+        const payload = doc.zoho_payload_pending;
+        if (!payload) continue;
+        try {
+          const zohoLeadId = await createLead(payload);
+          if (payload.Born_Date) { await updateLead(zohoLeadId, { Born_Date: payload.Born_Date }).catch(() => {}); }
+          await col.updateOne(
+            { _id: doc._id } as any,
+            {
+              $set: { zoho_lead_id: zohoLeadId, zoho_synced: true, zoho_synced_at: new Date().toISOString() },
+              $unset: { zoho_payload_pending: "", zoho_error: "" },
+            },
+          );
+          synced++;
+          let didFanout = false;
+          if (fanout) {
+            try {
+              const { handleLeadCreated } = await import("./_utils/prd_orchestrator");
+              await handleLeadCreated({
+                zoho_lead_id: zohoLeadId,
+                phone: doc.phone,
+                customer_name: [doc.first_name, doc.last_name].filter((x: any) => x && x !== ".").join(" ").trim() || "there",
+                project: doc.project || undefined,
+                is_resubmission: false,
+                last_page_visited: doc.last_page_visited,
+                budget: doc.lead_budget,
+                size_preference: doc.size_preference,
+              });
+              didFanout = true; fannedOut++;
+            } catch (fe: any) {
+              console.error(`[reconcile] fanout failed for ${doc._id}: ${fe.message}`);
+            }
+          }
+          results.push({ plid: doc._id, phone: doc.phone, project: doc.project, zoho_lead_id: zohoLeadId, fanout: didFanout });
+        } catch (ce: any) {
+          stillFailing++;
+          await col.updateOne({ _id: doc._id } as any, { $set: { zoho_error: ce.message, zoho_reconcile_last_try: new Date().toISOString() } });
+          results.push({ plid: doc._id, phone: doc.phone, status: "still_failing", error: ce.message });
+        }
+        // Gentle spacing so a big backlog doesn't re-trigger the /token rate limit.
+        await new Promise((r) => setTimeout(r, 250));
+      }
+
+      const remaining = await col.countDocuments(pendingQ);
+      return res.status(200).json({
+        ok: true,
+        processed: pending.length,
+        synced,
+        still_failing: stillFailing,
+        fanned_out: fannedOut,
+        fanout_enabled: fanout,
+        remaining_pending: remaining,
+        note: fanout
+          ? "fanout=true → recovered leads also got WhatsApp + AI call."
+          : "createLead only (no outreach). Pass &fanout=true to also fire T=0 WhatsApp + call.",
+        results,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── inncircles-audit — is the Inncircles caller actually SENDING born_date
   //     + origin flags, did they land in Mongo, and do they match Zoho?
   //     Read-only diagnostic (no writes, no side effects).
