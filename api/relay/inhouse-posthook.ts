@@ -240,6 +240,36 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ error: "Missing call_sid / phone_number" });
     }
 
+    // ── DIAGNOSTIC (temporary) — capture the raw voice-bot payload ───────────
+    // The goodcalls dashboard tags a call PRE_SITE but our CRM stays
+    // "Contacted / Lead Initiated" — proving the pre-site disposition never
+    // reaches us in a field we read (call_outcome/zoho_status/call_result_slug/
+    // status). This records the EXACT keys + values each webhook sends so we can
+    // find which field (if any) carries the disposition, then wire it into
+    // deriveCallStatus. Read via GET /api/chat-history?action=posthook-payloads.
+    // Best-effort, never blocks the handler; rows self-expire after 7 days.
+    try {
+      const { getCollection } = await import("../_utils/mongo");
+      const col = await getCollection("posthook_payloads" as any);
+      if (!(globalThis as any).__posthookPayloadIdx) {
+        (globalThis as any).__posthookPayloadIdx = true;
+        col.createIndex({ at: 1 }, { expireAfterSeconds: 604800 }).catch(() => {});
+      }
+      await col.insertOne({
+        at: new Date(),
+        call_id: callId || null,
+        phone: phoneRaw || null,
+        top_level_keys: Object.keys(body || {}),
+        raw_slug_read: rawSlug || null,
+        duration_secs: durationSecs,
+        has_extracted_slots: !!body.extracted_slots,
+        extracted_slots: body.extracted_slots || null,
+        body,
+      } as any);
+    } catch (capErr: any) {
+      console.error(`[InHouse Posthook] payload capture failed (non-fatal): ${capErr.message}`);
+    }
+
     // ── 1. Find the Zoho lead via full chain:
     //    Last_Inhouse_Call_ID → Last_Arrowhead_Call_ID → phone fallback.
     //    Deluge stamps the call_id under Last_Arrowhead_Call_ID for legacy

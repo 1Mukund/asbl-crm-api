@@ -6976,6 +6976,60 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── posthook-payloads — inspect the raw voice-bot call_completed payloads
+  //     captured by inhouse-posthook, to find which field carries the pre-site
+  //     disposition (the dashboard tags PRE_SITE but our CRM stays "Contacted").
+  //   GET ?action=posthook-payloads&secret=<INHOUSE_POSTHOOK_SECRET>&limit=20[&phone=98xxxxxxxx]
+  if (req.method === "GET" && req.query.action === "posthook-payloads") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    try {
+      const { getCollection } = await import("./_utils/mongo");
+      const col = await getCollection("posthook_payloads" as any);
+      const limit = Math.min(Number(req.query.limit) || 20, 100);
+      const q: any = {};
+      if (req.query.phone) {
+        const d = String(req.query.phone).replace(/\D/g, "").slice(-10);
+        if (d) q.phone = { $regex: d + "$" };
+      }
+      const rows = (await col.find(q).sort({ at: -1 }).limit(limit).toArray()) as any[];
+      // Surface the distinct disposition-bearing values across all captured rows
+      // so the pre-site field jumps out even without reading each body.
+      const dispositionFields = ["call_outcome", "zoho_status", "call_result_slug", "status", "disposition", "call_disposition", "tag", "journey_status", "outcome", "call_status"];
+      const seen: Record<string, Set<string>> = {};
+      for (const r of rows) {
+        const b = r.body || {};
+        for (const f of dispositionFields) {
+          if (b[f] !== undefined && b[f] !== null && typeof b[f] !== "object") {
+            (seen[f] ||= new Set()).add(String(b[f]));
+          }
+        }
+      }
+      const field_value_summary: Record<string, string[]> = {};
+      for (const f of Object.keys(seen)) field_value_summary[f] = Array.from(seen[f]);
+      return res.status(200).json({
+        ok: true,
+        count: rows.length,
+        field_value_summary,
+        rows: rows.map((r) => ({
+          at: r.at,
+          call_id: r.call_id,
+          phone: r.phone,
+          top_level_keys: r.top_level_keys,
+          raw_slug_read: r.raw_slug_read,
+          duration_secs: r.duration_secs,
+          extracted_slots: r.extracted_slots,
+          body: r.body,
+        })),
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── inncircles-audit — is the Inncircles caller actually SENDING born_date
   //     + origin flags, did they land in Mongo, and do they match Zoho?
   //     Read-only diagnostic (no writes, no side effects).
