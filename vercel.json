@@ -1,5 +1,11 @@
 {
   "version": 2,
+  "functions": {
+    "api/ingest/inncircles.ts": { "maxDuration": 60 },
+    "api/ingest/website.ts": { "maxDuration": 60 },
+    "api/ingest/meta.ts": { "maxDuration": 60 },
+    "api/ingest/fim.ts": { "maxDuration": 60 }
+  },
   "crons": [
     {
       "path": "/api/cron/followup?task=meta-backfill",
