@@ -416,6 +416,15 @@ function mapZohoLead(zohoLead: any): Record<string, any> | null {
     next_call_at: zohoLead.Next_Call_At ?? null,
     site_visit_date: zohoLead.Site_Visit_Date ?? null,
     last_customer_response: zohoLead.Last_Customer_Response ?? null,
+    // Inncircles origin flags + born dates — mirrored as top-level fields so the
+    // in-house CRM can read/filter them (also present in the `zoho` snapshot).
+    is_reactivated: zohoLead.IsReactivated ?? null,
+    is_born_fresh: zohoLead.IsBorn_Fresh ?? null,
+    is_born_in_other_project: zohoLead.IsBorn_InOtherProject ?? null,
+    is_bulk_transfer: zohoLead.IsBulkTransfer ?? null,
+    reactivation_is_latest: zohoLead.Reactivation_Is_Latest ?? null,
+    born_date: zohoLead.Born_Date ?? null,
+    inncircles_born_date: zohoLead.Inncircles_Born_Date ?? null,
     created_time: zohoLead.Created_Time ?? null,
     modified_time: zohoLead.Modified_Time ?? null,
     zoho: zohoLead,            // full raw snapshot — nothing is lost
@@ -470,6 +479,9 @@ export async function runZohoLeadSync(
     "Total_Call_Duration_Secs","Last_Call_At","Last_Recording_URL",
     "Next_Call_At","Site_Visit_Date","Last_Customer_Response",
     "Last_Inhouse_Call_ID","Last_Arrowhead_Call_ID","Budget","Lead_Comments",
+    // Inncircles origin flags + born dates (mirror to Mongo top-level fields)
+    "IsReactivated","IsBorn_Fresh","IsBorn_InOtherProject","IsBulkTransfer",
+    "Reactivation_Is_Latest","Born_Date","Inncircles_Born_Date",
   ].join(",");
   const since = opts.since || "";
   const maxPages = Math.min(opts.maxPages || 60, 200);
