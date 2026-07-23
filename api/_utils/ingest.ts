@@ -204,12 +204,13 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
       console.error(`[Ingest] recordResubmission threw for ${zohoLeadId}: ${err.message}`);
     }
   } else {
-    // MONGO-FIRST DURABILITY: if Zoho createLead fails (INVALID_TOKEN storm,
-    // rate-limit, or CRM Plus trial expired), the lead must NOT be lost. Persist
-    // it to Mongo as un-synced (zoho_lead_id=null, zoho_synced=false) and return
-    // "queued"; the reconcile-zoho-pending cron task retries the Zoho create once
-    // Zoho recovers. This is why "success but never landed in Zoho" can't lose a
-    // lead anymore — Mongo is the durable store, Zoho is reconciled after.
+    // ── MONGO-FIRST ─────────────────────────────────────────────────────────
+    // Persist the FULL lead to Mongo BEFORE touching Zoho, so lead capture never
+    // depends on Zoho's API (which exhausts under burst → INVALID_TOKEN / rate
+    // limit / trial-expired). Mongo is the source of truth; Zoho is a SECONDARY
+    // sync. If the Zoho create fails the lead is already safe in Mongo — we stash
+    // the payload and return "queued", and reconcile-zoho-pending syncs it later.
+    await upsertLead(lead, mlid, plid, null, false); // durable capture, unsynced
     try {
       zohoLeadId = await createLead(zohoPayload);
       action = "created";
@@ -218,10 +219,9 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
         await updateLead(zohoLeadId, { Born_Date: zohoPayload.Born_Date }).catch(() => {});
       }
     } catch (zerr: any) {
-      console.error(`[Ingest] createLead FAILED — queuing lead to Mongo (plid=${plid}): ${zerr.message}`);
-      await upsertLead(lead, mlid, plid, null, false);
-      // Stash the exact Zoho payload + error so the reconcile job can re-create
-      // the lead in Zoho without rebuilding it.
+      console.error(`[Ingest] createLead FAILED — lead kept in Mongo, queued for reconcile (plid=${plid}): ${zerr.message}`);
+      // The lead is already in Mongo (above) — just stash the payload so the
+      // reconcile job can re-create it in Zoho without rebuilding it.
       try {
         const { getCollection, COL } = await import("./mongo");
         const col = await getCollection(COL.LEADS);
@@ -236,7 +236,9 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
     }
   }
 
-  // ── Step 4: Store in Mongo (source of truth + safety net) ────────────────
+  // ── Step 4: Mark synced in Mongo now that Zoho has the lead. For the create
+  //    path this flips zoho_synced false→true + writes the zoho_lead_id; for the
+  //    updated path it refreshes the existing doc. Mongo stays source of truth.
   await upsertLead(lead, mlid, plid, zohoLeadId, true);
 
   return { action, zoho_lead_id: zohoLeadId, mlid, plid, resubmission };
