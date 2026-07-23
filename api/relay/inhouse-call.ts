@@ -94,14 +94,29 @@ async function triggerInHouseBot(
     payload.metadata = ctx.metadata;
   }
 
-  const r = await fetch(`${VOICEBOT_URL}/api/schedule-call`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${VOICEBOT_API_KEY}`,
-    },
-    body: JSON.stringify(payload),
-  });
+  // Timeout the voice-bot call — it's a Render host that can cold-start 30-50s,
+  // and the fetch was previously untimed, so a cold dial held the whole ingest
+  // request open past the client's read timeout. Cap at 8s; on timeout treat it
+  // as a failed trigger (caller handles ok:false; retry/cron re-fires it later).
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  let r: Response;
+  try {
+    r = await fetch(`${VOICEBOT_URL}/api/schedule-call`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${VOICEBOT_API_KEY}`,
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+  } catch (err: any) {
+    console.error(`[InHouse Call] voice-bot fetch aborted/failed (${VOICEBOT_URL}): ${err?.message}`);
+    return { ok: false, status: 0, data: { error: String(err?.message || err) }, call_id: "" };
+  } finally {
+    clearTimeout(timer);
+  }
   const data = await r.json().catch(() => ({}));
   const d = (data as any) || {};
   // Normalise: success flag from either shape; call_id from either field.

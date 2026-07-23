@@ -191,30 +191,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const { getReactivationEntry } = await import("../_utils/reactivation");
 
-    const results: any[] = [];
-    for (const item of items) {
+    // Process items with BOUNDED concurrency. This was a fully SEQUENTIAL loop,
+    // so a batch of N leads took N × per-lead — the primary cause of the client
+    // read-timeouts (response = Σ of every lead's Zoho + fanout work). Cap at 4
+    // to match the Mongo pool (maxPoolSize:4) and avoid hammering Zoho/voice-bot.
+    const CONCURRENCY = 4;
+    const results: any[] = new Array(items.length);
+
+    const processItem = async (item: any, idx: number): Promise<void> => {
       const lead = buildLead(item);
       if (!lead) {
-        results.push({ status: "skipped", reason: "invalid or missing phone", raw_phone: item?.phone ?? item?.mobile ?? null });
-        continue;
+        results[idx] = { status: "skipped", reason: "invalid or missing phone", raw_phone: item?.phone ?? item?.mobile ?? null };
+        return;
       }
       // MANUAL REACTIVATION (2026-07): existing customers are re-pushed through
       // this same webhook. If the phone is on the reactivation allowlist, flip
       // the source Inncircles M1 -> Manual Reactivation so Zoho reflects the
-      // real origin. Call routing / cadence is unchanged (webhook already sends
-      // the correct latest project; +30min / 15-per-tick batching still applies).
+      // real origin. Call routing / cadence is unchanged.
       let reactivation: any = null;
-      // Authoritative default on the reactivation source path: every Inncircles
-      // lead sends the flag (false here), so a re-push after the list changes
-      // clears any stale true — Zoho patch updates don't clear omitted fields.
+      // Authoritative default: every Inncircles lead sends the flag (false here),
+      // so a re-push after the list changes clears any stale true.
       lead.reactivation_is_latest = false;
       try {
         const entry = await getReactivationEntry(lead.mobile);
         if (entry) {
           lead.lead_source = "Manual Reactivation";
-          // Flag the lead whose project == the sheet's latest_project. Drives
-          // the Zoho purple-row marker (Reactivation_Is_Latest). A phone can
-          // arrive for several projects; only the latest one is flagged true.
           const isLatest = !!(lead.project && entry.latest_project &&
             lead.project.trim().toUpperCase() === entry.latest_project.trim().toUpperCase());
           lead.reactivation_is_latest = isLatest;
@@ -229,10 +230,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         // PRD v1.0 T=0 — fire chatbot WhatsApp + AI call on fresh creates only.
         // MUST await — Vercel kills the worker on handler return, so fire-and-
-        // forget (.catch without await) silently dies mid-flight. Confirmed
-        // by lead 1288576000002161053 (mahee/BROADWAY, 2026-06-05) where
-        // Chatbot_Attempt_Count never incremented despite the lead being
-        // ingested. Adds ~3-7s to response, well under Inncircles' 44s timeout.
+        // forget (.catch without await) silently dies mid-flight.
         if (result.action === "created") {
           try {
             const { handleLeadCreated } = await import("../_utils/prd_orchestrator");
@@ -251,7 +249,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           }
         }
 
-        results.push({
+        results[idx] = {
           // "queued" = captured in Mongo but Zoho create failed; the
           // reconcile-zoho-pending cron will sync it. NOT lost, NOT a hard error.
           status: result.action === "queued" ? "queued" : "ok",
@@ -265,11 +263,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           plid: result.plid,
           zoho_lead_id: result.zoho_lead_id,
           ...(result.zoho_error ? { zoho_error: result.zoho_error } : {}),
-        });
+        };
       } catch (err: any) {
         console.error(`[Inncircles] ingest failed for ${lead.mobile}: ${err.message}`);
-        results.push({ status: "error", phone: lead.mobile, error: err.message });
+        results[idx] = { status: "error", phone: lead.mobile, error: err.message };
       }
+    };
+
+    for (let i = 0; i < items.length; i += CONCURRENCY) {
+      const chunk = items.slice(i, i + CONCURRENCY);
+      await Promise.all(chunk.map((item, j) => processItem(item, i + j)));
     }
 
     const created = results.filter((r) => r.action === "created").length;

@@ -307,11 +307,19 @@ async function fireAiCall(opts: {
       preferred_call_time: opts.preferred_call_time || "",
     },
   };
+  // Timeout the self-HTTP hop to /api/relay/inhouse-call — it re-invokes a
+  // serverless fn that then dials the (Render, cold-startable) voice bot. Untimed,
+  // it held the ingest request open past the client read timeout. 12s (> the
+  // inner voice-bot 8s cap so that fires first). On timeout the abort throws →
+  // caught below → ok:false; the cron/retry re-fires the call.
+  const relayController = new AbortController();
+  const relayTimer = setTimeout(() => relayController.abort(), 12000);
   try {
     const r = await fetch(`${SELF_BASE_URL}/api/relay/inhouse-call`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal: relayController.signal,
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) {
@@ -323,6 +331,8 @@ async function fireAiCall(opts: {
   } catch (err: any) {
     console.error(`[PRD Orch] AI call throw: ${err.message}`);
     return { ok: false, error: err.message };
+  } finally {
+    clearTimeout(relayTimer);
   }
 }
 
