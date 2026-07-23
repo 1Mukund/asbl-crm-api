@@ -174,7 +174,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               try {
                 const { handleLeadCreated } = await import("../_utils/prd_orchestrator");
                 await handleLeadCreated({
-                  zoho_lead_id: result.zoho_lead_id,
+                  zoho_lead_id: result.zoho_lead_id!,
                   phone: lead.mobile,
                   customer_name: `${lead.first_name} ${lead.last_name}`.replace(/\s+\.$/, "").trim() || "there",
                   project: lead.project,

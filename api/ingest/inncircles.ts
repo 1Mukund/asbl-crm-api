@@ -237,7 +237,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           try {
             const { handleLeadCreated } = await import("../_utils/prd_orchestrator");
             await handleLeadCreated({
-              zoho_lead_id: result.zoho_lead_id,
+              zoho_lead_id: result.zoho_lead_id!,
               phone: lead.mobile,
               customer_name: `${lead.first_name} ${lead.last_name}`.replace(/\s+\.$/, "").trim() || "there",
               project: lead.project,
@@ -252,7 +252,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
 
         results.push({
-          status: "ok",
+          // "queued" = captured in Mongo but Zoho create failed; the
+          // reconcile-zoho-pending cron will sync it. NOT lost, NOT a hard error.
+          status: result.action === "queued" ? "queued" : "ok",
           action: result.action,
           phone: lead.mobile,
           name: `${lead.first_name} ${lead.last_name}`.trim(),
@@ -262,6 +264,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           mlid: result.mlid,
           plid: result.plid,
           zoho_lead_id: result.zoho_lead_id,
+          ...(result.zoho_error ? { zoho_error: result.zoho_error } : {}),
         });
       } catch (err: any) {
         console.error(`[Inncircles] ingest failed for ${lead.mobile}: ${err.message}`);
@@ -271,12 +274,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const created = results.filter((r) => r.action === "created").length;
     const updated = results.filter((r) => r.action === "updated").length;
+    // "queued" = safely captured in Mongo, Zoho create pending (reconcile cron
+    // will sync). Not lost, not a hard error.
+    const queued = results.filter((r) => r.action === "queued").length;
+    // HONEST success: reflect per-lead failures instead of always true. A caller
+    // that logs on top-level `success` alone previously recorded Zoho createLead
+    // failures (e.g. INVALID_TOKEN) as "success" and lost the lead. `success` is
+    // now false if ANY lead hard-errored; `queued` leads are surfaced separately
+    // (durable in Mongo, auto-reconciled), and `errors`/`failed` show real fails.
+    const errored = results.filter((r) => r.status === "error");
+    const failed = errored.map((r) => ({ phone: r.phone ?? null, error: r.error ?? null }));
     return res.status(200).json({
-      success: true,
+      success: errored.length === 0,
       default_source: DEFAULT_SOURCE,   // per-lead source is in results[].lead_source
       received: items.length,
       created,
       updated,
+      queued,
+      errors: errored.length,
+      failed,
       results,
     });
   } catch (err: any) {

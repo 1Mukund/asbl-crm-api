@@ -17,22 +17,29 @@ function isValidUrl(url?: string): boolean {
   } catch { return false; }
 }
 
+/** Set when action = "updated" — the lead resubmitted a form. Includes the new
+ *  total count, source, the audit-line we just appended, and whether outreach
+ *  was suppressed by the per-lead cooldown. Sales debugs this when they ask
+ *  "did the resubmission trigger fire?". */
+export type ResubmissionInfo = {
+  count: number;
+  source: string;
+  history_line: string;
+  outreach_suppressed: boolean;
+  cooldown_remaining_minutes: number;
+};
+
 export type IngestResult = {
-  action: "created" | "updated";
-  zoho_lead_id: string;
+  // "created"/"updated" landed in Zoho (zoho_lead_id present). "queued" = Zoho
+  // create failed (trial expired / auth / outage) so the lead was persisted to
+  // Mongo ONLY (zoho_lead_id null); reconcile-zoho-pending syncs it later.
+  action: "created" | "updated" | "queued";
+  zoho_lead_id: string | null;
   mlid: string;
   plid: string;
-  /** Set when action = "updated" — the lead resubmitted a form. Includes
-   *  the new total count, source, the audit-line we just appended, and
-   *  whether outreach was suppressed by the per-lead cooldown.
-   *  Sales debugs this when they ask "did the resubmission trigger fire?". */
-  resubmission?: {
-    count: number;
-    source: string;
-    history_line: string;
-    outreach_suppressed: boolean;
-    cooldown_remaining_minutes: number;
-  };
+  /** Set only when action = "queued" — why the Zoho create failed. */
+  zoho_error?: string;
+  resubmission?: ResubmissionInfo;
 };
 
 export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
@@ -167,7 +174,7 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
 
   let zohoLeadId: string;
   let action: "created" | "updated";
-  let resubmission: IngestResult["resubmission"] = undefined;
+  let resubmission: ResubmissionInfo | undefined = undefined;
 
   if (existingLead) {
     // Don't overwrite Born_Date / Inncircles_Born_Date on resubmissions — they
@@ -197,15 +204,39 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
       console.error(`[Ingest] recordResubmission threw for ${zohoLeadId}: ${err.message}`);
     }
   } else {
-    zohoLeadId = await createLead(zohoPayload);
-    action = "created";
-    // Zoho sometimes ignores custom fields in POST — patch Born_Date separately
-    if (zohoPayload.Born_Date) {
-      await updateLead(zohoLeadId, { Born_Date: zohoPayload.Born_Date }).catch(() => {});
+    // MONGO-FIRST DURABILITY: if Zoho createLead fails (INVALID_TOKEN storm,
+    // rate-limit, or CRM Plus trial expired), the lead must NOT be lost. Persist
+    // it to Mongo as un-synced (zoho_lead_id=null, zoho_synced=false) and return
+    // "queued"; the reconcile-zoho-pending cron task retries the Zoho create once
+    // Zoho recovers. This is why "success but never landed in Zoho" can't lose a
+    // lead anymore — Mongo is the durable store, Zoho is reconciled after.
+    try {
+      zohoLeadId = await createLead(zohoPayload);
+      action = "created";
+      // Zoho sometimes ignores custom fields in POST — patch Born_Date separately
+      if (zohoPayload.Born_Date) {
+        await updateLead(zohoLeadId, { Born_Date: zohoPayload.Born_Date }).catch(() => {});
+      }
+    } catch (zerr: any) {
+      console.error(`[Ingest] createLead FAILED — queuing lead to Mongo (plid=${plid}): ${zerr.message}`);
+      await upsertLead(lead, mlid, plid, null, false);
+      // Stash the exact Zoho payload + error so the reconcile job can re-create
+      // the lead in Zoho without rebuilding it.
+      try {
+        const { getCollection, COL } = await import("./mongo");
+        const col = await getCollection(COL.LEADS);
+        await col.updateOne(
+          { _id: plid } as any,
+          { $set: { zoho_payload_pending: zohoPayload, zoho_error: zerr.message, zoho_queued_at: new Date().toISOString() } },
+        );
+      } catch (stashErr: any) {
+        console.error(`[Ingest] failed to stash pending payload for ${plid}: ${stashErr.message}`);
+      }
+      return { action: "queued", zoho_lead_id: null, mlid, plid, zoho_error: zerr.message };
     }
   }
 
-  // ── Step 4: Store in Supabase (source of truth + safety net) ─────────────
+  // ── Step 4: Store in Mongo (source of truth + safety net) ────────────────
   await upsertLead(lead, mlid, plid, zohoLeadId, true);
 
   return { action, zoho_lead_id: zohoLeadId, mlid, plid, resubmission };
