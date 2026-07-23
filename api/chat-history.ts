@@ -6976,6 +6976,126 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── inncircles-audit — is the Inncircles caller actually SENDING born_date
+  //     + origin flags, did they land in Mongo, and do they match Zoho?
+  //     Read-only diagnostic (no writes, no side effects).
+  //   GET ?action=inncircles-audit&secret=<INHOUSE_POSTHOOK_SECRET>&limit=20
+  if (req.method === "GET" && req.query.action === "inncircles-audit") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    try {
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const col = await getCollection(COL.LEADS);
+      const limit = Math.min(Number(req.query.limit) || 20, 100);
+      // Inncircles-origin leads: source "Inncircles M1" / "Manual Reactivation",
+      // or utm_source contains inncircles.
+      const q: any = {
+        $or: [
+          { lead_source: { $regex: /inncircles/i } },
+          { lead_source: "Manual Reactivation" },
+          { utm_source: { $regex: /inncircles/i } },
+        ],
+      };
+      const rows = (await col.find(q).sort({ updated_at: -1 }).limit(limit).toArray()) as any[];
+
+      const flagKeys = ["is_reactivated", "is_born_fresh", "is_born_in_other_project", "is_bulk_transfer"] as const;
+      const stats = { sample: rows.length, any_flag_set: 0, born_date_caller_supplied: 0, reactivation_is_latest_set: 0 };
+
+      const sample = rows.map((r) => {
+        const anyFlag = flagKeys.some((k) => r[k] !== null && r[k] !== undefined);
+        if (anyFlag) stats.any_flag_set++;
+        // Caller-supplied born date = differs from the CRM-entry date (else it's
+        // just the fallback lead_received_at.slice(0,10)).
+        const entryDate = r.lead_received_at ? String(r.lead_received_at).slice(0, 10) : null;
+        const bornSupplied = !!(r.born_date && entryDate && r.born_date !== entryDate);
+        if (bornSupplied) stats.born_date_caller_supplied++;
+        if (r.reactivation_is_latest !== null && r.reactivation_is_latest !== undefined) stats.reactivation_is_latest_set++;
+        return {
+          phone: r.phone || r._id,
+          project: r.project ?? null,
+          lead_source: r.lead_source ?? null,
+          born_date: r.born_date ?? null,
+          born_supplied_by_caller: bornSupplied,
+          is_reactivated: r.is_reactivated ?? null,
+          is_born_fresh: r.is_born_fresh ?? null,
+          is_born_in_other_project: r.is_born_in_other_project ?? null,
+          is_bulk_transfer: r.is_bulk_transfer ?? null,
+          reactivation_is_latest: r.reactivation_is_latest ?? null,
+          zoho_lead_id: r.zoho_lead_id ?? null,
+          lead_received_at: r.lead_received_at ?? null,
+          updated_at: r.updated_at ?? null,
+        };
+      });
+
+      // Cross-check the newest lead that has a Zoho id — proves whether the same
+      // values that Mongo holds are actually visible on the Zoho record.
+      let zohoCrossCheck: any = null;
+      const withZoho = sample.find((s) => s.zoho_lead_id);
+      if (withZoho) {
+        try {
+          const { getAccessToken } = await import("./_utils/zoho");
+          const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+          const token = await getAccessToken();
+          const fields = "Born_Date,Inncircles_Born_Date,IsBorn_Fresh,IsReactivated,IsBorn_InOtherProject,IsBulkTransfer,Reactivation_Is_Latest,Lead_Source,ASBL_Project";
+          const zr = await fetch(`${ZOHO_API_BASE}/Leads/${withZoho.zoho_lead_id}?fields=${fields}`, {
+            headers: { Authorization: `Zoho-oauthtoken ${token}` },
+          });
+          const zj = (await zr.json().catch(() => ({}))) as any;
+          const zl = zj?.data?.[0] || null;
+          zohoCrossCheck = zl
+            ? {
+                zoho_lead_id: withZoho.zoho_lead_id,
+                phone: withZoho.phone,
+                zoho: {
+                  Born_Date: zl.Born_Date ?? null,
+                  Inncircles_Born_Date: zl.Inncircles_Born_Date ?? null,
+                  IsBorn_Fresh: zl.IsBorn_Fresh ?? null,
+                  IsReactivated: zl.IsReactivated ?? null,
+                  IsBorn_InOtherProject: zl.IsBorn_InOtherProject ?? null,
+                  IsBulkTransfer: zl.IsBulkTransfer ?? null,
+                  Reactivation_Is_Latest: zl.Reactivation_Is_Latest ?? null,
+                },
+                mongo: {
+                  born_date: withZoho.born_date,
+                  is_born_fresh: withZoho.is_born_fresh,
+                  is_reactivated: withZoho.is_reactivated,
+                  is_born_in_other_project: withZoho.is_born_in_other_project,
+                  is_bulk_transfer: withZoho.is_bulk_transfer,
+                  reactivation_is_latest: withZoho.reactivation_is_latest,
+                },
+              }
+            : { error: "zoho lead not found", http_status: zr.status, body: JSON.stringify(zj).slice(0, 300) };
+        } catch (e: any) {
+          zohoCrossCheck = { error: e.message };
+        }
+      }
+
+      return res.status(200).json({
+        ok: true,
+        verdict: {
+          caller_sending_flags: stats.any_flag_set > 0,
+          caller_sending_born_date: stats.born_date_caller_supplied > 0,
+          note:
+            stats.any_flag_set === 0
+              ? "NONE of the sampled Inncircles leads has any origin flag set → the caller is NOT sending IsBorn_Fresh / IsReactivated / IsBorn_InOtherProject / IsBulkTransfer yet (all null in Mongo)."
+              : `${stats.any_flag_set}/${stats.sample} sampled Inncircles leads have at least one origin flag set in Mongo → caller IS sending flags.`,
+          born_note:
+            stats.born_date_caller_supplied === 0
+              ? "No sampled lead has a caller-supplied born_date (born_date == CRM-entry date everywhere) → caller is NOT sending born_date; the value is just the fallback."
+              : `${stats.born_date_caller_supplied}/${stats.sample} sampled leads have a caller-supplied born_date distinct from the CRM-entry date.`,
+        },
+        stats,
+        sample,
+        zoho_cross_check: zohoCrossCheck,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── Mongo backfill from Supabase (one-shot per collection) ────────────
   // POST /api/chat-history?action=mongo-backfill&collection=<name>&secret=<...>
   // Copies rows from the named Supabase table to its Mongo equivalent.
