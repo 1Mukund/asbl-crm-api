@@ -39,36 +39,25 @@ async function sendTeams(opts: {
   title: string; message: string; severity: string; context?: Record<string, any>;
 }): Promise<void> {
   if (!TEAMS_WEBHOOK_URL) return;
-  const color = opts.severity === "warning" ? "Warning" : "Attention";
-  const facts = Object.entries(opts.context || {})
-    .filter(([, v]) => v !== undefined && v !== null && String(v) !== "")
-    .map(([k, v]) => ({ title: k, value: String(v).slice(0, 400) }));
-  const cardBody: any[] = [
-    { type: "TextBlock", size: "Medium", weight: "Bolder", color, wrap: true, text: `🚨 ASBL CRM — ${opts.title}` },
-    { type: "TextBlock", wrap: true, spacing: "Small", text: (opts.message || "").slice(0, 2000) },
-    { type: "TextBlock", isSubtle: true, size: "Small", spacing: "Small", text: new Date().toISOString() },
+  // The Teams "Post a message when a webhook request is received" Power Automate
+  // workflow expects a simple { text } body — NOT an Adaptive Card. Build a
+  // readable multi-line text alert (title + message + context + severity/time).
+  const lines: string[] = [
+    `🚨 ASBL CRM — ${opts.title}`,
+    "",
+    (opts.message || "").slice(0, 1500),
   ];
-  if (facts.length) cardBody.push({ type: "FactSet", facts });
-  // Adaptive Card wrapped for the Teams "Post to a channel when a webhook
-  // request is received" workflow (Power Automate) — the modern replacement for
-  // the retired Office 365 "Incoming Webhook" connector.
-  const payload = {
-    type: "message",
-    attachments: [{
-      contentType: "application/vnd.microsoft.card.adaptive",
-      content: {
-        $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
-        type: "AdaptiveCard",
-        version: "1.4",
-        msteams: { width: "Full" },
-        body: cardBody,
-      },
-    }],
-  };
+  const ctx = Object.entries(opts.context || {})
+    .filter(([, v]) => v !== undefined && v !== null && String(v) !== "");
+  if (ctx.length) {
+    lines.push("");
+    for (const [k, v] of ctx) lines.push(`${k}: ${String(v).slice(0, 300)}`);
+  }
+  lines.push("", `severity: ${opts.severity || "critical"}  |  ${new Date().toISOString()}`);
   await fetch(TEAMS_WEBHOOK_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({ text: lines.join("\n") }),
   }).catch(() => {});
 }
 
