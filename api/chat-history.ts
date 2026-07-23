@@ -7096,6 +7096,111 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── block-calls — mark leads so the dial-time guard NEVER proactively
+  //     calls them. Each supplied id is matched against mlid / zoho_lead_id /
+  //     source_lead_id / plid(_id) in the Mongo `leads` collection. mlid is the
+  //     in-house "Lead ID" shown in the CRM, so a plain numeric id matches that.
+  //     Sets call_blocked=true on EVERY matched doc — a person with multiple
+  //     project leads (same mlid) gets all of them blocked. The execution-time
+  //     guard (call_guard) reads call_blocked, aborts the dial, and clears
+  //     Next_Call_At on the next scheduler tick — no customer is ever dialed.
+  //
+  //   POST /api/chat-history?action=block-calls&secret=<INHOUSE_POSTHOOK_SECRET>
+  //   Body: { ids: ["1270490", ...], commit?: false, unblock?: false, reason?: "" }
+  //     commit=false (default) → PREVIEW: report matches, NO writes.
+  //     commit=true            → set call_blocked = !unblock on all matched docs.
+  if (req.method === "POST" && req.query.action === "block-calls") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    try {
+      let body: any = req.body || {};
+      if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
+      const rawIds: any[] = Array.isArray(body.ids) ? body.ids : [];
+      const ids = Array.from(new Set(rawIds.map((x) => String(x).trim()).filter(Boolean)));
+      if (!ids.length) return res.status(400).json({ error: "body.ids must be a non-empty array of lead ids" });
+      const commit = body.commit === true;
+      const unblock = body.unblock === true;
+      const reason = String(body.reason || "manual ops block").slice(0, 200);
+
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const col = await getCollection(COL.LEADS);
+
+      const q: any = {
+        $or: [
+          { mlid: { $in: ids } },
+          { zoho_lead_id: { $in: ids } },
+          { source_lead_id: { $in: ids } },
+          { _id: { $in: ids } },
+        ],
+      };
+      const docs = (await col
+        .find(q, {
+          projection: {
+            _id: 1, mlid: 1, zoho_lead_id: 1, source_lead_id: 1, phone: 1,
+            project: 1, first_name: 1, last_name: 1, call_blocked: 1,
+          } as any,
+        })
+        .toArray()) as any[];
+
+      const idSet = new Set(ids);
+      const matchedIds = new Set<string>();
+      const matches = docs.map((d) => {
+        let matched_id: string | null = null;
+        let matched_field = "";
+        if (idSet.has(String(d.mlid)))               { matched_id = String(d.mlid);           matched_field = "mlid"; }
+        else if (idSet.has(String(d.zoho_lead_id)))  { matched_id = String(d.zoho_lead_id);   matched_field = "zoho_lead_id"; }
+        else if (idSet.has(String(d.source_lead_id))){ matched_id = String(d.source_lead_id); matched_field = "source_lead_id"; }
+        else if (idSet.has(String(d._id)))           { matched_id = String(d._id);            matched_field = "plid"; }
+        if (matched_id) matchedIds.add(matched_id);
+        return {
+          matched_id,
+          matched_field,
+          plid: d._id,
+          mlid: d.mlid ?? null,
+          zoho_lead_id: d.zoho_lead_id ?? null,
+          phone: d.phone ?? null,
+          project: d.project ?? null,
+          name: [d.first_name, d.last_name].filter((x: any) => x && x !== ".").join(" ").trim() || null,
+          already_blocked: d.call_blocked === true,
+        };
+      });
+      const unmatched_ids = ids.filter((id) => !matchedIds.has(id));
+
+      let modified = 0;
+      if (commit && docs.length) {
+        const plids = docs.map((d) => d._id);
+        const r = await col.updateMany(
+          { _id: { $in: plids } } as any,
+          unblock
+            ? { $set: { call_blocked: false, call_block_reason: null, call_unblocked_at: new Date().toISOString() } }
+            : { $set: { call_blocked: true, call_block_reason: reason, call_blocked_at: new Date().toISOString() } },
+        );
+        modified = (r as any).modifiedCount ?? 0;
+      }
+
+      return res.status(200).json({
+        ok: true,
+        mode: commit ? (unblock ? "UNBLOCK (committed)" : "BLOCK (committed)") : "PREVIEW (no writes)",
+        requested_ids: ids.length,
+        matched_ids: matchedIds.size,
+        matched_docs: matches.length,
+        newly_changed: modified,
+        unmatched_ids,
+        note: commit
+          ? (unblock
+              ? `call_blocked=false on ${matches.length} lead doc(s) — calls re-enabled.`
+              : `call_blocked=true on ${matches.length} lead doc(s) (${modified} newly set). The dial-time guard now aborts every proactive call for these and clears Next_Call_At on the next tick — no customer is dialed.`)
+          : "PREVIEW only — nothing written. Re-POST with commit:true to apply.",
+        matches,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── Mongo backfill from Supabase (one-shot per collection) ────────────
   // POST /api/chat-history?action=mongo-backfill&collection=<name>&secret=<...>
   // Copies rows from the named Supabase table to its Mongo equivalent.

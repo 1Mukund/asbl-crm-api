@@ -36,7 +36,7 @@
 import { fetchLeadRecordsByPhone, pickPrimaryLeadId } from "./primary_lead";
 import { isSiteVisitMilestone, isTerminalLeadStatus } from "./prd_state_machine";
 
-export type CallBlockReason = "terminal" | "not-primary";
+export type CallBlockReason = "blocked" | "terminal" | "not-primary";
 
 export interface CallGuardResult {
   allowed: boolean;
@@ -70,9 +70,20 @@ export async function assertProactiveCallAllowed(opts: {
       const col = await getCollection<any>(COL.LEADS);
       const doc = await col.findOne(
         { zoho_lead_id: zohoLeadId } as any,
-        { projection: { prd_stage: 1, lead_status: 1 } as any },
+        { projection: { prd_stage: 1, lead_status: 1, call_blocked: 1 } as any },
       );
       if (doc) {
+        // ── MANUAL BLOCKLIST — highest-priority stop ─────────────────────────
+        // An ops-set `call_blocked: true` on the lead doc (via the block-calls
+        // admin endpoint) means "never proactively dial this lead", regardless
+        // of stage / primary / born date. Overrides everything below.
+        if (doc.call_blocked === true) {
+          return {
+            allowed: false,
+            blockedBy: "blocked",
+            reason: `lead ${zohoLeadId} is on the manual call-block list (call_blocked=true) — dial aborted`,
+          };
+        }
         const stage = String(doc.prd_stage || "");
         const terminal =
           TERMINAL_STAGES.has(stage) ||
