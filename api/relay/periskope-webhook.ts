@@ -1052,6 +1052,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
+    // MASTER FREEZE — log the customer's inbound to history but do NOT reply
+    // (no Gemini, no status change, no doc send) while the rebuild is in progress.
+    {
+      const { isAutomationFrozen } = await import("../_utils/automation_freeze");
+      if (await isAutomationFrozen()) {
+        await saveMessage(phone, "inbound", message, sender, null, null);
+        return res.status(200).json({ frozen: true, message: "automation frozen — inbound logged, no reply" });
+      }
+    }
+
     // PRD v1.0: every customer reply moves status to CF + global override
     // detection (site visit / not interested). Fire-and-forget so the
     // chatbot reply pipeline below is never blocked by state update.

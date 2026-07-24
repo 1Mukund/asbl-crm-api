@@ -34,6 +34,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     const body = req.body;
 
+    // MASTER FREEZE — archive the raw lead, do NOT process (no Mongo/Zoho/fanout).
+    {
+      const { isAutomationFrozen, archiveFrozen } = await import("../_utils/automation_freeze");
+      if (await isAutomationFrozen()) {
+        await archiveFrozen("ingest:website", body);
+        return res.status(200).json({ frozen: true, message: "automation frozen — lead archived, not processed" });
+      }
+    }
+
     const rawPhone = body.phone || body.mobile || body.phone_number || "";
     const mobile = normalizePhone(rawPhone);
 

@@ -364,6 +364,15 @@ export async function handleLeadCreated(input: OnLeadCreatedInput): Promise<{
   chatbot: { ok: boolean; error?: string };
   ai_call: { ok: boolean; error?: string };
 }> {
+  // MASTER FREEZE — no T=0 fanout (no stage-set, no greeting, no call) during
+  // the rebuild. (Ingest handlers also gate earlier; this covers other callers.)
+  {
+    const { isAutomationFrozen } = await import("./automation_freeze");
+    if (await isAutomationFrozen()) {
+      return { state: null, chatbot: { ok: false, error: "frozen" }, ai_call: { ok: false, error: "frozen" } };
+    }
+  }
+
   // 1. Stage/Status → New Lead / NA
   const state = await onLeadCreated(input.zoho_lead_id, input.lead);
 

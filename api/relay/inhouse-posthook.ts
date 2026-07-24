@@ -109,6 +109,16 @@ function formatTranscript(t: any): string {
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
+  // MASTER FREEZE — capture the call result for replay but do NOT process it
+  // (no status change, no scheduling) while the rebuild is in progress.
+  {
+    const { isAutomationFrozen, archiveFrozen } = await import("../_utils/automation_freeze");
+    if (await isAutomationFrozen()) {
+      await archiveFrozen("posthook", req.body);
+      return res.status(200).json({ frozen: true, message: "automation frozen — call result archived, not processed" });
+    }
+  }
+
   // ── Auth: shared-secret header check (non-blocking) ───────────────────
   //
   // CRITICAL HISTORY: this check used to REJECT mismatches with 401, which
