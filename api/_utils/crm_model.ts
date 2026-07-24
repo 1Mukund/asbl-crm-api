@@ -32,6 +32,7 @@
  */
 
 import { getCrmCollection, getCrmNextSequence, getCollection, COL } from "./mongo";
+import { getConversationContext } from "./conversation_context";
 
 // ─── Enums (string unions + runtime arrays) ────────────────────────────────
 
@@ -102,7 +103,7 @@ export async function ensureCrmIndexes(): Promise<void> {
   if (G.__crmIdxEnsured) return;
   G.__crmIdxEnsured = true;
   try {
-    const [persons, leads, events, calls, messages, visits, stale] = await Promise.all([
+    const [persons, leads, events, calls, messages, visits, stale, orchestratorCtx] = await Promise.all([
       getCrmCollection(COL.PERSONS),
       getCrmCollection(COL.CRM_LEADS),
       getCrmCollection(COL.LEAD_EVENTS),
@@ -110,6 +111,7 @@ export async function ensureCrmIndexes(): Promise<void> {
       getCrmCollection(COL.CRM_MESSAGES),
       getCrmCollection(COL.SITE_VISITS),
       getCrmCollection(COL.STALE_PERSON_RECORD),
+      getCrmCollection(COL.ORCHESTRATOR_CONTEXT),
     ]);
     await Promise.all([
       // persons ( _id (phone) is the automatic unique index )
@@ -141,6 +143,10 @@ export async function ensureCrmIndexes(): Promise<void> {
       // stale_person_record
       stale.createIndex({ person_id: 1 }, { name: "idx_stale_person" }),
       stale.createIndex({ person_id: 1, inncircles_born_date: 1 }, { name: "idx_stale_person_born" }),
+      // orchestrator_context (§16) — person/lead history + retry-dedupe.
+      orchestratorCtx.createIndex({ person_id: 1, ts: 1 }, { name: "idx_octx_person_ts" }),
+      orchestratorCtx.createIndex({ lead_id: 1, ts: 1 }, { name: "idx_octx_lead_ts" }),
+      orchestratorCtx.createIndex({ interaction_id: 1 }, { name: "idx_octx_interaction", unique: true }),
     ]);
     // frozen_inbox {at} TTL (§7 / §3.9). archiveFrozen() in automation_freeze.ts
     // writes this collection via getCollection → it lives in the LEGACY
@@ -168,6 +174,7 @@ export async function ensureCrmIndexesNow(): Promise<Record<string, string[]>> {
   for (const name of [
     COL.PERSONS, COL.CRM_LEADS, COL.LEAD_EVENTS, COL.CALLS,
     COL.CRM_MESSAGES, COL.SITE_VISITS, COL.STALE_PERSON_RECORD,
+    COL.ORCHESTRATOR_CONTEXT,
   ]) {
     try {
       const col = await getCrmCollection(name);
@@ -557,6 +564,11 @@ export async function recordIngestToNewModel(input: IngestModelInput): Promise<I
         stage: "new",
         status: "never_contacted",
         is_terminal: false,
+        // Terminal reason (§14.6) + captured primary interest (§19.11). Slots
+        // exist from creation so the orchestrator context always has a field to
+        // read even before capture is wired (set by changeStage / setPrimaryInterest).
+        not_interested_reason: null,
+        primary_interest: null,
         next_action_at: null,
         next_action_type: null,
         owner: null,
@@ -715,6 +727,11 @@ export interface TransitionOpts {
   actor?: Actor;
   channel?: Channel;
   reason?: string;
+  /** Set on a terminal transition (not_interested / lost / …). Stored on
+   *  crm_leads.not_interested_reason so every terminal lead shows WHY it
+   *  stopped (§14.6), and surfaced in the orchestrator context's
+   *  not_interested[]. Also carried in the stage_change event's `reason`. */
+  not_interested_reason?: string;
 }
 
 /** Move a lead to a new stage. No-op (returns changed:false) if already there.
@@ -729,19 +746,26 @@ export async function changeStage(
   if (!cur) return { changed: false };
   if (cur.stage === toStage) return { changed: false, from: cur.stage };
 
+  const terminal = isTerminalStage(toStage);
   const ev = await appendEvent({
     lead_id: leadId, person_id: cur.person_id, project: cur.project,
     type: "stage_change", actor: opts.actor ?? "system", channel: opts.channel ?? "crm",
     from: { stage: cur.stage, status: cur.status },
     to: { stage: toStage },
-    reason: opts.reason,
+    // On a terminal move, prefer the explicit not_interested_reason so history
+    // carries WHY (§14.6); otherwise the caller-supplied reason.
+    reason: (terminal && opts.not_interested_reason) || opts.reason,
   });
 
-  const terminal = isTerminalStage(toStage);
   await projectLead(leadId, ev.seq, {
     stage: toStage,
     is_terminal: terminal,
     "last.stage_changed_at": ev.ts,
+    // Store the reason on the current-state doc for the one-view + context.
+    // NOTE: is_active is deliberately NOT flipped here — it tracks Inncircles
+    // activation, not stage (§3.8 keeps stale vs terminal distinct). The
+    // orchestrator context partitions active leads by stage instead.
+    ...(terminal && opts.not_interested_reason ? { not_interested_reason: opts.not_interested_reason } : {}),
     ...(terminal ? { next_action_at: null, next_action_type: null } : {}),
   });
   return { changed: true, from: cur.stage };
@@ -800,6 +824,11 @@ export interface CallScheduledInput {
   scheduled_at?: string;
   provider?: "plivo" | "telnyx" | (string & {});
   actor?: Actor;
+  /** Layer-1 snapshot (§16): the COMPACT orchestrator context the bot got for
+   *  THIS dial. Persisted into the call_scheduled event's data.context_snapshot
+   *  so the timeline shows "what the bot knew when it called". Optional +
+   *  backward-compatible — usually the value returned by storeOrchestratorContext. */
+  context_snapshot?: OrchestratorContextSnapshot | Record<string, any>;
 }
 
 /** Record a scheduled/triggered dial: writes the calls doc + call_scheduled
@@ -824,7 +853,11 @@ export async function recordCallScheduled(input: CallScheduledInput): Promise<vo
   const ev = await appendEvent({
     lead_id: input.lead_id, person_id: input.person_id, project: input.project,
     type: "call_scheduled", actor: input.actor ?? "cron", channel: "call",
-    ref: input.call_id, data: { provider: input.provider ?? "plivo" },
+    ref: input.call_id,
+    data: {
+      provider: input.provider ?? "plivo",
+      ...(input.context_snapshot ? { context_snapshot: input.context_snapshot } : {}),
+    },
   });
   await projectLead(input.lead_id, ev.seq, { "last.call_at": ev.ts }, { "counters.call_count": 1 });
 }
@@ -917,6 +950,10 @@ export interface MessageInput {
   /** optional lead to attribute the wa_* event to (usually the primary lead) */
   lead_id?: string;
   actor?: Actor;
+  /** Layer-1 snapshot (§16): the COMPACT orchestrator context the bot got for
+   *  THIS message. Only meaningful for outbound sends; persisted into the
+   *  wa_outbound event's data.context_snapshot. Optional + backward-compatible. */
+  context_snapshot?: OrchestratorContextSnapshot | Record<string, any>;
 }
 
 /** Store a WhatsApp message (phone-level) + append a wa_inbound/wa_outbound
@@ -955,7 +992,12 @@ export async function recordMessage(input: MessageInput): Promise<void> {
     actor: input.actor ?? (inbound ? "customer" : "bot"), channel: "whatsapp",
     ref: input.message_id,
     reason: input.intent ? `intent: ${input.intent}` : undefined,
-    data: { intent: input.intent ?? null, doc_ref: input.doc_ref ?? null },
+    data: {
+      intent: input.intent ?? null,
+      doc_ref: input.doc_ref ?? null,
+      // Layer-1 snapshot on the outbound touch only (inbound carries none).
+      ...(!inbound && input.context_snapshot ? { context_snapshot: input.context_snapshot } : {}),
+    },
   });
   await projectLead(
     input.lead_id, ev.seq,
@@ -1093,4 +1135,435 @@ export async function buildCallerContext(phone: string): Promise<CallerContext> 
     not_interested: staleRecs.map((s) => ({ project: s.project })),
     do_not_contact: !!person?.do_not_contact,
   };
+}
+
+// ─── Orchestrator context (§16 / §17) — the per-touch context layer ─────────
+//
+// The context orchestrator builds, for every outreach touch (a call or a
+// WhatsApp send), the exact STATE it hands the bot. This is a strict superset
+// of CallerContext (§6.3): it also carries prefs, identity, the last inbound
+// reply, primary_interest, a recent call/message summary, multi-project flags,
+// per-project not_interested_reason, and the RESOLVED decision.
+//
+// DESIGN (product-approved): the context stores person/lead STATE + prefs +
+// decision and POINTS to the active projects BY NAME — it never copies
+// KB/offer/inventory blobs (the bot loads those separately at reply time).
+// Keeps snapshots lean and avoids stale KB copies.
+//
+// It is STORED in three layers (all kept — §16):
+//   1. Timeline snapshot — a COMPACT context_snapshot on each call_scheduled /
+//      wa_outbound lead_event (see recordCallScheduled / recordMessage).
+//   2. orchestrator_context collection — one FULL doc per interaction + the
+//      resolved decision, keyed { person_id, lead_id, interaction_id, ts }.
+//   3. crm_leads.orchestrator_context — the LATEST built context (one-view).
+//
+// buildOrchestratorContext is READ-ONLY. storeOrchestratorContext performs the
+// writes (layers 2 + 3) and returns the compact snapshot for layer 1.
+
+export interface OrchestratorPrefs {
+  budget_min: number | string | null;
+  budget_max: number | string | null;
+  size: string | null;
+  config: string | null;
+  facing: string | null;
+  timeline: string | null;
+  purpose: string | null;
+}
+
+export interface OrchestratorProject {
+  project: string;
+  stage: string;
+  activation_type: ActivationType | null;
+  is_primary_caller: boolean;
+  flags: Required<ActivationFlags>;
+}
+
+export interface OrchestratorNotInterested {
+  project: string;
+  not_interested_reason: string | null;
+  activation_type: ActivationType | null;
+  /** terminal = an explicitly-declined active lead (stage not_interested/lost);
+   *  stale = a not-interested Inncircles sibling in stale_person_record. */
+  source: "terminal" | "stale";
+}
+
+export interface OrchestratorLastInbound {
+  text: string;
+  ts: string | null;
+  intent: string | null;
+  days_since: number | null;
+}
+
+export interface OrchestratorRecentSummary {
+  call_count: number;
+  connected_count: number;
+  last_call_outcome: string | null;
+  wa_in: number;
+  wa_out: number;
+  last_inbound_at: string | null;
+  last_outbound_at: string | null;
+}
+
+/** The resolved decision the orchestrator reached for this touch (which project
+ *  is being worked, on which channel, when, and why). Owned by the cadence /
+ *  reactive phases — Phase 2 just carries + stores it. */
+export interface OrchestratorDecision {
+  project: string | null;
+  next_action_type: "call" | "whatsapp" | null;
+  next_action_at: string | null;
+  reason: string | null;
+}
+
+export interface OrchestratorContext {
+  person_id: string;
+  phone: string;
+  name: string | null;
+  language: string | null;
+  do_not_contact: boolean;
+  prefs: OrchestratorPrefs;
+  primary_caller_lead_id: string | null;
+  /** The project currently being worked (primary caller), null if none. */
+  current: OrchestratorProject | null;
+  /** Other live projects for continuity (never re-pitch a declined one). */
+  other_active: OrchestratorProject[];
+  /** Declined projects WITH reason: terminal active leads + stale siblings. */
+  not_interested: OrchestratorNotInterested[];
+  is_multi_project: boolean;
+  active_project_count: number;
+  last_inbound: OrchestratorLastInbound | null;
+  /** Captured customer primary interest (§19.11) — drives focus once set. */
+  primary_interest: string | null;
+  recent: OrchestratorRecentSummary;
+  /** Human-readable recent-chat summary. Populated ONLY when the caller passes
+   *  includeConversationSummary; reads the LEGACY Zoho_Database whatsapp_messages
+   *  (read-only — NOT a write into the legacy DB). Left null by default so the
+   *  stored snapshot stays new-model-only. */
+  conversation_summary: string | null;
+  decision: OrchestratorDecision | null;
+  built_at: string;
+}
+
+/** The COMPACT projection embedded in the touch event (Layer 1). Kept small and
+ *  with the raw last-inbound text truncated, because it lands in the immutable,
+ *  never-TTL'd lead_events timeline (PII-sprawl guard, §19.5). */
+export interface OrchestratorContextSnapshot {
+  person_id: string;
+  current: { project: string; stage: string; activation_type: ActivationType | null } | null;
+  other_active: Array<{ project: string; stage: string }>;
+  not_interested: Array<{ project: string; not_interested_reason: string | null }>;
+  prefs: { budget_min: number | string | null; budget_max: number | string | null; size: string | null };
+  primary_interest: string | null;
+  last_inbound: { intent: string | null; days_since: number | null; text: string } | null;
+  is_multi_project: boolean;
+  active_project_count: number;
+  do_not_contact: boolean;
+  decision: OrchestratorDecision | null;
+  built_at: string;
+}
+
+function leadToProject(l: any, primaryId: string | null): OrchestratorProject {
+  return {
+    project: l.project,
+    stage: l.stage,
+    activation_type: l.activation_type ?? null,
+    is_primary_caller: l._id === primaryId,
+    flags: {
+      is_born_fresh: !!l.is_born_fresh,
+      is_reactivated: !!l.is_reactivated,
+      is_born_in_other_project: !!l.is_born_in_other_project,
+      is_bulk_transfer: !!l.is_bulk_transfer,
+    },
+  };
+}
+
+/** True for the two "declined" terminal stages that belong in not_interested[]
+ *  (booked/spam are terminal too but are NOT declines). */
+function isDeclinedStage(stage?: string | null): boolean {
+  return stage === "not_interested" || stage === "lost";
+}
+
+/**
+ * Build the full orchestrator context for a person (READ-ONLY — no writes).
+ *
+ * Reads persons + crm_leads (active) + stale_person_record + Intelligent_CRM
+ * messages (last inbound). Partitions active leads BY STAGE (not by is_active
+ * alone): a cadence-terminal not_interested/lost lead keeps is_active:true
+ * (§3.8), so relying on is_active would leak a declined project into
+ * other_active — instead declined active leads go into not_interested[] WITH
+ * their not_interested_reason, and stale siblings are a separate source.
+ *
+ * POINTS to projects by name only — no KB/inventory copied.
+ */
+export async function buildOrchestratorContext(
+  phone: string,
+  opts: { decision?: OrchestratorDecision; includeConversationSummary?: boolean } = {},
+): Promise<OrchestratorContext> {
+  const personId = personIdOf(phone);
+  const persons = await getCrmCollection(COL.PERSONS);
+  const leads = await getCrmCollection(COL.CRM_LEADS);
+  const stale = await getCrmCollection(COL.STALE_PERSON_RECORD);
+  const messages = await getCrmCollection(COL.CRM_MESSAGES);
+
+  const person = (await persons.findOne({ _id: personId } as any)) as any;
+  const active = (await leads.find({ person_id: personId, is_active: true } as any).toArray()) as any[];
+  const staleRecs = (await stale.find({ person_id: personId } as any).toArray()) as any[];
+
+  // Partition active leads by stage (see doc above).
+  const declined = active.filter((l) => isDeclinedStage(l.stage));
+  const workable = active.filter((l) => !isDeclinedStage(l.stage));
+
+  const primaryId =
+    person?.primary_caller_lead_id ?? workable.find((l) => l.is_primary_caller)?._id ?? null;
+  const primary = workable.find((l) => l._id === primaryId) || null;
+
+  const not_interested: OrchestratorNotInterested[] = [
+    ...declined.map((l) => ({
+      project: l.project,
+      not_interested_reason: l.not_interested_reason ?? null,
+      activation_type: (l.activation_type ?? null) as ActivationType | null,
+      source: "terminal" as const,
+    })),
+    ...staleRecs.map((s) => ({
+      project: s.project,
+      not_interested_reason: s.not_interested_reason ?? s.stale_reason ?? null,
+      activation_type: null,
+      source: "stale" as const,
+    })),
+  ];
+
+  // Last inbound from the NEW-model messages (index idx_msg_person_ts). We do
+  // NOT reuse getConversationContext for this because it reads the legacy
+  // Zoho_Database — the stored snapshot must stay Intelligent_CRM-only.
+  let last_inbound: OrchestratorLastInbound | null = null;
+  try {
+    const lastIn = (await messages.findOne(
+      { person_id: personId, direction: "inbound" } as any,
+      { sort: { ts: -1 } as any },
+    )) as any;
+    if (lastIn) {
+      const tsIso: string | null = lastIn.ts ?? lastIn.created_at ?? null;
+      const daysSince =
+        tsIso && ts(tsIso) !== -Infinity
+          ? Math.floor((Date.now() - new Date(tsIso).getTime()) / 86400000)
+          : null;
+      last_inbound = {
+        text: String(lastIn.body ?? "").slice(0, 500),
+        ts: tsIso,
+        intent: lastIn.intent ?? null,
+        days_since: daysSince,
+      };
+    }
+  } catch (err: any) {
+    console.error(`[crm_model] buildOrchestratorContext last_inbound failed: ${err.message}`);
+  }
+
+  const counters = (primary?.counters ?? {}) as any;
+  const last = (primary?.last ?? {}) as any;
+  const prefs = (person?.prefs ?? {}) as any;
+
+  const activeCount = Array.isArray(person?.active_lead_ids)
+    ? person.active_lead_ids.length
+    : active.length;
+
+  // Optional human-readable summary (legacy read — see field doc).
+  let conversation_summary: string | null = null;
+  if (opts.includeConversationSummary) {
+    try {
+      const conv = await getConversationContext(phone);
+      conversation_summary = conv.formatted;
+    } catch (err: any) {
+      console.error(`[crm_model] buildOrchestratorContext conv summary failed: ${err.message}`);
+    }
+  }
+
+  return {
+    person_id: personId,
+    phone: digits(phone) || personId,
+    name: person?.name ?? null,
+    language: person?.language ?? null,
+    do_not_contact: !!person?.do_not_contact,
+    prefs: {
+      budget_min: prefs.budget_min ?? null,
+      budget_max: prefs.budget_max ?? null,
+      size: prefs.size ?? null,
+      config: prefs.config ?? null,
+      facing: prefs.facing ?? null,
+      timeline: prefs.timeline ?? null,
+      purpose: prefs.purpose ?? null,
+    },
+    primary_caller_lead_id: primaryId,
+    current: primary ? leadToProject(primary, primaryId) : null,
+    other_active: workable
+      .filter((l) => l._id !== primaryId)
+      .map((l) => leadToProject(l, primaryId)),
+    not_interested,
+    is_multi_project: activeCount > 1,
+    active_project_count: activeCount,
+    last_inbound,
+    primary_interest:
+      primary?.primary_interest ?? workable.find((l) => l.primary_interest)?.primary_interest ?? null,
+    recent: {
+      call_count: counters.call_count ?? 0,
+      connected_count: counters.connected_count ?? 0,
+      last_call_outcome: last.call_outcome ?? null,
+      wa_in: counters.wa_in ?? 0,
+      wa_out: counters.wa_out ?? 0,
+      last_inbound_at: last.inbound_at ?? null,
+      last_outbound_at: last.outbound_at ?? null,
+    },
+    conversation_summary,
+    decision: opts.decision ?? null,
+    built_at: nowISO(),
+  };
+}
+
+/** Compact a full context down to the Layer-1 event snapshot (truncates the raw
+ *  last-inbound text — it lands in the permanent, never-deleted timeline). */
+export function compactSnapshot(ctx: OrchestratorContext): OrchestratorContextSnapshot {
+  return {
+    person_id: ctx.person_id,
+    current: ctx.current
+      ? { project: ctx.current.project, stage: ctx.current.stage, activation_type: ctx.current.activation_type }
+      : null,
+    other_active: ctx.other_active.map((p) => ({ project: p.project, stage: p.stage })),
+    not_interested: ctx.not_interested.map((n) => ({
+      project: n.project,
+      // Truncated: this lands in the permanent, never-deleted Layer-1 timeline —
+      // keep free-text reasons bounded so a long future reason can't bloat every event.
+      not_interested_reason: n.not_interested_reason == null ? n.not_interested_reason : String(n.not_interested_reason).slice(0, 120),
+    })),
+    prefs: { budget_min: ctx.prefs.budget_min, budget_max: ctx.prefs.budget_max, size: ctx.prefs.size },
+    primary_interest: ctx.primary_interest,
+    last_inbound: ctx.last_inbound
+      ? {
+          intent: ctx.last_inbound.intent,
+          days_since: ctx.last_inbound.days_since,
+          text: String(ctx.last_inbound.text ?? "").slice(0, 120),
+        }
+      : null,
+    is_multi_project: ctx.is_multi_project,
+    active_project_count: ctx.active_project_count,
+    do_not_contact: ctx.do_not_contact,
+    decision: ctx.decision ?? null,
+    built_at: ctx.built_at,
+  };
+}
+
+export interface StoreOrchestratorContextOpts {
+  /** Stable id for THIS touch — dedupes a retried store (no double doc/event). */
+  interaction_id: string;
+  /** The lead being worked (its crm_leads doc caches the latest context). */
+  lead_id: string;
+  touch_type: "call" | "whatsapp";
+  person_id?: string;
+  ts?: string;
+  /** The resolved decision to embed in the stored context. Falls back to
+   *  ctx.decision if omitted. */
+  decision?: OrchestratorDecision;
+}
+
+/**
+ * Store the built context across §16's three layers and return the compact
+ * snapshot for the emitting event (Layer 1). Idempotent + golden-rule safe:
+ *   • Layer 2: upserts ONE orchestrator_context doc keyed by interaction_id
+ *     (== _id) via $setOnInsert — a retry does NOT create a second doc.
+ *   • Layer 3: $sets crm_leads.orchestrator_context = the latest context.
+ *   • Returns compactSnapshot(ctx) so the caller can pass it as
+ *     context_snapshot into recordCallScheduled / recordMessage (Layer 1).
+ *
+ * Does NOT append any event itself — the touch event (call_scheduled /
+ * wa_outbound) carries the Layer-1 snapshot and stays the single source of the
+ * counter $inc, avoiding a double-count on retry.
+ */
+export async function storeOrchestratorContext(
+  ctx: OrchestratorContext,
+  opts: StoreOrchestratorContextOpts,
+): Promise<OrchestratorContextSnapshot> {
+  if (!opts.interaction_id) throw new Error("storeOrchestratorContext: empty interaction_id");
+  void ensureCrmIndexes();
+
+  const interactionId = opts.interaction_id;
+  const leadId = opts.lead_id;
+  const personId = opts.person_id || ctx.person_id;
+  const tsIso = opts.ts ? new Date(opts.ts).toISOString() : nowISO();
+  const decision = opts.decision ?? ctx.decision ?? null;
+  const fullCtx: OrchestratorContext = { ...ctx, decision };
+
+  // Layer 2 — dedicated collection, idempotent by interaction_id (== _id).
+  const col = await getCrmCollection(COL.ORCHESTRATOR_CONTEXT);
+  try {
+    await col.updateOne(
+      { _id: interactionId } as any,
+      {
+        $setOnInsert: {
+          _id: interactionId,
+          interaction_id: interactionId,
+          person_id: personId,
+          lead_id: leadId,
+          touch_type: opts.touch_type,
+          ts: tsIso,
+          context: fullCtx,
+          decision,
+          created_at: nowISO(),
+        },
+      },
+      { upsert: true },
+    );
+  } catch (err: any) {
+    // Two truly-concurrent stores with the same interaction_id can both miss the
+    // upsert and race to insert; the loser hits E11000. The doc already exists
+    // (dedupe held), so a duplicate-key is the intended idempotent no-op — swallow
+    // it. Anything else is a real error and rethrows.
+    if (err?.code !== 11000) throw err;
+  }
+
+  // Layer 3 — cache the latest built context on the lead for the one-view.
+  if (leadId) {
+    const leads = await getCrmCollection(COL.CRM_LEADS);
+    await leads.updateOne(
+      { _id: leadId } as any,
+      {
+        $set: {
+          orchestrator_context: {
+            ...fullCtx,
+            interaction_id: interactionId,
+            touch_type: opts.touch_type,
+            ts: tsIso,
+          },
+          updated_at: nowISO(),
+        },
+      },
+      { upsert: false },
+    );
+  }
+
+  // Layer 1 — the caller embeds this into the touch event.
+  return compactSnapshot(fullCtx);
+}
+
+/**
+ * Capture the customer's primary interest (§19.11): sets crm_leads.primary_interest
+ * and appends a note event. The posthook / reactive-bot phase calls this after
+ * the bot asks "which project are you most interested in". No-op if unchanged.
+ * (Focus/call-track shifting to that project is the cadence phase's job.)
+ */
+export async function setPrimaryInterest(
+  leadId: string,
+  project: string,
+  opts: TransitionOpts = {},
+): Promise<{ changed: boolean }> {
+  const leads = await getCrmCollection(COL.CRM_LEADS);
+  const cur = (await leads.findOne({ _id: leadId } as any)) as any;
+  if (!cur) return { changed: false };
+  const norm = normProject(project);
+  if (cur.primary_interest === norm) return { changed: false };
+
+  const ev = await appendEvent({
+    lead_id: leadId, person_id: cur.person_id, project: cur.project,
+    type: "note", actor: opts.actor ?? "bot", channel: opts.channel ?? "crm",
+    reason: opts.reason ?? `primary interest captured → ${norm}`,
+    data: { primary_interest: norm },
+  });
+  await projectLead(leadId, ev.seq, { primary_interest: norm });
+  return { changed: true };
 }

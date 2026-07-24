@@ -97,6 +97,12 @@ export const COL = {
    *  (see automation_freeze.ts). TTL-indexed on `at` so it auto-expires (30d)
    *  and never bloats. `at` MUST be a BSON Date for the TTL to fire. */
   FROZEN_INBOX:       "frozen_inbox",
+  /** orchestrator_context — one doc per outreach interaction (call / WhatsApp).
+   *  Holds the FULL/heavy context the orchestrator handed the bot for THAT
+   *  touch + the resolved decision (Layer 2 of §16). Keyed { person_id, lead_id,
+   *  interaction_id, ts }; interaction_id is the _id so a retried store dedupes.
+   *  History kept forever (no TTL). */
+  ORCHESTRATOR_CONTEXT: "orchestrator_context",
 } as const;
 
 // ─── Cached client (shared across warm Vercel invocations) ────────────────
