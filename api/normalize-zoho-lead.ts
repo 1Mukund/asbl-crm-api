@@ -49,21 +49,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const mlid = await getOrCreateMLID(mobile);
     const plid = await getOrCreatePLID(mobile, mlid, project);
 
-    // ── 5. Update Zoho lead with normalized fields ─────────────────────────────
-    await updateLead(zohoLeadId, {
-      Mobile:           mobile,
-      First_Name:       first_name,
-      Last_Name:        last_name,
-      Lead_Source:      leadSource,
-      Master_Lead_ID:   mlid,
-      Project_Lead_ID:  plid,
-      ASBL_Project:     project,
-      Campaign_Name:    campaignName,
-      ...(email ? { Email: email } : {}),
-    });
-
-    // ── 6. UPSERT into Mongo `leads` so dedup + cron + PRD all see this lead ──
-    // Was skipped previously → 36 LeadChain leads existed in Zoho but not in Mongo.
+    // ── 5. MONGO-FIRST: upsert into Mongo `leads` before the Zoho write ──────
+    // Mongo is the source of truth — persist the normalized lead here first so
+    // dedup + cron + PRD + the in-house CRM see it even if the Zoho PATCH fails.
+    // (Was skipped previously → 36 LeadChain leads existed in Zoho but not Mongo;
+    // and previously the Zoho write was blocking, so a Zoho outage lost the Mongo
+    // write entirely.)
     const normalized: NormalizedLead = {
       first_name,
       last_name,
@@ -79,6 +70,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       await upsertLead(normalized, mlid, plid, zohoLeadId, true);
     } catch (err: any) {
       console.error(`[normalize-zoho-lead] upsertLead failed: ${err.message}`);
+    }
+
+    // ── 6. Best-effort Zoho normalize (non-blocking — Mongo already durable) ──
+    try {
+      await updateLead(zohoLeadId, {
+        Mobile:           mobile,
+        First_Name:       first_name,
+        Last_Name:        last_name,
+        Lead_Source:      leadSource,
+        Master_Lead_ID:   mlid,
+        Project_Lead_ID:  plid,
+        ASBL_Project:     project,
+        Campaign_Name:    campaignName,
+        ...(email ? { Email: email } : {}),
+      });
+    } catch (err: any) {
+      console.error(`[normalize-zoho-lead] Zoho updateLead failed (Mongo already authoritative): ${err.message}`);
     }
 
     // ── 7. PRD T=0 fanout — DISABLED 2026-05-28 ────────────────────────────

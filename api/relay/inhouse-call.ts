@@ -85,7 +85,7 @@ async function triggerInHouseBot(
     external_customer_id?: string;
     metadata?: Record<string, any>;
   },
-): Promise<{ ok: boolean; status: number; data: any; call_id: string }> {
+): Promise<{ ok: boolean; deferred: boolean; status: number; data: any; call_id: string }> {
   const payload: any = { to: phone };
   if (ctx.customer_name)        payload.customer_name = ctx.customer_name;
   if (ctx.external_schedule_id) payload.external_schedule_id = ctx.external_schedule_id;
@@ -113,7 +113,7 @@ async function triggerInHouseBot(
     });
   } catch (err: any) {
     console.error(`[InHouse Call] voice-bot fetch aborted/failed (${VOICEBOT_URL}): ${err?.message}`);
-    return { ok: false, status: 0, data: { error: String(err?.message || err) }, call_id: "" };
+    return { ok: false, deferred: false, status: 0, data: { error: String(err?.message || err) }, call_id: "" };
   } finally {
     clearTimeout(timer);
   }
@@ -121,8 +121,13 @@ async function triggerInHouseBot(
   const d = (data as any) || {};
   // Normalise: success flag from either shape; call_id from either field.
   const okFlag = r.ok && (d.success === true || d.ok === true);
+  // NIGHT_DEFERRED: for +91 leads dialed 9pm-6am IST, the voice-bot does NOT
+  // dial now — it re-places the SAME call itself in the morning window
+  // (8-11:30am IST), keeping our external_schedule_id. It's HANDLED, not a
+  // failure, and MUST NOT be retried (else the customer gets two morning calls).
+  const deferred = r.ok && d.error_code === "NIGHT_DEFERRED";
   const callId = String(d.call_id || d.requestUuid || d.external_schedule_id || "");
-  return { ok: okFlag, status: r.status, data, call_id: callId };
+  return { ok: okFlag, deferred, status: r.status, data, call_id: callId };
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -190,6 +195,33 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       external_customer_id: externalCustomerId || undefined,
       metadata: Object.keys(metadata).length ? metadata : undefined,
     });
+    // NIGHT_DEFERRED — voice-bot rescheduled this +91 night-time dial to the
+    // morning window itself. HANDLED, not a failure. Stamp the stable
+    // correlation key (external_schedule_id) so the morning call_completed
+    // posthook still maps back to this lead, then return a clean success so
+    // NOTHING downstream treats it as an error or retries it.
+    if (result.deferred) {
+      console.log(
+        `[InHouse Call] NIGHT_DEFERRED — voice-bot will re-dial ${phone} in the morning window ` +
+        `(lead=${zohoLeadId || "(none)"}, external_schedule_id=${externalScheduleId || "(none)"}).`,
+      );
+      if (zohoLeadId && externalScheduleId) {
+        const fields: Record<string, any> = { Last_Arrowhead_Call_ID: externalScheduleId };
+        await updateLead(zohoLeadId, fields).catch((e) =>
+          console.error(`[InHouse Call] NIGHT_DEFERRED stamp failed: ${e.message}`),
+        );
+        await mirrorLeadStateToMongo(zohoLeadId, fields).catch(() => {});
+      }
+      return res.status(200).json({
+        success: true,
+        deferred: true,
+        reason: "NIGHT_DEFERRED",
+        scheduled_for: (result.data as any)?.error_message || "morning window (IST)",
+        external_schedule_id: externalScheduleId,
+        to: phone,
+      });
+    }
+
     if (!result.ok) {
       console.error(`[InHouse Call] Voice-bot trigger failed (${result.status}):`, result.data);
       return res.status(result.status || 500).json({

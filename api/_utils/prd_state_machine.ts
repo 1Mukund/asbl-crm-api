@@ -194,33 +194,44 @@ export async function transitionStage(input: TransitionInput): Promise<Transitio
   // PRD section 9: Not Interested stage → terminal cleanup
   // PRD section 8.6: Pre Site Visit → track Site_Visit_Date upstream
 
+  // ── MONGO-FIRST: Mongo `leads` is the source of truth ────────────────────
+  // Write the new state into Mongo FIRST; the transition is "applied" once this
+  // lands. Zoho is then updated best-effort (non-blocking) so it stays in sync
+  // while it's live, but a Zoho outage no longer loses the state change or fails
+  // the transition. Downstream cadence/CRM readers key off the Mongo doc.
   try {
-    await updateLead(input.leadId, updates);
-    // Mirror to Mongo — every state transition (Stage/Status/extraFields)
-    // also lands in the Mongo `leads` doc for downstream readers.
     await mirrorLeadStateToMongo(input.leadId, updates);
-    console.log(
-      `[PRD State] Lead ${input.leadId}: → ${targetStage}/${targetStatus || "(terminal)"} ` +
-      `reason=${effectiveReason}`,
-    );
-    return {
-      ok: true,
-      applied: true,
-      finalStage: targetStage,
-      finalStatus: targetStatus,
-      reason: effectiveReason,
-    };
-  } catch (err: any) {
-    console.error(`[PRD State] Transition failed for lead ${input.leadId}: ${err.message}`);
+  } catch (mErr: any) {
+    console.error(`[PRD State] Mongo mirror FAILED for lead ${input.leadId}: ${mErr.message}`);
     return {
       ok: false,
       applied: false,
       finalStage: targetStage,
       finalStatus: targetStatus,
       reason: effectiveReason,
-      message: err.message,
+      message: mErr.message,
     };
   }
+
+  // Best-effort Zoho write — kept in sync as long as Zoho is reachable, but it
+  // is NOT authoritative and its failure never fails the transition.
+  try {
+    await updateLead(input.leadId, updates);
+  } catch (zErr: any) {
+    console.error(`[PRD State] Zoho update failed (Mongo already authoritative) for lead ${input.leadId}: ${zErr.message}`);
+  }
+
+  console.log(
+    `[PRD State] Lead ${input.leadId}: → ${targetStage}/${targetStatus || "(terminal)"} ` +
+    `reason=${effectiveReason}`,
+  );
+  return {
+    ok: true,
+    applied: true,
+    finalStage: targetStage,
+    finalStatus: targetStatus,
+    reason: effectiveReason,
+  };
 }
 
 // ─── Convenience helpers — common transitions ────────────────────────────

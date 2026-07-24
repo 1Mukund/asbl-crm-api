@@ -403,19 +403,35 @@ async function findLeadDetailsByPhone(phone: string, token: string): Promise<Lea
   return null;
 }
 
-// ── Zoho: Update lead intent ──────────────────────────────────────────────────
+// ── Update lead intent — MONGO-FIRST, then best-effort Zoho ───────────────────
 async function updateZohoIntent(leadId: string, intent: string, token: string): Promise<void> {
-  await fetch(`${ZOHO_API_BASE}/Leads`, {
-    method: "PATCH",
-    headers: {
-      Authorization: `Zoho-oauthtoken ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      data: [{ id: leadId, Last_Intent: intent, Whatsapp_Replied: true }],
-    }),
-  });
-  console.log(`[Periskope Webhook] Zoho updated — Lead ${leadId}: Last_Intent=${intent}`);
+  const fields = {
+    Last_Intent: intent,
+    Whatsapp_Replied: true,
+    Last_Whatsapp_At: new Date().toISOString().replace(/\.\d{3}Z$/, "+00:00"),
+  };
+  // Mongo is the source of truth — mirror the intent state there first so the
+  // in-house CRM sees it even if Zoho is unreachable. Non-blocking.
+  try {
+    const { mirrorLeadStateToMongo } = await import("../_utils/supabase");
+    await mirrorLeadStateToMongo(leadId, fields);
+  } catch (err: any) {
+    console.error(`[Periskope Webhook] Mongo intent mirror failed for ${leadId}: ${err.message}`);
+  }
+  // Best-effort Zoho write (kept in sync while Zoho is live; never blocks reply).
+  try {
+    await fetch(`${ZOHO_API_BASE}/Leads`, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Zoho-oauthtoken ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ data: [{ id: leadId, ...fields }] }),
+    });
+    console.log(`[Periskope Webhook] Zoho updated — Lead ${leadId}: Last_Intent=${intent}`);
+  } catch (err: any) {
+    console.error(`[Periskope Webhook] Zoho intent update failed (Mongo already authoritative) for ${leadId}: ${err.message}`);
+  }
 }
 
 // ── Callback trigger — fires voice-bot call when customer asks for callback ──

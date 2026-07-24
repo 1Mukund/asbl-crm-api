@@ -33,9 +33,11 @@ export async function isAutomationFrozen(): Promise<boolean> {
  */
 export async function archiveFrozen(kind: string, payload: any): Promise<void> {
   try {
-    const { getCollection } = await import("./mongo");
-    const col = await getCollection("frozen_inbox" as any);
-    await col.insertOne({ kind, payload, at: new Date().toISOString() } as any);
+    const { getCollection, COL } = await import("./mongo");
+    const col = await getCollection(COL.FROZEN_INBOX);
+    // `at` MUST be a BSON Date (not an ISO string) so the TTL index on
+    // frozen_inbox actually expires rows — Mongo skips string-valued TTL fields.
+    await col.insertOne({ kind, payload, at: new Date() } as any);
   } catch (err: any) {
     console.error(`[freeze] archiveFrozen(${kind}) failed: ${err?.message}`);
   }

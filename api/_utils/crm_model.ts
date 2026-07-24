@@ -1,0 +1,1039 @@
+/**
+ * crm_model.ts — Event-sourced CRM write helpers (rebuild v1).
+ * ============================================================
+ *
+ * Implements the APPROVED database architecture:
+ *
+ *   persons              — 1 per phone (identity + running profile)
+ *   crm_leads            — current-state projection, 1 per person×project
+ *   lead_events          — APPEND-ONLY immutable timeline (the design's heart)
+ *   calls                — 1 doc per dial
+ *   messages             — WhatsApp in/out, phone-level
+ *   site_visits          — 1 doc per booking
+ *   stale_person_record  — not-interested Inncircles siblings (hidden)
+ *
+ * Two layers:
+ *   • HISTORY  = lead_events. Every state change appends ONE immutable row.
+ *                Never updated, never deleted. "Sab dikhta hai."
+ *   • NOW      = crm_leads / persons. Rebuilt (projected) from events after
+ *                each append. Fast reads + dashboards + cron.
+ *
+ * THE GOLDEN RULE (see appendEvent): a lead's state NEVER changes without an
+ * event. Every public mutator here does (a) appendEvent, then (b) project the
+ * current-state doc. Callers should go through these helpers, never poke the
+ * collections directly.
+ *
+ * Isolation: the current-state collection is COL.CRM_LEADS ("crm_leads"), NOT
+ * the legacy COL.LEADS ("leads") flat Zoho mirror — the two coexist during the
+ * rebuild so nothing in the (frozen) automation is disturbed.
+ *
+ * Everything is best-effort-safe: helpers throw only on programmer error
+ * (missing ids); call sites that must not fail ingest wrap in try/catch.
+ */
+
+import { getCollection, getNextSequence, COL } from "./mongo";
+
+// ─── Enums (string unions + runtime arrays) ────────────────────────────────
+
+export type Stage =
+  | "new" | "contacted" | "engaged" | "qualified"
+  | "visit_scheduled" | "visit_done" | "negotiation" | "booked"
+  | "not_interested" | "lost" | "spam";
+
+export type Status =
+  | "never_contacted" | "attempting" | "connected" | "unreachable" | "dnd";
+
+export type EventType =
+  | "lead_created" | "stage_change" | "status_change"
+  | "call_scheduled" | "call_completed"
+  | "wa_inbound" | "wa_outbound" | "doc_sent"
+  | "visit_booked" | "visit_done"
+  | "activation" | "primary_caller_shifted"
+  | "assignment" | "note" | "system";
+
+export type Actor = "system" | "cron" | "bot" | "customer" | (string & {}); // rm:<id>
+export type Channel = "call" | "whatsapp" | "crm" | "system";
+
+export type ActivationType = "fresh" | "reactivated" | "born_in_other" | "bulk";
+
+/** Terminal stages — no automation past these. */
+export const TERMINAL_STAGES: Stage[] = ["booked", "not_interested", "lost", "spam"];
+/** Milestone (sticky) stages — automation must not drop the lead below these. */
+export const MILESTONE_STAGES: Stage[] = ["visit_scheduled", "visit_done", "negotiation", "booked"];
+
+export function isTerminalStage(s?: string | null): boolean {
+  return !!s && (TERMINAL_STAGES as string[]).includes(s);
+}
+
+// ─── Small utils ───────────────────────────────────────────────────────────
+
+function digits(p?: string | null): string {
+  return String(p || "").replace(/\D/g, "");
+}
+export function normProject(p?: string | null): string {
+  const v = String(p || "UNKNOWN").trim().toUpperCase();
+  return v || "UNKNOWN";
+}
+export function personIdOf(phone: string): string {
+  return digits(phone);
+}
+export function leadIdOf(personId: string, project?: string | null): string {
+  return `${personId}:${normProject(project)}`;
+}
+function nowISO(): string {
+  return new Date().toISOString();
+}
+/** Best-effort → epoch ms for ordering. null/invalid → -Infinity. */
+function ts(v: any): number {
+  if (!v) return -Infinity;
+  const t = new Date(v).getTime();
+  return Number.isNaN(t) ? -Infinity : t;
+}
+
+// ─── Index management (idempotent, guarded) ────────────────────────────────
+
+/**
+ * Create every index in the approved indexing plan. createIndex is idempotent
+ * so this is a no-op once built; guarded by a per-warm-instance flag so only
+ * the first model write touches it. Never throws to the caller.
+ */
+export async function ensureCrmIndexes(): Promise<void> {
+  const G = globalThis as any;
+  if (G.__crmIdxEnsured) return;
+  G.__crmIdxEnsured = true;
+  try {
+    const [persons, leads, events, calls, messages, visits, stale, frozen] = await Promise.all([
+      getCollection(COL.PERSONS),
+      getCollection(COL.CRM_LEADS),
+      getCollection(COL.LEAD_EVENTS),
+      getCollection(COL.CALLS),
+      getCollection(COL.CRM_MESSAGES),
+      getCollection(COL.SITE_VISITS),
+      getCollection(COL.STALE_PERSON_RECORD),
+      getCollection(COL.FROZEN_INBOX),
+    ]);
+    await Promise.all([
+      // persons ( _id (phone) is the automatic unique index )
+      persons.createIndex({ primary_caller_lead_id: 1 }, { name: "idx_persons_primary" }),
+      // crm_leads
+      leads.createIndex({ person_id: 1 }, { name: "idx_leads_person" }),
+      leads.createIndex({ stage: 1, next_action_at: 1 }, { name: "idx_leads_stage_next" }),
+      // Both is_primary (arch's documented cron query) and is_primary_caller
+      // (the semantic call-track flag) are kept in sync on the doc; index both
+      // so whichever the cron filters on hits an index — never a full scan.
+      leads.createIndex({ is_primary: 1, next_action_at: 1 }, { name: "idx_leads_primary_next" }),
+      leads.createIndex({ is_primary_caller: 1, next_action_at: 1 }, { name: "idx_leads_primarycaller_next" }),
+      leads.createIndex({ "external.zoho_lead_id": 1 }, { name: "idx_leads_zoho", sparse: true }),
+      // lead_events — {lead_id,seq} unique is the single most important index
+      events.createIndex({ lead_id: 1, seq: 1 }, { name: "idx_events_lead_seq", unique: true }),
+      events.createIndex({ person_id: 1, ts: 1 }, { name: "idx_events_person_ts" }),
+      events.createIndex({ type: 1, ts: 1 }, { name: "idx_events_type_ts" }),
+      events.createIndex({ lead_id: 1, type: 1, ts: 1 }, { name: "idx_events_lead_type_ts" }),
+      // calls
+      calls.createIndex({ lead_id: 1 }, { name: "idx_calls_lead" }),
+      calls.createIndex({ outcome: 1, dialed_at: 1 }, { name: "idx_calls_outcome_dialed" }),
+      calls.createIndex({ scheduled_at: 1 }, { name: "idx_calls_scheduled" }),
+      // messages
+      messages.createIndex({ person_id: 1, ts: -1 }, { name: "idx_msg_person_ts" }),
+      messages.createIndex({ direction: 1, ts: 1 }, { name: "idx_msg_dir_ts" }),
+      // site_visits
+      visits.createIndex({ lead_id: 1 }, { name: "idx_visits_lead" }),
+      visits.createIndex({ status: 1, scheduled_for: 1 }, { name: "idx_visits_status_for" }),
+      // stale_person_record
+      stale.createIndex({ person_id: 1 }, { name: "idx_stale_person" }),
+      stale.createIndex({ person_id: 1, inncircles_born_date: 1 }, { name: "idx_stale_person_born" }),
+      // frozen_inbox — TTL (30d). Requires `at` to be a BSON Date (see
+      // automation_freeze.archiveFrozen); Mongo ignores string-valued fields
+      // for TTL expiry.
+      frozen.createIndex({ at: 1 }, { name: "idx_frozen_ttl", expireAfterSeconds: 2592000 }),
+    ]);
+  } catch (err: any) {
+    (globalThis as any).__crmIdxEnsured = false; // allow a later retry
+    console.error(`[crm_model] ensureCrmIndexes failed: ${err.message}`);
+  }
+}
+
+/** Force-(re)create every CRM index now; returns names per collection. Backs
+ *  the admin ensure-crm-indexes flow — immediate + verifiable. */
+export async function ensureCrmIndexesNow(): Promise<Record<string, string[]>> {
+  (globalThis as any).__crmIdxEnsured = false;
+  await ensureCrmIndexes();
+  const out: Record<string, string[]> = {};
+  for (const name of [
+    COL.PERSONS, COL.CRM_LEADS, COL.LEAD_EVENTS, COL.CALLS,
+    COL.CRM_MESSAGES, COL.SITE_VISITS, COL.STALE_PERSON_RECORD, COL.FROZEN_INBOX,
+  ]) {
+    try {
+      const col = await getCollection(name);
+      const idx = await col.listIndexes().toArray();
+      out[name] = idx.map((i: any) => i.name);
+    } catch (err: any) {
+      out[name] = [`error: ${err.message}`];
+    }
+  }
+  return out;
+}
+
+// ─── lead_events — the append-only writer ──────────────────────────────────
+
+export interface EventInput {
+  lead_id: string;
+  person_id: string;
+  project: string;
+  type: EventType;
+  ts?: Date | string;
+  actor?: Actor;
+  channel?: Channel;
+  from?: { stage?: string; status?: string };
+  to?: { stage?: string; status?: string };
+  reason?: string;
+  ref?: string;
+  data?: Record<string, any>;
+}
+
+export interface EventDoc extends EventInput {
+  seq: number;
+  ts: string;
+}
+
+/**
+ * Append ONE immutable event to lead_events. Allocates a per-lead monotonic
+ * `seq` via the atomic _counters collection (unique {lead_id,seq} index also
+ * blocks accidental duplicates). This is the ONLY function that writes events;
+ * it never updates or deletes. Returns the persisted event (with its seq).
+ */
+export async function appendEvent(evt: EventInput): Promise<EventDoc> {
+  if (!evt.lead_id) throw new Error("appendEvent: empty lead_id");
+  void ensureCrmIndexes();
+  const seq = await getNextSequence(`crm_ev:${evt.lead_id}`, 1);
+  const doc: any = {
+    lead_id: evt.lead_id,
+    person_id: evt.person_id,
+    project: evt.project,
+    seq,
+    ts: evt.ts ? new Date(evt.ts).toISOString() : nowISO(),
+    type: evt.type,
+    actor: evt.actor ?? "system",
+    channel: evt.channel ?? "system",
+  };
+  if (evt.from) doc.from = evt.from;
+  if (evt.to) doc.to = evt.to;
+  if (evt.reason) doc.reason = evt.reason;
+  if (evt.ref) doc.ref = evt.ref;
+  if (evt.data) doc.data = evt.data;
+  const col = await getCollection(COL.LEAD_EVENTS);
+  await col.insertOne(doc as any);
+  return doc as EventDoc;
+}
+
+/** Read a lead's full timeline in order. */
+export async function getLeadTimeline(leadId: string): Promise<EventDoc[]> {
+  const col = await getCollection(COL.LEAD_EVENTS);
+  return (await col.find({ lead_id: leadId } as any).sort({ seq: 1 }).toArray()) as any;
+}
+
+// ─── projection helper ─────────────────────────────────────────────────────
+
+/** Apply a projection update to the crm_leads current-state doc. `seq` marks
+ *  how far the projection has advanced (via $max so it's monotonic). */
+async function projectLead(
+  leadId: string,
+  seq: number,
+  set: Record<string, any>,
+  inc?: Record<string, number>,
+): Promise<void> {
+  const col = await getCollection(COL.CRM_LEADS);
+  const update: any = {
+    $set: { ...set, updated_at: nowISO() },
+    $max: { event_seq: seq },
+  };
+  if (inc && Object.keys(inc).length) update.$inc = inc;
+  await col.updateOne({ _id: leadId } as any, update, { upsert: false });
+}
+
+// ─── persons ───────────────────────────────────────────────────────────────
+
+export interface PersonInput {
+  phone: string;
+  name?: string;
+  email?: string;
+  language?: string;
+  prefs?: Record<string, any>; // budget_min, budget_max, size, config, facing, timeline, purpose
+  project?: string;            // enquiry project → denorm into persons.projects[]
+}
+
+/** Upsert the person (phone-level). Never overwrites known fields with blanks;
+ *  accumulates emails + projects via $addToSet; merges prefs. */
+export async function upsertPerson(input: PersonInput): Promise<string> {
+  const personId = personIdOf(input.phone);
+  if (!personId) throw new Error("upsertPerson: empty phone");
+  void ensureCrmIndexes();
+  const now = nowISO();
+
+  const set: Record<string, any> = { updated_at: now };
+  if (input.name && input.name.trim()) set.name = input.name.trim();
+  if (input.language) set.language = input.language;
+  if (input.prefs) {
+    for (const [k, v] of Object.entries(input.prefs)) {
+      if (v !== undefined && v !== null && v !== "") set[`prefs.${k}`] = v;
+    }
+  }
+  const addToSet: Record<string, any> = {};
+  if (input.email && input.email.trim()) addToSet.emails = input.email.trim().toLowerCase();
+  if (input.project) addToSet.projects = normProject(input.project);
+
+  const update: any = {
+    $setOnInsert: { _id: personId, first_seen_at: now, do_not_contact: false },
+    $set: set,
+  };
+  if (Object.keys(addToSet).length) update.$addToSet = addToSet;
+
+  const col = await getCollection(COL.PERSONS);
+  await col.updateOne({ _id: personId } as any, update, { upsert: true });
+  return personId;
+}
+
+// ─── Inncircles activation classification ──────────────────────────────────
+
+export interface ActivationFlags {
+  is_born_fresh?: boolean;
+  is_reactivated?: boolean;
+  is_born_in_other_project?: boolean;
+  is_bulk_transfer?: boolean;
+}
+
+export interface Classification {
+  active: boolean;
+  activation_type: ActivationType | null;
+  /** the four flags, coerced to explicit booleans for storage */
+  flags: Required<ActivationFlags>;
+  stale_reason: "not_interested_sibling" | null;
+}
+
+/**
+ * The Inncircles rule. Each of the 4 activation flags => active + callable
+ * (they differ only in "why", captured as activation_type). All four false
+ * (an explicit not-interested sibling) => stale_person_record. Missing flags
+ * entirely (non-Inncircles source: website/meta/fim, or Inncircles omitting
+ * them) => treat as a normal fresh active lead.
+ *
+ * When (defensively) more than one flag is true, priority is
+ * fresh > reactivated > born_in_other > bulk.
+ */
+export function classifyActivation(flags?: ActivationFlags | null): Classification {
+  const f = flags || {};
+  const fresh = f.is_born_fresh === true;
+  const react = f.is_reactivated === true;
+  const other = f.is_born_in_other_project === true;
+  const bulk = f.is_bulk_transfer === true;
+
+  const coerced: Required<ActivationFlags> = {
+    is_born_fresh: fresh,
+    is_reactivated: react,
+    is_born_in_other_project: other,
+    is_bulk_transfer: bulk,
+  };
+
+  if (fresh) return { active: true, activation_type: "fresh", flags: coerced, stale_reason: null };
+  if (react) return { active: true, activation_type: "reactivated", flags: coerced, stale_reason: null };
+  if (other) return { active: true, activation_type: "born_in_other", flags: coerced, stale_reason: null };
+  if (bulk) return { active: true, activation_type: "bulk", flags: coerced, stale_reason: null };
+
+  // No flag true. Distinguish "explicit all-false" (Inncircles sibling → stale)
+  // from "no flag info at all" (normal source → fresh active).
+  const anyProvided =
+    f.is_born_fresh !== undefined || f.is_reactivated !== undefined ||
+    f.is_born_in_other_project !== undefined || f.is_bulk_transfer !== undefined;
+
+  if (anyProvided) {
+    // present but all false → not-interested sibling → stale
+    return { active: false, activation_type: null, flags: coerced, stale_reason: "not_interested_sibling" };
+  }
+  // no flags supplied → a plain new enquiry, active as "fresh"
+  return { active: true, activation_type: "fresh", flags: coerced, stale_reason: null };
+}
+
+// ─── primary-caller recompute (multiple-active → latest wins) ───────────────
+
+/** Order two active leads: primary = latest-activated, tiebreak
+ *  inncircles_born_date > born_at > lead_id. Returns <0 if a should sort
+ *  BEFORE b (a is "more primary"). */
+function comparePrimary(a: any, b: any): number {
+  const byActivated = ts(b.activated_at) - ts(a.activated_at);
+  if (byActivated !== 0) return byActivated;
+  const byInnc = ts(b.inncircles_born_date) - ts(a.inncircles_born_date);
+  if (byInnc !== 0) return byInnc;
+  const byBorn = ts(b.born_at) - ts(a.born_at);
+  if (byBorn !== 0) return byBorn;
+  return String(a._id).localeCompare(String(b._id));
+}
+
+/**
+ * Recompute which of a person's ACTIVE leads is the primary caller. All active
+ * leads stay CRM-visible; only the latest-activated is is_primary_caller (the
+ * one that gets call-tracked). If the primary shifts, append a
+ * primary_caller_shifted event on the new primary and update persons.
+ */
+export async function recomputePrimaryCaller(personId: string): Promise<string | null> {
+  const leads = await getCollection(COL.CRM_LEADS);
+  const active = (await leads.find({ person_id: personId, is_active: true } as any).toArray()) as any[];
+  if (!active.length) {
+    await (await getCollection(COL.PERSONS)).updateOne(
+      { _id: personId } as any,
+      { $set: { active_lead_ids: [], primary_caller_lead_id: null, updated_at: nowISO() } },
+      { upsert: false },
+    );
+    return null;
+  }
+  active.sort(comparePrimary);
+  const primary = active[0];
+  const prevPrimary = active.find((l) => l.is_primary_caller);
+
+  for (const l of active) {
+    const shouldBe = l._id === primary._id;
+    if (!!l.is_primary_caller !== shouldBe || !!l.is_primary !== shouldBe) {
+      await leads.updateOne(
+        { _id: l._id } as any,
+        { $set: { is_primary_caller: shouldBe, is_primary: shouldBe, updated_at: nowISO() } },
+        { upsert: false },
+      );
+    }
+  }
+
+  await (await getCollection(COL.PERSONS)).updateOne(
+    { _id: personId } as any,
+    {
+      $set: {
+        active_lead_ids: active.map((l) => l._id),
+        primary_caller_lead_id: primary._id,
+        updated_at: nowISO(),
+      },
+    },
+    { upsert: false },
+  );
+
+  if (!prevPrimary || prevPrimary._id !== primary._id) {
+    await appendEvent({
+      lead_id: primary._id,
+      person_id: personId,
+      project: primary.project,
+      type: "primary_caller_shifted",
+      actor: "system",
+      channel: "crm",
+      reason: prevPrimary
+        ? `primary caller shifted ${prevPrimary._id} → ${primary._id} (latest-activated)`
+        : `primary caller set → ${primary._id}`,
+      data: { from: prevPrimary?._id ?? null, to: primary._id },
+    });
+  }
+  return primary._id;
+}
+
+// ─── ingest → new model (the main entry from ingestLead) ───────────────────
+
+export interface IngestModelInput {
+  phone: string;
+  project?: string;
+  source?: string;              // website / meta / inncircles / …
+  name?: string;
+  email?: string;
+  language?: string;
+  born_at?: string;             // when lead born at source (ISO / YYYY-MM-DD)
+  inncircles_born_date?: string;
+  source_lead_id?: string;
+  flags?: ActivationFlags;      // the 4 Inncircles activation flags
+  zoho_lead_id?: string | null;
+  prefs?: Record<string, any>;
+  activated_at?: string;        // defaults to now
+}
+
+export interface IngestModelResult {
+  person_id: string;
+  lead_id: string;
+  target: "crm_leads" | "stale_person_record";
+  activation_type: ActivationType | null;
+  is_active: boolean;
+  created: boolean;
+  is_primary_caller: boolean;
+}
+
+/**
+ * Populate the new event-sourced model for a freshly-ingested lead. Mongo-first
+ * and additive — safe to call alongside the legacy ingest write. Idempotent:
+ * re-ingesting the same (phone, project) does NOT duplicate lead_created /
+ * activation events (they fire only on genuine creation / change).
+ *
+ * Flow:
+ *   1. upsert person
+ *   2. classify activation from the 4 flags
+ *   3. active  → ensure crm_leads doc, append lead_created (on create) +
+ *                activation (on create/change), recompute primary caller.
+ *      stale   → ensure stale_person_record doc, append lead_created (on
+ *                create). No activation event (all flags false).
+ *   4. promotion: an activation flag arriving for a previously-stale lead
+ *      moves it stale → crm_leads (event: activation, reason "promotion").
+ */
+export async function recordIngestToNewModel(input: IngestModelInput): Promise<IngestModelResult> {
+  const personId = personIdOf(input.phone);
+  if (!personId) throw new Error("recordIngestToNewModel: empty phone");
+  const project = normProject(input.project);
+  const leadId = leadIdOf(personId, project);
+  const now = input.activated_at || nowISO();
+
+  await upsertPerson({
+    phone: input.phone,
+    name: input.name,
+    email: input.email,
+    language: input.language,
+    prefs: input.prefs,
+    project,
+  });
+
+  const cls = classifyActivation(input.flags);
+  const leads = await getCollection(COL.CRM_LEADS);
+  const stale = await getCollection(COL.STALE_PERSON_RECORD);
+
+  // Current state of this lead across both collections.
+  const existingActive = (await leads.findOne({ _id: leadId } as any)) as any;
+  const existingStale = (await stale.findOne({ _id: leadId } as any)) as any;
+
+  // ── ACTIVE path ───────────────────────────────────────────────────────
+  if (cls.active) {
+    let created = false;
+    const promotedFromStale = !existingActive && !!existingStale;
+
+    if (!existingActive) {
+      // Insert the current-state doc (idempotent via $setOnInsert).
+      const initial: any = {
+        _id: leadId,
+        person_id: personId,
+        project,
+        source: input.source ?? "",
+        born_at: input.born_at ?? now,
+        inncircles_born_date: input.inncircles_born_date ?? null,
+        is_born_fresh: cls.flags.is_born_fresh,
+        is_reactivated: cls.flags.is_reactivated,
+        is_born_in_other_project: cls.flags.is_born_in_other_project,
+        is_bulk_transfer: cls.flags.is_bulk_transfer,
+        source_lead_id: input.source_lead_id ?? "",
+        activation_type: cls.activation_type,
+        is_active: true,
+        is_primary_caller: false, // set by recomputePrimaryCaller below
+        is_primary: false,
+        activated_at: now,
+        stage: "new",
+        status: "never_contacted",
+        is_terminal: false,
+        next_action_at: null,
+        next_action_type: null,
+        owner: null,
+        counters: { call_count: 0, connected_count: 0, wa_in: 0, wa_out: 0, docs_sent: 0 },
+        last: {},
+        event_seq: 0,
+        external: { zoho_lead_id: input.zoho_lead_id ?? null, synced: !!input.zoho_lead_id },
+        created_at: now,
+        updated_at: now,
+      };
+      const before = await leads.findOneAndUpdate(
+        { _id: leadId } as any,
+        { $setOnInsert: initial },
+        { upsert: true, returnDocument: "before" },
+      );
+      created = !before;
+    }
+
+    // If promoted from stale, drop the stale record (history stays in events).
+    if (promotedFromStale) {
+      await stale.deleteOne({ _id: leadId } as any);
+      // carry forward a previously-known stage if the stale doc had one
+      if (existingStale?.last_stage && existingStale.last_stage !== "new") {
+        await leads.updateOne(
+          { _id: leadId } as any,
+          { $set: { stage: existingStale.last_stage, is_terminal: isTerminalStage(existingStale.last_stage), updated_at: nowISO() } },
+          { upsert: false },
+        );
+      }
+    }
+
+    if (created) {
+      const ev = await appendEvent({
+        lead_id: leadId, person_id: personId, project,
+        type: "lead_created", actor: "system", channel: "crm",
+        to: { stage: "new", status: "never_contacted" },
+        reason: `lead created via ${input.source || "ingest"}`,
+        data: { source: input.source ?? null, source_lead_id: input.source_lead_id ?? null },
+      });
+      await projectLead(leadId, ev.seq, {});
+    }
+
+    // Activation event fires on genuine create/promotion/type-change only.
+    const activationChanged =
+      created || promotedFromStale ||
+      (existingActive && (existingActive.is_active !== true || existingActive.activation_type !== cls.activation_type));
+
+    if (activationChanged) {
+      const ev = await appendEvent({
+        lead_id: leadId, person_id: personId, project,
+        type: "activation", actor: "system", channel: "crm",
+        reason: promotedFromStale
+          ? `promoted from stale → active (${cls.activation_type})`
+          : `activated (${cls.activation_type})`,
+        data: { activation_type: cls.activation_type, flags: cls.flags, promoted: promotedFromStale },
+      });
+      await projectLead(leadId, ev.seq, {
+        is_active: true,
+        activation_type: cls.activation_type,
+        is_born_fresh: cls.flags.is_born_fresh,
+        is_reactivated: cls.flags.is_reactivated,
+        is_born_in_other_project: cls.flags.is_born_in_other_project,
+        is_bulk_transfer: cls.flags.is_bulk_transfer,
+        activated_at: now,
+        ...(input.zoho_lead_id ? { "external.zoho_lead_id": input.zoho_lead_id, "external.synced": true } : {}),
+      });
+    } else if (input.zoho_lead_id && existingActive && !existingActive.external?.zoho_lead_id) {
+      // no activation change, but attach a newly-known zoho id
+      await leads.updateOne(
+        { _id: leadId } as any,
+        { $set: { "external.zoho_lead_id": input.zoho_lead_id, "external.synced": true, updated_at: nowISO() } },
+        { upsert: false },
+      );
+    }
+
+    const primaryId = await recomputePrimaryCaller(personId);
+
+    return {
+      person_id: personId, lead_id: leadId, target: "crm_leads",
+      activation_type: cls.activation_type, is_active: true,
+      created, is_primary_caller: primaryId === leadId,
+    };
+  }
+
+  // ── STALE path (all four flags explicitly false) ────────────────────────
+  // If the lead is already active, an all-false re-push does NOT demote it
+  // (Inncircles never demotes; only call-track shifts). Leave it be.
+  if (existingActive) {
+    return {
+      person_id: personId, lead_id: leadId, target: "crm_leads",
+      activation_type: existingActive.activation_type ?? null,
+      is_active: true, created: false,
+      is_primary_caller: !!existingActive.is_primary_caller,
+    };
+  }
+
+  let created = false;
+  if (!existingStale) {
+    const initial: any = {
+      _id: leadId,
+      person_id: personId,
+      project,
+      source: input.source ?? "",
+      inncircles_born_date: input.inncircles_born_date ?? null,
+      flags: cls.flags,
+      activation_type: null,
+      stale_reason: cls.stale_reason,
+      last_stage: null,
+      event_seq: 0,
+      external: { zoho_lead_id: input.zoho_lead_id ?? null, synced: !!input.zoho_lead_id },
+      created_at: now,
+      updated_at: now,
+    };
+    const before = await stale.findOneAndUpdate(
+      { _id: leadId } as any,
+      { $setOnInsert: initial },
+      { upsert: true, returnDocument: "before" },
+    );
+    created = !before;
+  }
+
+  if (created) {
+    await appendEvent({
+      lead_id: leadId, person_id: personId, project,
+      type: "lead_created", actor: "system", channel: "crm",
+      to: { stage: "new" },
+      reason: `not-interested sibling captured (stale) via ${input.source || "ingest"}`,
+      data: { source: input.source ?? null, stale_reason: cls.stale_reason, flags: cls.flags },
+    });
+    // stale docs are not projected into crm_leads; bump event_seq on the stale doc
+    await stale.updateOne(
+      { _id: leadId } as any,
+      { $set: { event_seq: 1, updated_at: nowISO() } },
+      { upsert: false },
+    );
+  }
+
+  return {
+    person_id: personId, lead_id: leadId, target: "stale_person_record",
+    activation_type: null, is_active: false, created,
+    is_primary_caller: false,
+  };
+}
+
+/** Attach a Zoho lead id to a crm_leads (or stale) doc after the fact. */
+export async function setLeadZohoId(leadId: string, zohoLeadId: string): Promise<void> {
+  if (!leadId || !zohoLeadId) return;
+  const patch = { $set: { "external.zoho_lead_id": zohoLeadId, "external.synced": true, updated_at: nowISO() } };
+  await (await getCollection(COL.CRM_LEADS)).updateOne({ _id: leadId } as any, patch, { upsert: false });
+  await (await getCollection(COL.STALE_PERSON_RECORD)).updateOne({ _id: leadId } as any, patch, { upsert: false });
+}
+
+// ─── stage / status transitions (every change = one event) ─────────────────
+
+export interface TransitionOpts {
+  actor?: Actor;
+  channel?: Channel;
+  reason?: string;
+}
+
+/** Move a lead to a new stage. No-op (returns changed:false) if already there.
+ *  Appends a stage_change event, then projects stage + is_terminal + last. */
+export async function changeStage(
+  leadId: string,
+  toStage: Stage,
+  opts: TransitionOpts = {},
+): Promise<{ changed: boolean; from?: string }> {
+  const leads = await getCollection(COL.CRM_LEADS);
+  const cur = (await leads.findOne({ _id: leadId } as any)) as any;
+  if (!cur) return { changed: false };
+  if (cur.stage === toStage) return { changed: false, from: cur.stage };
+
+  const ev = await appendEvent({
+    lead_id: leadId, person_id: cur.person_id, project: cur.project,
+    type: "stage_change", actor: opts.actor ?? "system", channel: opts.channel ?? "crm",
+    from: { stage: cur.stage, status: cur.status },
+    to: { stage: toStage },
+    reason: opts.reason,
+  });
+
+  const terminal = isTerminalStage(toStage);
+  await projectLead(leadId, ev.seq, {
+    stage: toStage,
+    is_terminal: terminal,
+    "last.stage_changed_at": ev.ts,
+    ...(terminal ? { next_action_at: null, next_action_type: null } : {}),
+  });
+  return { changed: true, from: cur.stage };
+}
+
+/** Move a lead's reachability status. No-op if unchanged. */
+export async function changeStatus(
+  leadId: string,
+  toStatus: Status,
+  opts: TransitionOpts = {},
+): Promise<{ changed: boolean; from?: string }> {
+  const leads = await getCollection(COL.CRM_LEADS);
+  const cur = (await leads.findOne({ _id: leadId } as any)) as any;
+  if (!cur) return { changed: false };
+  if (cur.status === toStatus) return { changed: false, from: cur.status };
+
+  const ev = await appendEvent({
+    lead_id: leadId, person_id: cur.person_id, project: cur.project,
+    type: "status_change", actor: opts.actor ?? "system", channel: opts.channel ?? "crm",
+    from: { stage: cur.stage, status: cur.status },
+    to: { status: toStatus },
+    reason: opts.reason,
+  });
+  await projectLead(leadId, ev.seq, { status: toStatus });
+  return { changed: true, from: cur.status };
+}
+
+/** Schedule the next action (the timer). null clears it. */
+export async function scheduleNextAction(
+  leadId: string,
+  at: Date | string | null,
+  type: "call" | "whatsapp" | null,
+  opts: TransitionOpts = {},
+): Promise<void> {
+  const leads = await getCollection(COL.CRM_LEADS);
+  const cur = (await leads.findOne({ _id: leadId } as any)) as any;
+  if (!cur) return;
+  const atISO = at ? new Date(at).toISOString() : null;
+  const ev = await appendEvent({
+    lead_id: leadId, person_id: cur.person_id, project: cur.project,
+    type: "system", actor: opts.actor ?? "cron", channel: opts.channel ?? "system",
+    reason: opts.reason ?? (atISO ? `next ${type} scheduled` : "next action cleared"),
+    data: { next_action_at: atISO, next_action_type: type },
+  });
+  await projectLead(leadId, ev.seq, { next_action_at: atISO, next_action_type: type });
+}
+
+// ─── calls ─────────────────────────────────────────────────────────────────
+
+export interface CallScheduledInput {
+  call_id: string;
+  lead_id: string;
+  person_id: string;
+  project: string;
+  phone: string;
+  scheduled_at?: string;
+  provider?: "plivo" | "telnyx" | (string & {});
+  actor?: Actor;
+}
+
+/** Record a scheduled/triggered dial: writes the calls doc + call_scheduled
+ *  event + bumps call_count. */
+export async function recordCallScheduled(input: CallScheduledInput): Promise<void> {
+  const calls = await getCollection(COL.CALLS);
+  const now = nowISO();
+  await calls.updateOne(
+    { _id: input.call_id } as any,
+    {
+      $setOnInsert: { _id: input.call_id, created_at: now },
+      $set: {
+        lead_id: input.lead_id, person_id: input.person_id, project: input.project,
+        phone: digits(input.phone), scheduled_at: input.scheduled_at ?? now,
+        provider: input.provider ?? "plivo", updated_at: now,
+      },
+    },
+    { upsert: true },
+  );
+  const ev = await appendEvent({
+    lead_id: input.lead_id, person_id: input.person_id, project: input.project,
+    type: "call_scheduled", actor: input.actor ?? "cron", channel: "call",
+    ref: input.call_id, data: { provider: input.provider ?? "plivo" },
+  });
+  await projectLead(input.lead_id, ev.seq, { "last.call_at": ev.ts }, { "counters.call_count": 1 });
+}
+
+export interface CallCompletedInput {
+  call_id: string;
+  lead_id: string;
+  person_id: string;
+  project: string;
+  outcome: "connected" | "no_answer" | "busy" | "switched_off" | "failed" | (string & {});
+  /** semantic bot result — kept SEPARATE from `outcome` (the pre_site lesson). */
+  disposition?: "pre_site" | "virtual_tour" | "callback" | "not_interested" | "info" | (string & {});
+  dialed_at?: string;
+  duration_secs?: number;
+  recording_url?: string;
+  transcript?: string;
+  slots?: Record<string, any>; // { visit_date, callback_time }
+  actor?: Actor;
+}
+
+/** Record a completed call: updates the calls doc + call_completed event +
+ *  bumps connected_count when connected. Disposition stays in its own field. */
+export async function recordCallCompleted(input: CallCompletedInput): Promise<void> {
+  const calls = await getCollection(COL.CALLS);
+  const now = nowISO();
+  await calls.updateOne(
+    { _id: input.call_id } as any,
+    {
+      $setOnInsert: {
+        _id: input.call_id, lead_id: input.lead_id, person_id: input.person_id,
+        project: input.project, created_at: now,
+      },
+      $set: {
+        outcome: input.outcome,
+        disposition: input.disposition ?? null,
+        dialed_at: input.dialed_at ?? now,
+        duration_secs: input.duration_secs ?? null,
+        recording_url: input.recording_url ?? null,
+        transcript: input.transcript ?? null,
+        slots: input.slots ?? null,
+        updated_at: now,
+      },
+    },
+    { upsert: true },
+  );
+  const connected = input.outcome === "connected";
+  const ev = await appendEvent({
+    lead_id: input.lead_id, person_id: input.person_id, project: input.project,
+    type: "call_completed", actor: input.actor ?? "bot", channel: "call",
+    ref: input.call_id,
+    reason: `call ${input.outcome}${input.disposition ? ` · disposition ${input.disposition}` : ""}`,
+    data: {
+      outcome: input.outcome, disposition: input.disposition ?? null,
+      duration_secs: input.duration_secs ?? null, slots: input.slots ?? null,
+    },
+  });
+  await projectLead(
+    input.lead_id, ev.seq,
+    { "last.call_at": ev.ts, "last.call_outcome": input.outcome },
+    connected ? { "counters.connected_count": 1 } : undefined,
+  );
+}
+
+// ─── messages (WhatsApp) ────────────────────────────────────────────────────
+
+export interface MessageInput {
+  message_id: string;
+  person_id: string;
+  phone: string;
+  direction: "inbound" | "outbound";
+  body?: string;
+  ts?: string;
+  sender?: string;
+  intent?: string;
+  project?: string;
+  doc_ref?: string;
+  /** optional lead to attribute the wa_* event to (usually the primary lead) */
+  lead_id?: string;
+  actor?: Actor;
+}
+
+/** Store a WhatsApp message (phone-level) + append a wa_inbound/wa_outbound
+ *  event on the given lead (if any) and bump wa counters. Message store is
+ *  deduped by provider message id. */
+export async function recordMessage(input: MessageInput): Promise<void> {
+  void ensureCrmIndexes();
+  const messages = await getCollection(COL.CRM_MESSAGES);
+  const now = input.ts ? new Date(input.ts).toISOString() : nowISO();
+  await messages.updateOne(
+    { _id: input.message_id } as any,
+    {
+      $setOnInsert: { _id: input.message_id, created_at: nowISO() },
+      $set: {
+        person_id: input.person_id, phone: digits(input.phone),
+        direction: input.direction, body: input.body ?? "", ts: now,
+        sender: input.sender ?? null, intent: input.intent ?? null,
+        project: input.project ? normProject(input.project) : null,
+        doc_ref: input.doc_ref ?? null,
+      },
+    },
+    { upsert: true },
+  );
+
+  if (!input.lead_id) return; // phone-level store only; no lead to attribute
+  const leads = await getCollection(COL.CRM_LEADS);
+  const cur = (await leads.findOne({ _id: input.lead_id } as any)) as any;
+  if (!cur) return;
+  const inbound = input.direction === "inbound";
+  const ev = await appendEvent({
+    lead_id: input.lead_id, person_id: input.person_id, project: cur.project,
+    type: inbound ? "wa_inbound" : "wa_outbound",
+    actor: input.actor ?? (inbound ? "customer" : "bot"), channel: "whatsapp",
+    ref: input.message_id,
+    reason: input.intent ? `intent: ${input.intent}` : undefined,
+    data: { intent: input.intent ?? null, doc_ref: input.doc_ref ?? null },
+  });
+  await projectLead(
+    input.lead_id, ev.seq,
+    inbound ? { "last.inbound_at": ev.ts } : { "last.outbound_at": ev.ts },
+    inbound ? { "counters.wa_in": 1 } : { "counters.wa_out": 1 },
+  );
+}
+
+/** Record a document (PDF) sent over WhatsApp: doc_sent event + docs_sent++. */
+export async function recordDocSent(
+  leadId: string,
+  docType: string,
+  opts: { ref?: string; sizeLabel?: string; actor?: Actor } = {},
+): Promise<void> {
+  const leads = await getCollection(COL.CRM_LEADS);
+  const cur = (await leads.findOne({ _id: leadId } as any)) as any;
+  if (!cur) return;
+  const ev = await appendEvent({
+    lead_id: leadId, person_id: cur.person_id, project: cur.project,
+    type: "doc_sent", actor: opts.actor ?? "bot", channel: "whatsapp",
+    ref: opts.ref, reason: `sent ${docType}${opts.sizeLabel ? ` (${opts.sizeLabel})` : ""}`,
+    data: { doc_type: docType, size_label: opts.sizeLabel ?? null },
+  });
+  await projectLead(leadId, ev.seq, {}, { "counters.docs_sent": 1 });
+}
+
+// ─── site visits ────────────────────────────────────────────────────────────
+
+export interface SiteVisitInput {
+  visit_id: string;
+  lead_id: string;
+  person_id: string;
+  project: string;
+  type?: "site" | "virtual";
+  scheduled_for: string;
+  booked_via?: "call" | "whatsapp" | "rm";
+  actor?: Actor;
+}
+
+/** Book a site visit: writes the site_visits row (status booked) +
+ *  visit_booked event. Does NOT change stage — callers pair it with
+ *  changeStage("visit_scheduled") so the milestone/automation-stop is explicit. */
+export async function recordSiteVisitBooked(input: SiteVisitInput): Promise<void> {
+  const visits = await getCollection(COL.SITE_VISITS);
+  const now = nowISO();
+  await visits.updateOne(
+    { _id: input.visit_id } as any,
+    {
+      $setOnInsert: { _id: input.visit_id, created_at: now },
+      $set: {
+        lead_id: input.lead_id, person_id: input.person_id, project: input.project,
+        type: input.type ?? "site", scheduled_for: new Date(input.scheduled_for).toISOString(),
+        status: "booked", booked_via: input.booked_via ?? "call", updated_at: now,
+      },
+    },
+    { upsert: true },
+  );
+  const ev = await appendEvent({
+    lead_id: input.lead_id, person_id: input.person_id, project: input.project,
+    type: "visit_booked", actor: input.actor ?? "bot", channel: input.booked_via === "whatsapp" ? "whatsapp" : "call",
+    ref: input.visit_id, reason: `visit booked for ${input.scheduled_for}`,
+    data: { scheduled_for: input.scheduled_for, type: input.type ?? "site" },
+  });
+  await projectLead(input.lead_id, ev.seq, { "last.visit_booked_at": ev.ts });
+}
+
+/** Mark a booked visit done / no_show / cancelled + visit_done event. */
+export async function recordSiteVisitOutcome(
+  visitId: string,
+  status: "done" | "no_show" | "cancelled",
+  opts: { actor?: Actor } = {},
+): Promise<void> {
+  const visits = await getCollection(COL.SITE_VISITS);
+  const visit = (await visits.findOne({ _id: visitId } as any)) as any;
+  if (!visit) return;
+  await visits.updateOne(
+    { _id: visitId } as any,
+    { $set: { status, updated_at: nowISO() } },
+    { upsert: false },
+  );
+  const ev = await appendEvent({
+    lead_id: visit.lead_id, person_id: visit.person_id, project: visit.project,
+    type: "visit_done", actor: opts.actor ?? "rm", channel: "crm",
+    ref: visitId, reason: `visit ${status}`,
+    data: { status },
+  });
+  await projectLead(visit.lead_id, ev.seq, { "last.visit_outcome_at": ev.ts });
+}
+
+// ─── calling-agent cross-project context ───────────────────────────────────
+
+export interface CallerContext {
+  person_id: string;
+  primary_caller_lead_id: string | null;
+  current: { project: string; stage: string; activation_type: ActivationType | null } | null;
+  other_active: Array<{ project: string; stage: string; activation_type: ActivationType | null }>;
+  not_interested: Array<{ project: string }>;
+  do_not_contact: boolean;
+}
+
+/**
+ * Build the cross-project picture the orchestrator hands the calling agent when
+ * it fires the primary caller: the current project+stage+activation_type, the
+ * OTHER active projects (context/continuity), and the not-interested siblings
+ * (so the agent doesn't re-pitch a project the person already declined).
+ */
+export async function buildCallerContext(phone: string): Promise<CallerContext> {
+  const personId = personIdOf(phone);
+  const persons = await getCollection(COL.PERSONS);
+  const leads = await getCollection(COL.CRM_LEADS);
+  const stale = await getCollection(COL.STALE_PERSON_RECORD);
+
+  const person = (await persons.findOne({ _id: personId } as any)) as any;
+  const active = (await leads.find({ person_id: personId, is_active: true } as any).toArray()) as any[];
+  const staleRecs = (await stale.find({ person_id: personId } as any).toArray()) as any[];
+
+  const primaryId = person?.primary_caller_lead_id ?? active.find((l) => l.is_primary_caller)?._id ?? null;
+  const primary = active.find((l) => l._id === primaryId) || null;
+
+  return {
+    person_id: personId,
+    primary_caller_lead_id: primaryId,
+    current: primary
+      ? { project: primary.project, stage: primary.stage, activation_type: primary.activation_type ?? null }
+      : null,
+    other_active: active
+      .filter((l) => l._id !== primaryId)
+      .map((l) => ({ project: l.project, stage: l.stage, activation_type: l.activation_type ?? null })),
+    not_interested: staleRecs.map((s) => ({ project: s.project })),
+    do_not_contact: !!person?.do_not_contact,
+  };
+}

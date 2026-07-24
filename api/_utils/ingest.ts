@@ -37,7 +37,9 @@ export type IngestResult = {
   zoho_lead_id: string | null;
   mlid: string;
   plid: string;
-  /** Set only when action = "queued" — why the Zoho create failed. */
+  /** Why the Zoho write failed. Set when action = "queued" (create failed →
+   *  Mongo-only, reconcile later) OR when action = "updated" but the Zoho
+   *  field-sync failed (lead is already durable in Mongo; reconcile re-applies). */
   zoho_error?: string;
   resubmission?: ResubmissionInfo;
 };
@@ -172,18 +174,71 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
     }
   }
 
-  let zohoLeadId: string;
+  // ── Step 4: MONGO-FIRST durability (Mongo is the source of truth) ─────────
+  // Persist the FULL lead to Mongo BEFORE any Zoho write. The lead is durable
+  // here regardless of whether Zoho is reachable, so nothing downstream depends
+  // on Zoho for the lead to exist. Zoho is then written best-effort / non-
+  // blocking and the doc is stamped zoho_synced=true ONLY when the Zoho write
+  // actually lands; every failure falls through to the queued/reconcile pattern
+  // instead of losing (or failing) the lead.
+  const preZohoId: string | null = existingLead ? String(existingLead.id) : null;
+  await upsertLead(lead, mlid, plid, preZohoId, false);
+
+  // ── New event-sourced model (rebuild v1) — Mongo-first, additive ──────────
+  // Populate persons / crm_leads / lead_events (+ stale_person_record for
+  // not-interested Inncircles siblings) alongside the legacy `leads` mirror.
+  // Best-effort: a failure here must NEVER fail ingest (the legacy write above
+  // already made the lead durable). Runs only when not frozen (the ingest
+  // handlers gate on the freeze before ever calling ingestLead).
+  try {
+    const { recordIngestToNewModel } = await import("./crm_model");
+    await recordIngestToNewModel({
+      phone: mobile,
+      project,
+      source: lead.lead_source,
+      name: `${lead.first_name} ${lead.last_name}`.trim(),
+      email: lead.email,
+      born_at: lead.born_date || lead.lead_received_at,
+      // The Inncircles-supplied original born date drives active/stale +
+      // primary-caller ordering. Only meaningful when the caller sent one.
+      inncircles_born_date: lead.born_date,
+      source_lead_id: lead.source_lead_id,
+      flags: lead.inncircles_flags,
+      zoho_lead_id: preZohoId,
+      prefs: {
+        budget: lead.budget,
+        size: lead.size_preference,
+        facing: lead.floor_preference,
+        timeline: lead.possession_timeline,
+        purpose: lead.purchase_purpose,
+      },
+    });
+  } catch (merrModel: any) {
+    console.error(`[Ingest] recordIngestToNewModel failed (legacy write is durable) for plid=${plid}: ${merrModel.message}`);
+  }
+
+  let zohoLeadId: string | null = preZohoId;
   let action: "created" | "updated";
+  let zohoSynced = false;
+  let zohoError: string | undefined;
   let resubmission: ResubmissionInfo | undefined = undefined;
 
   if (existingLead) {
+    action = "updated";
     // Don't overwrite Born_Date / Inncircles_Born_Date on resubmissions — they
     // should reflect the ORIGINAL born date, not the latest resubmit.
     // (Resubmission timing is captured separately on Last_Resubmission_At.)
     const { Born_Date: _ignored, Inncircles_Born_Date: _ignored2, ...payloadForUpdate } = zohoPayload;
-    await updateLead(existingLead.id, payloadForUpdate);
-    zohoLeadId = existingLead.id;
-    action = "updated";
+    // Zoho field-sync is OPTIONAL — Mongo already holds the full record. A Zoho
+    // outage must not fail ingest; leave the doc zoho_synced=false so reconcile
+    // re-applies later.
+    try {
+      await updateLead(existingLead.id, payloadForUpdate);
+      zohoSynced = true;
+    } catch (zerr: any) {
+      zohoError = zerr.message;
+      console.error(`[Ingest] updateLead FAILED (Mongo already durable) for ${existingLead.id}: ${zerr.message}`);
+    }
 
     // ── Resubmission tracking ─────────────────────────────────────────────
     // Existing-lead-found-by-phone-and-project means the user filled a form
@@ -193,7 +248,7 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
     try {
       const r = await recordResubmission({
         lead,
-        zohoLeadId,
+        zohoLeadId: existingLead.id,
         mlid,
         plid,
         existingLead,
@@ -201,25 +256,25 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
       resubmission = r;
     } catch (err: any) {
       // Never block ingest on resubmission tracking — log and move on.
-      console.error(`[Ingest] recordResubmission threw for ${zohoLeadId}: ${err.message}`);
+      console.error(`[Ingest] recordResubmission threw for ${existingLead.id}: ${err.message}`);
     }
   } else {
-    // MONGO-FIRST DURABILITY: if Zoho createLead fails (INVALID_TOKEN storm,
-    // rate-limit, or CRM Plus trial expired), the lead must NOT be lost. Persist
-    // it to Mongo as un-synced (zoho_lead_id=null, zoho_synced=false) and return
-    // "queued"; the reconcile-zoho-pending cron task retries the Zoho create once
-    // Zoho recovers. This is why "success but never landed in Zoho" can't lose a
-    // lead anymore — Mongo is the durable store, Zoho is reconciled after.
+    // Zoho create is OPTIONAL / non-blocking. On failure (INVALID_TOKEN storm,
+    // rate-limit, CRM Plus trial expired) the lead is ALREADY durable in Mongo
+    // (upsertLead above) as un-synced (zoho_lead_id=null, zoho_synced=false); we
+    // stash the payload + return "queued" so the reconcile-zoho-pending cron
+    // re-creates it in Zoho once Zoho recovers. Mongo — not Zoho — is what
+    // guarantees the lead is never lost.
     try {
       zohoLeadId = await createLead(zohoPayload);
       action = "created";
+      zohoSynced = true;
       // Zoho sometimes ignores custom fields in POST — patch Born_Date separately
       if (zohoPayload.Born_Date) {
         await updateLead(zohoLeadId, { Born_Date: zohoPayload.Born_Date }).catch(() => {});
       }
     } catch (zerr: any) {
-      console.error(`[Ingest] createLead FAILED — queuing lead to Mongo (plid=${plid}): ${zerr.message}`);
-      await upsertLead(lead, mlid, plid, null, false);
+      console.error(`[Ingest] createLead FAILED — lead already durable in Mongo (plid=${plid}): ${zerr.message}`);
       // Stash the exact Zoho payload + error so the reconcile job can re-create
       // the lead in Zoho without rebuilding it.
       try {
@@ -236,8 +291,25 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
     }
   }
 
-  // ── Step 4: Store in Mongo (source of truth + safety net) ────────────────
-  await upsertLead(lead, mlid, plid, zohoLeadId, true);
+  // ── Step 5: stamp Mongo as Zoho-synced ONLY when the Zoho write landed ────
+  // (Re-upserts the full doc with the resolved zoho_lead_id + zoho_synced=true.)
+  if (zohoSynced && zohoLeadId) {
+    await upsertLead(lead, mlid, plid, zohoLeadId, true);
+    // Mirror the resolved Zoho id onto the new-model doc (best-effort).
+    try {
+      const { setLeadZohoId, personIdOf, leadIdOf } = await import("./crm_model");
+      await setLeadZohoId(leadIdOf(personIdOf(mobile), project), zohoLeadId);
+    } catch (zerr2: any) {
+      console.error(`[Ingest] setLeadZohoId failed for plid=${plid}: ${zerr2.message}`);
+    }
+  }
 
-  return { action, zoho_lead_id: zohoLeadId, mlid, plid, resubmission };
+  return {
+    action,
+    zoho_lead_id: zohoLeadId,
+    mlid,
+    plid,
+    ...(zohoError ? { zoho_error: zohoError } : {}),
+    resubmission,
+  };
 }
