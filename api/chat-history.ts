@@ -8098,6 +8098,37 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── drop-legacy-crm-collections — remove the event-sourced collections that
+  //     were accidentally created in the LEGACY Zoho_Database (before the
+  //     Intelligent_CRM db split). SAFE: drops ONLY these exact names, ONLY from
+  //     Zoho_Database, and ONLY when the collection is EMPTY — never drops data.
+  //   POST /api/chat-history?action=drop-legacy-crm-collections&secret=<...>
+  if ((req.method === "GET" || req.method === "POST") && req.query.action === "drop-legacy-crm-collections") {
+    const session = (req as any)._session;
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!session && (!expectedSecret || incomingSecret !== expectedSecret)) {
+      return res.status(401).json({ error: "Unauthorized — log in OR pass ?secret=..." });
+    }
+    try {
+      const NAMES = ["persons", "crm_leads", "lead_events", "calls", "messages", "site_visits", "stale_person_record"];
+      const { getDb } = await import("./_utils/mongo");
+      const db = await getDb(); // Zoho_Database (the LEGACY db these were wrongly created in)
+      const existing = (await db.listCollections().toArray()).map((c: any) => c.name);
+      const result: any[] = [];
+      for (const name of NAMES) {
+        if (!existing.includes(name)) { result.push({ name, status: "absent" }); continue; }
+        const count = await db.collection(name).estimatedDocumentCount();
+        if (count > 0) { result.push({ name, status: "SKIPPED — not empty", count }); continue; }
+        await db.collection(name).drop().catch(() => {});
+        result.push({ name, status: "dropped" });
+      }
+      return res.status(200).json({ ok: true, db: "Zoho_Database", result });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── supabase-config-check — where do dashboard uploads actually go?
   //   Reports the SUPABASE_URL host (not the key) + does a real round-trip:
   //   upload a tiny test file via the same helper the dashboard uses, build
