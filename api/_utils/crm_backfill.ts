@@ -20,10 +20,12 @@ import { getCollection, getCrmCollection, COL } from "./mongo";
 import {
   recordIngestToNewModel,
   changeStage,
+  changeStatus,
   personIdOf,
   leadIdOf,
   classifyActivation,
   type Stage,
+  type Status,
   type ActivationFlags,
 } from "./crm_model";
 
@@ -36,13 +38,19 @@ export function mapLegacyStage(prdStage?: string | null, leadStatus?: string | n
     const v = String(raw || "").trim().toLowerCase();
     if (!v) return null;
     if (/spam/.test(v)) return "spam";
-    if (/not interested|not qualif|disqualif|lost|junk|dead/.test(v)) return "not_interested";
+    // "won" before "lost" so "closed won" wins; then lost/dead → the distinct
+    // `lost` stage (kept separate from not_interested so the enum is reachable).
     if (/booked|won|customer|closed won/.test(v)) return "booked";
+    if (/\blost\b|\bdead\b/.test(v)) return "lost";
+    if (/not interested|not qualif|disqualif|junk/.test(v)) return "not_interested";
     if (/negotiat/.test(v)) return "negotiation";
     if (/post.?site|visit done|site visit done/.test(v)) return "visit_done";
     if (/pre.?site|site visit|virtual tour|visit sched|visit confirm/.test(v)) return "visit_scheduled";
     if (/qualif/.test(v)) return "qualified";
-    if (/engaged|replied|connected|answered|intent/.test(v)) return "engaged";
+    // Reachability tokens (connected/answered) are STATUS, not stage — they are
+    // mapped by mapLegacyStatus so a merely-reachable lead isn't over-promoted
+    // to the `engaged` stage. Only genuine engagement signals map here.
+    if (/engaged|replied|intent/.test(v)) return "engaged";
     if (/contacted|lead initiated|attempt|first touch|in future/.test(v)) return "contacted";
     if (/fresh|^new|not contacted|uncontacted|new lead/.test(v)) return "new";
     return null;
@@ -67,6 +75,38 @@ function flagsFromLegacy(doc: any): ActivationFlags {
   };
 }
 
+// ─── legacy reachability status → new Status enum ──────────────────────────
+
+/** Map the legacy Lead_Status vocabulary onto the new reachability Status enum.
+ *  Returns null when there's no clear reachability signal — the caller then
+ *  leaves the projection at its default `never_contacted` (so we never invent a
+ *  contact that didn't happen). Ordered most-specific-first. */
+export function mapLegacyStatus(leadStatus?: string | null): Status | null {
+  const v = String(leadStatus || "").trim().toLowerCase();
+  if (!v) return null;
+  if (/\bdnd\b|\bdnc\b|do not (disturb|call|contact)|opt.?out/.test(v)) return "dnd";
+  if (/unreachable|switched? off|not reachable|out of service|disconnected|invalid number|wrong number|number not/.test(v)) return "unreachable";
+  if (/connected|answered|spoke|reached|contacted|in ?conversation|call ?back received/.test(v)) return "connected";
+  if (/attempt|ringing|no answer|not answer|busy|call ?back|callback|follow.?up|not picked|missed|ringing no response|rnr/.test(v)) return "attempting";
+  return null;
+}
+
+/** Best available "when did this lead activate" timestamp from a legacy doc.
+ *  comparePrimary sorts a person's active leads by activated_at DESC to pick the
+ *  primary caller, so backfill MUST pass a real per-lead activation time —
+ *  otherwise every backfilled lead would be stamped `now` and the primary would
+ *  fall out of DB-iteration order (G2). Falls through the most
+ *  activation-meaningful legacy fields; undefined when none are present (then
+ *  recordIngestToNewModel defaults to now, matching a genuinely-unknown time). */
+function legacyActivatedAt(doc: any): string | undefined {
+  const cand =
+    doc.reactivation_date || doc.reactivated_at || doc.inncircles_born_date ||
+    doc.born_date || doc.lead_received_at || doc.created_time || doc.updated_at;
+  if (!cand) return undefined;
+  const t = new Date(cand).getTime();
+  return Number.isNaN(t) ? undefined : new Date(t).toISOString();
+}
+
 // ─── report shape ──────────────────────────────────────────────────────────
 
 export interface BackfillReport {
@@ -78,6 +118,7 @@ export interface BackfillReport {
   stale_leads: number;          // would-create / created stale records
   already_present: number;      // lead_id already existed (idempotent skip of creation)
   stage_sets: number;           // non-"new" stages applied / would-apply
+  status_sets: number;          // non-default reachability statuses applied / would-apply
   events_estimated: number;     // approximate lead_events that would be appended
   errors: string[];
   samples: Array<{
@@ -120,7 +161,7 @@ export async function backfillNewModel(opts: BackfillOpts = {}): Promise<Backfil
     mode: commit ? "commit" : "dry-run",
     scanned: 0, skipped_no_phone: 0, persons: 0,
     active_leads: 0, stale_leads: 0, already_present: 0,
-    stage_sets: 0, events_estimated: 0, errors: [],
+    stage_sets: 0, status_sets: 0, events_estimated: 0, errors: [],
     samples: [], ms: 0,
     note: commit
       ? "COMMIT mode — wrote to persons / crm_leads / lead_events / stale_person_record."
@@ -144,6 +185,7 @@ export async function backfillNewModel(opts: BackfillOpts = {}): Promise<Backfil
       const flags = flagsFromLegacy(doc);
       const cls = classifyActivation(flags);
       const mappedStage = mapLegacyStage((doc as any).prd_stage, (doc as any).lead_status);
+      const mappedStatus = mapLegacyStatus((doc as any).lead_status);
 
       // Does a new-model doc already exist for this lead?
       const [existActive, existStale] = await Promise.all([
@@ -173,6 +215,9 @@ export async function backfillNewModel(opts: BackfillOpts = {}): Promise<Backfil
           source_lead_id: (doc as any).source_lead_id || undefined,
           flags,
           zoho_lead_id: (doc as any).zoho_lead_id || null,
+          // Real per-lead activation time so the primary-caller (latest-activated)
+          // is reproduced deterministically instead of by DB-iteration order (G2).
+          activated_at: legacyActivatedAt(doc),
         });
         if (r.target === "crm_leads") report.active_leads++; else report.stale_leads++;
         if (r.created) {
@@ -180,10 +225,15 @@ export async function backfillNewModel(opts: BackfillOpts = {}): Promise<Backfil
         } else {
           report.already_present++;
         }
-        // Apply the historical stage (idempotent; only active leads project a stage).
+        // Apply the historical stage + status (idempotent; only active leads
+        // project stage/status).
         if (r.target === "crm_leads" && mappedStage !== "new") {
           const sc = await changeStage(leadId, mappedStage, { actor: "system", reason: "backfill: imported legacy stage" });
           if (sc.changed) { report.stage_sets++; report.events_estimated++; }
+        }
+        if (r.target === "crm_leads" && mappedStatus && mappedStatus !== "never_contacted") {
+          const st = await changeStatus(leadId, mappedStatus, { actor: "system", reason: "backfill: imported legacy status" });
+          if (st.changed) { report.status_sets++; report.events_estimated++; }
         }
       } else {
         // DRY-RUN — tally only, NO WRITES.
@@ -193,6 +243,7 @@ export async function backfillNewModel(opts: BackfillOpts = {}): Promise<Backfil
           report.active_leads++;
           report.events_estimated += 2; // lead_created + activation
           if (mappedStage !== "new") { report.stage_sets++; report.events_estimated++; }
+          if (mappedStatus && mappedStatus !== "never_contacted") { report.status_sets++; report.events_estimated++; }
         } else {
           report.stale_leads++;
           report.events_estimated += 1; // lead_created
