@@ -6976,6 +6976,25 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── ensure-leads-indexes — create the hot-path indexes on the `leads`
+  //     collection (zoho_lead_id / phone / mlid / source_lead_id / sync) and
+  //     return the resulting index list. Idempotent.
+  //   GET ?action=ensure-leads-indexes&secret=<INHOUSE_POSTHOOK_SECRET>
+  if (req.method === "GET" && req.query.action === "ensure-leads-indexes") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    try {
+      const { ensureLeadIndexesNow } = await import("./_utils/supabase");
+      const indexes = await ensureLeadIndexesNow();
+      return res.status(200).json({ ok: true, collection: "leads", indexes });
+    } catch (err: any) {
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  }
+
   // ─── posthook-payloads — inspect the raw voice-bot call_completed payloads
   //     captured by inhouse-posthook, to find which field carries the pre-site
   //     disposition (the dashboard tags PRE_SITE but our CRM stays "Contacted").

@@ -61,6 +61,44 @@ function cleanPhone(p: string): string {
   return String(p || "").replace(/\D/g, "");
 }
 
+// ─── leads collection indexes ─────────────────────────────────────────────
+// Without these, every hot-path query on `leads` is a FULL COLLECTION SCAN:
+//   { zoho_lead_id }  — call_guard runs this before EVERY proactive dial,
+//                       plus reconcile + block-calls + state mirrors
+//   { phone }         — fetchLeadRecordsByPhone / per-phone sibling lookups
+//   { mlid }          — block-calls + multi-project dedup
+//   { source_lead_id }— block-calls
+//   { zoho_synced, zoho_lead_id } — reconcile-zoho-pending scan
+// createIndex is idempotent (no-op once built). Guarded by a per-instance flag
+// so only the first write on a warm instance touches it.
+async function ensureLeadIndexes(): Promise<void> {
+  if ((globalThis as any).__leadIdxEnsured) return;
+  (globalThis as any).__leadIdxEnsured = true;
+  try {
+    const col = await getCollection<LeadDoc>(COL.LEADS);
+    await Promise.all([
+      col.createIndex({ zoho_lead_id: 1 }, { name: "idx_zoho_lead_id" }),
+      col.createIndex({ phone: 1 }, { name: "idx_phone" }),
+      col.createIndex({ mlid: 1 }, { name: "idx_mlid" }),
+      col.createIndex({ source_lead_id: 1 }, { name: "idx_source_lead_id" }),
+      col.createIndex({ zoho_synced: 1, zoho_lead_id: 1 }, { name: "idx_sync_pending" }),
+    ]);
+  } catch (err: any) {
+    (globalThis as any).__leadIdxEnsured = false; // allow a later retry
+    console.error(`[leads] ensureLeadIndexes failed: ${err.message}`);
+  }
+}
+
+/** Force-(re)create the leads indexes now and return the resulting index names.
+ *  Backs the ensure-leads-indexes admin endpoint (immediate, verifiable). */
+export async function ensureLeadIndexesNow(): Promise<string[]> {
+  (globalThis as any).__leadIdxEnsured = false;
+  await ensureLeadIndexes();
+  const col = await getCollection<LeadDoc>(COL.LEADS);
+  const idx = await col.listIndexes().toArray();
+  return idx.map((i: any) => i.name);
+}
+
 // ─── MLID: Atomic get-or-create (Mongo) ───────────────────────────────────
 
 export async function getOrCreateMLID(phone: string): Promise<string> {
@@ -249,6 +287,7 @@ export async function upsertLead(
 ): Promise<void> {
   if (!plid) throw new Error("upsertLead: empty plid");
   const col = await getCollection<LeadDoc>(COL.LEADS);
+  void ensureLeadIndexes(); // self-healing backstop; guarded + idempotent
   const now = new Date().toISOString();
 
   const doc: any = {
