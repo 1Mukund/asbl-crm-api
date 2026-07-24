@@ -124,6 +124,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     const body = req.body;
 
+    // MASTER FREEZE — archive the raw lead, do NOT process (no Mongo/Zoho/fanout).
+    // (Meta's GET verify-challenge above is untouched so the webhook stays valid.)
+    {
+      const { isAutomationFrozen, archiveFrozen } = await import("../_utils/automation_freeze");
+      if (await isAutomationFrozen()) {
+        await archiveFrozen("ingest:meta", body);
+        return res.status(200).json({ frozen: true, message: "automation frozen — lead archived, not processed" });
+      }
+    }
+
     // ── Format A: Native Meta Webhook ─────────────────────────────────────────
     // Meta sends: { object: "page", entry: [{ changes: [{ value: { leadgen_id, form_id, page_id, ... } }] }] }
     if (body.object === "page" && Array.isArray(body.entry)) {

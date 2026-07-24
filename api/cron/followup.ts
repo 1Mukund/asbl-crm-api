@@ -725,6 +725,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
+  // MASTER FREEZE — no cron task runs at all (no stage reconcile, no call
+  // firing, no dedup, no follow-ups) while the rebuild is in progress.
+  {
+    const { isAutomationFrozen } = await import("../_utils/automation_freeze");
+    if (await isAutomationFrozen()) {
+      return res.status(200).json({ frozen: true, task: req.query.task ?? null });
+    }
+  }
+
   // ── PRD v1.0 cadence processor (every 15 min) ────────────────────────────
   if (req.query.task === "prd-cadence") {
     try {

@@ -6073,6 +6073,7 @@ ${SHARED_STYLE}
       "calls_paused",
       "first_call_delay_min",
       "first_call_batch_size",
+      "automation_frozen", // MASTER kill-switch — freezes ingest/cron/posthook/reactive/T=0
     ]);
     try {
       const { getBotSetting, setBotSetting } = await import("./_utils/bot_settings");

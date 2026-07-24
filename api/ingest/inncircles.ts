@@ -184,6 +184,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     const body = req.body || {};
 
+    // MASTER FREEZE — archive the raw lead, do NOT process (no Mongo/Zoho/fanout).
+    {
+      const { isAutomationFrozen, archiveFrozen } = await import("../_utils/automation_freeze");
+      if (await isAutomationFrozen()) {
+        await archiveFrozen("ingest:inncircles", body);
+        return res.status(200).json({ frozen: true, message: "automation frozen — lead archived, not processed" });
+      }
+    }
+
     // Support both a single lead object and a batch ({ leads: [...] }).
     const items: any[] = Array.isArray(body?.leads) ? body.leads
       : Array.isArray(body) ? body
