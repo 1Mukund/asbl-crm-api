@@ -16,7 +16,7 @@
  * stage already matches — so re-running commit does not double-write history.
  */
 
-import { getCollection, COL } from "./mongo";
+import { getCollection, getCrmCollection, COL } from "./mongo";
 import {
   recordIngestToNewModel,
   changeStage,
@@ -112,9 +112,9 @@ export async function backfillNewModel(opts: BackfillOpts = {}): Promise<Backfil
   const commit = opts.commit === true;
   const limit = Math.max(1, Math.min(opts.limit ?? 500, 20000));
 
-  const legacy = await getCollection(COL.LEADS);
-  const crmLeads = await getCollection(COL.CRM_LEADS);
-  const staleCol = await getCollection(COL.STALE_PERSON_RECORD);
+  const legacy = await getCollection(COL.LEADS);              // legacy source — Zoho_Database
+  const crmLeads = await getCrmCollection(COL.CRM_LEADS);     // new model — Intelligent_CRM
+  const staleCol = await getCrmCollection(COL.STALE_PERSON_RECORD);
 
   const report: BackfillReport = {
     mode: commit ? "commit" : "dry-run",

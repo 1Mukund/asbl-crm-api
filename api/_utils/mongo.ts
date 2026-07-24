@@ -223,6 +223,54 @@ export async function getNextSequence(
   return seq;
 }
 
+// ─── Intelligent CRM database (the event-sourced rebuild) ─────────────────
+//
+// The new event-sourced model (persons / crm_leads / lead_events / calls /
+// crm_messages / site_visits / stale_person_record) lives in its OWN database,
+// SEPARATE from the legacy Zoho_Database, on the SAME Mongo server/connection.
+// Mongo database names cannot contain spaces, so "Intelligent CRM" is stored
+// as "Intelligent_CRM". The legacy system keeps using getCollection/getDb
+// (Zoho_Database); the new model uses getCrmCollection/getCrmNextSequence.
+export const CRM_DB_NAME = "Intelligent_CRM";
+
+/** Db handle for the Intelligent CRM database. */
+export async function getCrmDb(): Promise<Db> {
+  const client = await getClient();
+  return client.db(CRM_DB_NAME);
+}
+
+/** Get a typed Collection in the Intelligent CRM database. */
+export async function getCrmCollection<T extends Record<string, any> = any>(
+  name: (typeof COL)[keyof typeof COL] | string,
+): Promise<Collection<T>> {
+  const db = await getCrmDb();
+  return db.collection<T>(name) as Collection<T>;
+}
+
+/** Atomic sequence in the Intelligent CRM database (e.g. per-lead event seq).
+ *  Same contract as getNextSequence but on the new DB's _counters. */
+export async function getCrmNextSequence(
+  key: string,
+  startAt: number = 1,
+): Promise<number> {
+  const col = await getCrmCollection<{ _id: string; seq: number }>(COL.COUNTERS);
+  const result = await col.findOneAndUpdate(
+    { _id: key as any },
+    { $inc: { seq: 1 }, $setOnInsert: { _id: key as any } },
+    { upsert: true, returnDocument: "after" },
+  );
+  const seq = (result as any)?.seq ?? 1;
+  if (seq < startAt) {
+    const fix = await col.findOneAndUpdate(
+      { _id: key as any },
+      { $set: { seq: startAt } },
+      { returnDocument: "after" },
+    );
+    return (fix as any)?.seq ?? startAt;
+  }
+  return seq;
+}
+
 /** Health probe for /api/chat-history?action=mongo-diag. */
 export async function ping(): Promise<{
   ok: boolean;
