@@ -973,7 +973,7 @@ The cadence engine runs off `crm_leads` (Mongo, `Intelligent_CRM` db). Every act
 
 ### 14.5 Visit booked (pre-site / site-visit)
 - The proactive cadence **stops**, BUT before the visit send **1 reminder call + 1 WhatsApp** (confirm date/time/location).
-- After the visit → **sales RM takes over** (reactive WhatsApp replies still run).
+- After the visit → **AI cadence ENDS** (stage `visit_done`). **There is NO sales RM in this system** — everything is AI-driven (call + WhatsApp) up to the site visit; beyond the visit the in-person site team handles it, outside this system. (Reactive WhatsApp replies still run.)
 
 ### 14.6 Terminal / stop conditions (both channels stop)
 - Customer says **not interested** → `not_interested_reason` = the captured reason.
@@ -985,7 +985,7 @@ The cadence engine runs off `crm_leads` (Mongo, `Intelligent_CRM` db). Every act
 ### 14.7 Multi-project (resolved)
 - **ONE call track per person** = the `primary_caller` (latest-activated active project). There are NEVER separate call tracks per project.
 - **The context orchestrator gives the bot ALL of the person's active projects' context** (each project + its stage), so in that single call the bot **discusses every active project, asks about each, AND asks the customer's primary interest**. The bot handles multi-project inside one conversation — it does not "shift" between call tracks.
-- **When a site visit is booked in project X:** X becomes the **priority** (sales RM takes it forward), and **every OTHER active project for that person is marked `not_interested`** with `not_interested_reason = "Booked Site Visit in {{X}}"`. (No shift — the others are closed, not re-called.)
+- **When a site visit is booked in project X:** X becomes the **priority** (AI drives reminders till the visit), and **every OTHER active project for that person is marked `not_interested`** with `not_interested_reason = "Booked Site Visit in {{X}}"`. (No shift — the others are closed, not re-called.)
 - If the primary goes `not_interested` for a specific project but the person stays active in another, the single call already covered both (via context) and the bot's captured "primary interest" drives which project stays the focus.
 
 ### 14.8 Storage for the cadence (fields + events)
@@ -1096,3 +1096,54 @@ The rebuild follows **none** of Zoho's logic. Each Zoho dependency is replaced b
 | **Blueprint** drives `Lead_Status` transitions in Zoho | Replaced by **`crm_leads.stage` + `lead_events`** (the state machine in §4). Transitions are already decided; Zoho blueprint is retired. |
 
 **Cutover order (while automation stays frozen):** (1) point Zoho-only lead sources at the ingest API; (2) port the cadence cron to read `crm_leads`; (3) rebuild the posthook Mongo-only; (4) cut automation over to the new stage machine + §14 cadence; (5) decommission Zoho + delete `mongo-sync`. Ingestion API contracts stay unchanged throughout.
+
+---
+
+## 19. Build plan & operating decisions (product-approved)
+
+These are the implementation + policy decisions that govern the rebuild. The dev should build to these.
+
+### 19.1 Cadence engine mechanism
+- **T=0 (lead becomes active / reactivated / resubmitted) → fire DIRECTLY** (immediate, no cron wait).
+- **Follow-up slots → a cron every 5 minutes** reads `crm_leads` where `next_action_at <= now` AND not terminal, fires the due call/WhatsApp, then sets the next `next_action_at` + appends the event.
+
+### 19.2 Opt-out / DNC
+- Customer says STOP / "don't call" / unsubscribe → **all proactive outreach stops** (calls + WhatsApp). Set a suppressed/`dnc` state; append a `dnc` `lead_event` with reason.
+- **It is NOT permanent-forever:** if the customer LATER initiates contact themselves (inbound WhatsApp or call), the lead **reactivates** per §14.9 (positive intent → resume; negative → stays off). Only customer-initiated contact re-opens it.
+
+### 19.3 No sales RM
+- **There is no sales RM in this system.** Everything is AI-driven (call + WhatsApp) **up to the site visit**. There is no RM assignment/handoff/notification. Beyond the visit, the in-person site team handles the lead outside this system; the AI cadence ends at `visit_done`.
+
+### 19.4 Language
+- **Proactive** WhatsApp follow-ups = **English only**. **Reactive** replies = **match the customer's language** (proven rule).
+
+### 19.5 Data retention
+- **Everything is kept FOREVER.** No TTL on `lead_events`, `messages`, `orchestrator_context`, or any history collection. Full permanent audit.
+
+### 19.6 Testing & go-live (for the ops team building this)
+- **Test order:** (1) **dry-run** — the engine decides + logs to DB but fires NOTHING; verify logic. (2) **test leads** — a few own/test numbers, real end-to-end call + WhatsApp. Only then go live.
+- **Go-live scope:** **new leads first** (leads that arrive from cutover-day onward run on the new engine); backfilled old leads are visible/history but their cadence is enabled only later, after confidence.
+
+### 19.7 Backfill
+- Migrate the legacy leads into the new model **now** (`persons` + `crm_leads` + `lead_events`, applying the §6 Inncircles active/stale/primary-caller/activation_type classification and mapping legacy stage/status → new `stage`/`status`). **Dry-run first**, then commit. Missing legacy fields may be skipped. Backfilled leads are **visible + full history** but cadence stays OFF until explicitly enabled (avoids double-outreach).
+
+### 19.8 Posthook contract (voice bot → us)
+- The voice bot MUST send, per completed call: **connection outcome** (`connected/no_answer/busy/switched_off`) + **semantic disposition** (`pre_site/callback_time/not_interested/interested`) + **captured slots** (`callback_time`, `primary_interest` project, `visit_date`).
+- The posthook is **strict**: if the disposition is missing it **alerts on Teams + logs** (never silently guesses). This is the fix for the earlier gap where the bot sent only `connected` and the CRM never learned a site visit was captured.
+
+### 19.9 Reactive WhatsApp bot
+- The existing Gemini reply engine (persona + project knowledge + document-send + language-match) is **kept as-is**; it is **re-wired to the new model** — every inbound/outbound writes `messages` + a `lead_events` row, and updates `crm_leads` (reactivation / ghost mode per §14).
+
+### 19.10 CRM UI data access
+- The CRM front-end (built by an external dev) reads via **backend read-APIs** (production-grade + effectively as fast as direct Mongo, because complex views are aggregated server-side and it keeps the DB private). No direct-Mongo-from-frontend. Endpoints: `person-oneview`, `leads-due`, `identity-graph`, `dashboard-aggregates` (build `person-oneview` + `leads-due` first).
+
+### 19.11 Multi-project primary interest
+- Default focus = the **latest-activated** project (`primary_caller`). During the call/chat the bot **asks the customer's primary interest**; the answer becomes `primary_interest` **and shifts the focus/call-track** to that project.
+
+### 19.12 Build phase order
+`backfill → orchestrator (context build + store) → cadence engine + cron → posthook (Mongo-only) → dashboards/read-APIs → cutover (Zoho-only sources → ingest; test leads → go-live; delete mongo-sync + decommission Zoho)`.
+
+### 19.13 Alerts, auth, dedup (ops defaults)
+- **Alerts (Teams):** critical failures (ingest / posthook / cron) + posthook disposition-gap + a daily summary (leads, calls, connect-rate).
+- **Auth:** dashboard login via `dashboard_users` with simple roles (admin / viewer) — no RM role.
+- **Dedup:** identity = phone; number-change / two-number merges are a manual tool later, not automatic.
