@@ -982,9 +982,11 @@ The cadence engine runs off `crm_leads` (Mongo, `Intelligent_CRM` db). Every act
 - **Visit booked** → cadence stops (reminder-only until the visit).
 - `not_interested_reason` is a **stored field** on `crm_leads` (and carried in the `stage_change` event's `reason`), so every terminal lead shows WHY.
 
-### 14.7 Multi-project
-- Only the **primary_caller** (latest-activated active project) gets calls. Other active projects are CRM-visible and provide **context to the calling agent** (their stages + not-interested history).
-- **OPEN (product decision):** when the primary_caller lead becomes terminal, does the call-track shift to the next-latest active project, or does calling stop for that person? (Default assumed: no auto-shift — decide.)
+### 14.7 Multi-project (resolved)
+- **ONE call track per person** = the `primary_caller` (latest-activated active project). There are NEVER separate call tracks per project.
+- **The context orchestrator gives the bot ALL of the person's active projects' context** (each project + its stage), so in that single call the bot **discusses every active project, asks about each, AND asks the customer's primary interest**. The bot handles multi-project inside one conversation — it does not "shift" between call tracks.
+- **When a site visit is booked in project X:** X becomes the **priority** (sales RM takes it forward), and **every OTHER active project for that person is marked `not_interested`** with `not_interested_reason = "Booked Site Visit in {{X}}"`. (No shift — the others are closed, not re-called.)
+- If the primary goes `not_interested` for a specific project but the person stays active in another, the single call already covered both (via context) and the bot's captured "primary interest" drives which project stays the focus.
 
 ### 14.8 Storage for the cadence (fields + events)
 **On `crm_leads` (current state):**
@@ -1032,3 +1034,65 @@ All of this is answerable from `crm_leads` (current-state counters) + `lead_even
 
 ### 15.4 Calling + WhatsApp logic (documented in-product)
 The dashboard should surface (or link) the **cadence rules** from §14 so ops/sales understand: the 2/day 10 AM + 5 PM call cadence, the 7-day/14-call cap, the WhatsApp 1/day (cold 7d, ghost 3d), reactivation-by-inbound, and the visit-reminder flow.
+
+### 14.9 Reactivation cadence (dormant / not-interested lead replies via WhatsApp)
+When a `dormant`/`not_interested` lead sends an inbound WhatsApp (e.g. day 8/9), the **reply's intent decides** the resume cadence:
+- **Positive intent** → the context orchestrator sends the lead's context to the bot; the bot converses on that basis.
+  - Customer **asks for a call** → place the call.
+  - Customer **does NOT ask for a call** → continue on **WhatsApp**, AND fire **exactly ONE call at the time the inbound arrived** (once only) — after that, everything continues on WhatsApp.
+- **Negative intent (DNC / not interested)** → **STOP** everything (mark DNC / not_interested; no further outreach).
+- The reactivation itself is an `activation` event (`activation_type = reactivated`, `via = whatsapp_inbound`).
+
+### 14.10 Resubmission cadence (existing lead re-submits the SAME project's form)
+- **Lead is ACTIVE** → **fire a call IMMEDIATELY** on resubmit, with context to the bot that this is a **resubmission** (renewed interest).
+- **Lead is not_interested / dormant** → **reactivate + fire a fresh cycle** (calls + WhatsApp), with resubmission context.
+
+---
+
+## 16. Orchestrator context — stored in Intelligent_CRM
+
+The **context orchestrator** builds, for every outreach touch (call or WhatsApp), the exact context handed to the bot/agent: the person's active projects + each stage, the not-interested projects, budget/size/prefs, `activation_type`, the last inbound reply's context, the captured primary interest, and multi-project flags. **All of it is stored** (product requirement) — two layers, both kept:
+
+1. **Timeline snapshot** — each `call_scheduled` / `wa_outbound` `lead_event` carries `data.context_snapshot` = the context the bot got for THAT touch. So the timeline shows "what did the bot know when it called/messaged."
+2. **Dedicated `orchestrator_context` collection** — one doc per interaction (full/heavy context + the resolved decision), for audit + the identity-graph/dashboard. Keyed by `{ person_id, lead_id, interaction_id, ts }`, indexed `{ person_id, ts }` and `{ lead_id, ts }`.
+3. `crm_leads.orchestrator_context` — the *latest* built context (for the one-view, no lookup).
+
+So for any user you can answer: "what context is the orchestrator sending, and how is it working for this person?" — from data alone.
+
+---
+
+## 17. Dashboard — identity graph + person one-view
+
+Beyond §15, the new CRM must render two person-centric views:
+
+### 17.1 Identity graph (per person)
+A visual graph of how the orchestrator sees a person:
+`person (phone)` → all their **projects** (active / stale nodes) → each project's **stage** → the **orchestrator context** currently feeding the bot (what it knows, primary interest, activation_type). Shows, at a glance, "one user, N projects, this is how the orchestrator is working them." Edges carry the activation/relationship (fresh / reactivated / born_in_other / bulk / booked-elsewhere).
+
+### 17.2 Person one-view (360)
+A single screen consolidating everything for a person (as designed in the DB architecture — "har lead ka sab dikhe", at person level):
+- Identity (phone, name, language, prefs, DNC).
+- **All projects** (active + stale) with stage, `activation_type`, is_primary_caller.
+- **Full timeline** — every call, message, doc, stage change, activation, reactivation (the merged `lead_events` across the person's projects).
+- **Cadence state** — call attempts (X/14), next call time, WhatsApp mode (cold/ghost/dormant) + follow-up count, `next_action_at`.
+- **Messages** — full chat, and **which ASBL sender number(s)** messaged the person (with counts per number).
+- **Calls** — each call's time/slot/outcome/disposition/duration/recording.
+- **`not_interested_reason`** wherever terminal.
+- **Orchestrator context** (latest + per-touch history from §16).
+
+Both views read only from `persons` / `crm_leads` / `lead_events` / `messages` / `calls` / `orchestrator_context` — no extra store.
+
+---
+
+## 18. Zoho-free architecture (the cutover — nothing follows Zoho)
+
+The rebuild follows **none** of Zoho's logic. Each Zoho dependency is replaced by a Mongo/Intelligent_CRM equivalent:
+
+| Old (Zoho) | New (Intelligent_CRM) |
+|---|---|
+| Cadence cron reads the lead corpus from **Zoho** | Cron reads **`crm_leads`** (`stage` + `next_action_at` indexed) — the §14 cadence. |
+| **mongo-sync** (Zoho→Mongo) keeps Mongo populated for Zoho-created leads | **Removed** once nothing writes directly to Zoho. Any source that still writes to Zoho (LeadChain / manual / bulk) must point at the **ingest API** (→ Mongo-first) instead. |
+| **Posthook** looks up the lead in Zoho (`locateLead`) + writes Zoho fields/blueprint | Posthook looks up **`crm_leads`** by `call_id`/phone → appends a `call_completed` **`lead_event`** → projects `crm_leads` (stage machine) → sets the next cadence step. **No Zoho.** |
+| **Blueprint** drives `Lead_Status` transitions in Zoho | Replaced by **`crm_leads.stage` + `lead_events`** (the state machine in §4). Transitions are already decided; Zoho blueprint is retired. |
+
+**Cutover order (while automation stays frozen):** (1) point Zoho-only lead sources at the ingest API; (2) port the cadence cron to read `crm_leads`; (3) rebuild the posthook Mongo-only; (4) cut automation over to the new stage machine + §14 cadence; (5) decommission Zoho + delete `mongo-sync`. Ingestion API contracts stay unchanged throughout.
