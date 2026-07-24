@@ -937,3 +937,98 @@ Visual source of design truth (read alongside this PRD): `db_architecture.html`.
 ---
 
 *End of PRD.*
+
+---
+
+## 14. Cadence engine — calling + WhatsApp (product-approved v1)
+
+The cadence engine runs off `crm_leads` (Mongo, `Intelligent_CRM` db). Every action appends a `lead_event`, then projects the current-state fields below. Calls and WhatsApp run in PARALLEL, each on its own timer (`next_action_at` is per-channel; see storage).
+
+### 14.1 Timezone rule (applies to ALL timings)
+- Phone starts with **+91 → IST (Asia/Kolkata)**.
+- Otherwise → the **country-code's timezone**.
+- All slot times below are in the **customer's** timezone.
+
+### 14.2 T=0 — lead becomes ACTIVE (fresh / reactivated / born_in_other / bulk)
+- **Fire the first AI call IMMEDIATELY.** (Night 9pm–6am IST +91 calls are auto-deferred to the morning window by the voice bot — `NIGHT_DEFERRED` — so "immediate" is safe.)
+- **Send the T=0 WhatsApp greeting.**
+
+### 14.3 Calling cadence
+| Situation | Rule |
+|---|---|
+| **Miss** (not picked / busy / switched off) | **2 calls/day** at **10:00 AM** and **5:00 PM** (customer TZ), every day, for **7 days** → max **14 attempts** total. |
+| **Picked + customer gave a callback time** | Call at that **exact time** (TZ-aware). Overrides the 7-day cap. |
+| **Picked + no time given** | Continue the **10 AM + 5 PM** daily cadence until picked again, or the 7-day window ends. |
+| **Any pickup** | Cancels the remaining miss attempts; the picked cadence applies. |
+| **7 days / 14 calls, never picked** | Stage → **not_interested**, `not_interested_reason = "Multiple Call Failures"`. **STOP calls AND WhatsApp.** |
+
+### 14.4 WhatsApp cadence (parallel to calls)
+| Situation | Rule |
+|---|---|
+| **T=0** | Send greeting. |
+| **Proactive (cold — never replied)** | **1 message/day (anytime), for 7 days.** |
+| **No reply in 7 days** | Stage → **not_interested**, `not_interested_reason = "No WhatsApp reply (7 days)"`. Stop. |
+| **Ghost (replied once, then silent)** | **1 message/day for 3 days**, each written with the **context of the customer's last reply**. |
+| **Reactivation** | A **dormant/not-interested** lead that replies later (e.g. day 8/9) → **reactivate** (append `activation` event, `activation_type = reactivated`, `via = whatsapp_inbound`); stage → engaged; cadence resumes. |
+
+### 14.5 Visit booked (pre-site / site-visit)
+- The proactive cadence **stops**, BUT before the visit send **1 reminder call + 1 WhatsApp** (confirm date/time/location).
+- After the visit → **sales RM takes over** (reactive WhatsApp replies still run).
+
+### 14.6 Terminal / stop conditions (both channels stop)
+- Customer says **not interested** → `not_interested_reason` = the captured reason.
+- **7-day / 14-call** no pickup → `not_interested_reason = "Multiple Call Failures"`.
+- **7-day** no WhatsApp reply → `not_interested_reason = "No WhatsApp reply (7 days)"`.
+- **Visit booked** → cadence stops (reminder-only until the visit).
+- `not_interested_reason` is a **stored field** on `crm_leads` (and carried in the `stage_change` event's `reason`), so every terminal lead shows WHY.
+
+### 14.7 Multi-project
+- Only the **primary_caller** (latest-activated active project) gets calls. Other active projects are CRM-visible and provide **context to the calling agent** (their stages + not-interested history).
+- **OPEN (product decision):** when the primary_caller lead becomes terminal, does the call-track shift to the next-latest active project, or does calling stop for that person? (Default assumed: no auto-shift — decide.)
+
+### 14.8 Storage for the cadence (fields + events)
+**On `crm_leads` (current state):**
+- `next_action` : `{ call_at, wa_at }` — per-channel next timers (or two rows; a call timer + a whatsapp timer).
+- `call` : `{ attempts, last_at, last_outcome, picked_ever, callback_time }`.
+- `wa` : `{ mode: cold|ghost|dormant, followup_count, last_outbound_at, last_inbound_at, window_ends_at }`.
+- `not_interested_reason` : string (set on any terminal).
+- `stage`, `status`, `is_primary_caller`, `activation_type` (from §6).
+
+**In `lead_events` (append-only timeline):**
+- `call_scheduled` / `call_completed` `{ outcome, disposition, slot, tz }`
+- `wa_outbound` `{ mode, followup_no, context_ref }` · `wa_inbound` `{ text_ref }`
+- `stage_change` → `not_interested` `{ reason }`
+- `activation` `{ activation_type, via }` — reactivation-by-inbound lands here
+- `visit_booked` / reminder events
+
+So a lead's full timeline shows every call attempt (with slot + outcome), every message (with mode), when/why it went not-interested, and when/how it reactivated.
+
+---
+
+## 15. Dashboard requirements (what the new CRM UI must show)
+
+All of this is answerable from `crm_leads` (current-state counters) + `lead_events` (timeline) + `messages` + `calls` — no extra store needed. Indexed per §7.
+
+### 15.1 Per PERSON
+- **Total calls** and **total WhatsApp messages** (all projects combined).
+- **Total follow-ups sent** — calls + WhatsApp separately.
+- **Per-project breakdown**: for each of the person's projects — # calls, # messages, current stage, active/stale.
+- **Which ASBL sender number(s)** messaged this person (from `messages.sender`) — full list + counts per sender (a person can be messaged from multiple numbers).
+- **Full timeline** (the person's `lead_events` across all projects, time-ordered).
+
+### 15.2 Per LEAD (person × project)
+- Current **stage / status**, `activation_type`, `is_primary_caller`.
+- **Cadence state**: call attempts (X/14), next call time, WhatsApp mode (cold/ghost/dormant) + follow-up count, `next_action_at`.
+- **`not_interested_reason`** (if terminal) — WHY it stopped.
+- **Call log**: each call's time, slot, outcome, disposition, duration, recording.
+- **Message log**: each message in/out, time, sender number, intent.
+
+### 15.3 Aggregate / ops views
+- **Funnel** by stage (new → … → booked) with conversion %.
+- **Calls today / this week**, connect rate, per-slot performance (10 AM vs 5 PM).
+- **Not-interested breakdown** by `not_interested_reason` (how many "Multiple Call Failures" vs "No WhatsApp reply" vs "Customer declined").
+- **Reactivations** (dormant → active via inbound) count.
+- **Per-project** active leads, due-for-call, due-for-WhatsApp.
+
+### 15.4 Calling + WhatsApp logic (documented in-product)
+The dashboard should surface (or link) the **cadence rules** from §14 so ops/sales understand: the 2/day 10 AM + 5 PM call cadence, the 7-day/14-call cap, the WhatsApp 1/day (cold 7d, ghost 3d), reactivation-by-inbound, and the visit-reminder flow.
