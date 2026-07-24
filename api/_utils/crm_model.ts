@@ -31,7 +31,7 @@
  * (missing ids); call sites that must not fail ingest wrap in try/catch.
  */
 
-import { getCollection, getNextSequence, COL } from "./mongo";
+import { getCrmCollection, getCrmNextSequence, COL } from "./mongo";
 
 // ─── Enums (string unions + runtime arrays) ────────────────────────────────
 
@@ -102,15 +102,14 @@ export async function ensureCrmIndexes(): Promise<void> {
   if (G.__crmIdxEnsured) return;
   G.__crmIdxEnsured = true;
   try {
-    const [persons, leads, events, calls, messages, visits, stale, frozen] = await Promise.all([
-      getCollection(COL.PERSONS),
-      getCollection(COL.CRM_LEADS),
-      getCollection(COL.LEAD_EVENTS),
-      getCollection(COL.CALLS),
-      getCollection(COL.CRM_MESSAGES),
-      getCollection(COL.SITE_VISITS),
-      getCollection(COL.STALE_PERSON_RECORD),
-      getCollection(COL.FROZEN_INBOX),
+    const [persons, leads, events, calls, messages, visits, stale] = await Promise.all([
+      getCrmCollection(COL.PERSONS),
+      getCrmCollection(COL.CRM_LEADS),
+      getCrmCollection(COL.LEAD_EVENTS),
+      getCrmCollection(COL.CALLS),
+      getCrmCollection(COL.CRM_MESSAGES),
+      getCrmCollection(COL.SITE_VISITS),
+      getCrmCollection(COL.STALE_PERSON_RECORD),
     ]);
     await Promise.all([
       // persons ( _id (phone) is the automatic unique index )
@@ -142,10 +141,6 @@ export async function ensureCrmIndexes(): Promise<void> {
       // stale_person_record
       stale.createIndex({ person_id: 1 }, { name: "idx_stale_person" }),
       stale.createIndex({ person_id: 1, inncircles_born_date: 1 }, { name: "idx_stale_person_born" }),
-      // frozen_inbox — TTL (30d). Requires `at` to be a BSON Date (see
-      // automation_freeze.archiveFrozen); Mongo ignores string-valued fields
-      // for TTL expiry.
-      frozen.createIndex({ at: 1 }, { name: "idx_frozen_ttl", expireAfterSeconds: 2592000 }),
     ]);
   } catch (err: any) {
     (globalThis as any).__crmIdxEnsured = false; // allow a later retry
@@ -161,10 +156,10 @@ export async function ensureCrmIndexesNow(): Promise<Record<string, string[]>> {
   const out: Record<string, string[]> = {};
   for (const name of [
     COL.PERSONS, COL.CRM_LEADS, COL.LEAD_EVENTS, COL.CALLS,
-    COL.CRM_MESSAGES, COL.SITE_VISITS, COL.STALE_PERSON_RECORD, COL.FROZEN_INBOX,
+    COL.CRM_MESSAGES, COL.SITE_VISITS, COL.STALE_PERSON_RECORD,
   ]) {
     try {
-      const col = await getCollection(name);
+      const col = await getCrmCollection(name);
       const idx = await col.listIndexes().toArray();
       out[name] = idx.map((i: any) => i.name);
     } catch (err: any) {
@@ -205,7 +200,7 @@ export interface EventDoc extends EventInput {
 export async function appendEvent(evt: EventInput): Promise<EventDoc> {
   if (!evt.lead_id) throw new Error("appendEvent: empty lead_id");
   void ensureCrmIndexes();
-  const seq = await getNextSequence(`crm_ev:${evt.lead_id}`, 1);
+  const seq = await getCrmNextSequence(`crm_ev:${evt.lead_id}`, 1);
   const doc: any = {
     lead_id: evt.lead_id,
     person_id: evt.person_id,
@@ -221,14 +216,14 @@ export async function appendEvent(evt: EventInput): Promise<EventDoc> {
   if (evt.reason) doc.reason = evt.reason;
   if (evt.ref) doc.ref = evt.ref;
   if (evt.data) doc.data = evt.data;
-  const col = await getCollection(COL.LEAD_EVENTS);
+  const col = await getCrmCollection(COL.LEAD_EVENTS);
   await col.insertOne(doc as any);
   return doc as EventDoc;
 }
 
 /** Read a lead's full timeline in order. */
 export async function getLeadTimeline(leadId: string): Promise<EventDoc[]> {
-  const col = await getCollection(COL.LEAD_EVENTS);
+  const col = await getCrmCollection(COL.LEAD_EVENTS);
   return (await col.find({ lead_id: leadId } as any).sort({ seq: 1 }).toArray()) as any;
 }
 
@@ -242,7 +237,7 @@ async function projectLead(
   set: Record<string, any>,
   inc?: Record<string, number>,
 ): Promise<void> {
-  const col = await getCollection(COL.CRM_LEADS);
+  const col = await getCrmCollection(COL.CRM_LEADS);
   const update: any = {
     $set: { ...set, updated_at: nowISO() },
     $max: { event_seq: seq },
@@ -288,7 +283,7 @@ export async function upsertPerson(input: PersonInput): Promise<string> {
   };
   if (Object.keys(addToSet).length) update.$addToSet = addToSet;
 
-  const col = await getCollection(COL.PERSONS);
+  const col = await getCrmCollection(COL.PERSONS);
   await col.updateOne({ _id: personId } as any, update, { upsert: true });
   return personId;
 }
@@ -375,10 +370,10 @@ function comparePrimary(a: any, b: any): number {
  * primary_caller_shifted event on the new primary and update persons.
  */
 export async function recomputePrimaryCaller(personId: string): Promise<string | null> {
-  const leads = await getCollection(COL.CRM_LEADS);
+  const leads = await getCrmCollection(COL.CRM_LEADS);
   const active = (await leads.find({ person_id: personId, is_active: true } as any).toArray()) as any[];
   if (!active.length) {
-    await (await getCollection(COL.PERSONS)).updateOne(
+    await (await getCrmCollection(COL.PERSONS)).updateOne(
       { _id: personId } as any,
       { $set: { active_lead_ids: [], primary_caller_lead_id: null, updated_at: nowISO() } },
       { upsert: false },
@@ -400,7 +395,7 @@ export async function recomputePrimaryCaller(personId: string): Promise<string |
     }
   }
 
-  await (await getCollection(COL.PERSONS)).updateOne(
+  await (await getCrmCollection(COL.PERSONS)).updateOne(
     { _id: personId } as any,
     {
       $set: {
@@ -490,8 +485,8 @@ export async function recordIngestToNewModel(input: IngestModelInput): Promise<I
   });
 
   const cls = classifyActivation(input.flags);
-  const leads = await getCollection(COL.CRM_LEADS);
-  const stale = await getCollection(COL.STALE_PERSON_RECORD);
+  const leads = await getCrmCollection(COL.CRM_LEADS);
+  const stale = await getCrmCollection(COL.STALE_PERSON_RECORD);
 
   // Current state of this lead across both collections.
   const existingActive = (await leads.findOne({ _id: leadId } as any)) as any;
@@ -672,8 +667,8 @@ export async function recordIngestToNewModel(input: IngestModelInput): Promise<I
 export async function setLeadZohoId(leadId: string, zohoLeadId: string): Promise<void> {
   if (!leadId || !zohoLeadId) return;
   const patch = { $set: { "external.zoho_lead_id": zohoLeadId, "external.synced": true, updated_at: nowISO() } };
-  await (await getCollection(COL.CRM_LEADS)).updateOne({ _id: leadId } as any, patch, { upsert: false });
-  await (await getCollection(COL.STALE_PERSON_RECORD)).updateOne({ _id: leadId } as any, patch, { upsert: false });
+  await (await getCrmCollection(COL.CRM_LEADS)).updateOne({ _id: leadId } as any, patch, { upsert: false });
+  await (await getCrmCollection(COL.STALE_PERSON_RECORD)).updateOne({ _id: leadId } as any, patch, { upsert: false });
 }
 
 // ─── stage / status transitions (every change = one event) ─────────────────
@@ -691,7 +686,7 @@ export async function changeStage(
   toStage: Stage,
   opts: TransitionOpts = {},
 ): Promise<{ changed: boolean; from?: string }> {
-  const leads = await getCollection(COL.CRM_LEADS);
+  const leads = await getCrmCollection(COL.CRM_LEADS);
   const cur = (await leads.findOne({ _id: leadId } as any)) as any;
   if (!cur) return { changed: false };
   if (cur.stage === toStage) return { changed: false, from: cur.stage };
@@ -720,7 +715,7 @@ export async function changeStatus(
   toStatus: Status,
   opts: TransitionOpts = {},
 ): Promise<{ changed: boolean; from?: string }> {
-  const leads = await getCollection(COL.CRM_LEADS);
+  const leads = await getCrmCollection(COL.CRM_LEADS);
   const cur = (await leads.findOne({ _id: leadId } as any)) as any;
   if (!cur) return { changed: false };
   if (cur.status === toStatus) return { changed: false, from: cur.status };
@@ -743,7 +738,7 @@ export async function scheduleNextAction(
   type: "call" | "whatsapp" | null,
   opts: TransitionOpts = {},
 ): Promise<void> {
-  const leads = await getCollection(COL.CRM_LEADS);
+  const leads = await getCrmCollection(COL.CRM_LEADS);
   const cur = (await leads.findOne({ _id: leadId } as any)) as any;
   if (!cur) return;
   const atISO = at ? new Date(at).toISOString() : null;
@@ -772,7 +767,7 @@ export interface CallScheduledInput {
 /** Record a scheduled/triggered dial: writes the calls doc + call_scheduled
  *  event + bumps call_count. */
 export async function recordCallScheduled(input: CallScheduledInput): Promise<void> {
-  const calls = await getCollection(COL.CALLS);
+  const calls = await getCrmCollection(COL.CALLS);
   const now = nowISO();
   await calls.updateOne(
     { _id: input.call_id } as any,
@@ -813,7 +808,7 @@ export interface CallCompletedInput {
 /** Record a completed call: updates the calls doc + call_completed event +
  *  bumps connected_count when connected. Disposition stays in its own field. */
 export async function recordCallCompleted(input: CallCompletedInput): Promise<void> {
-  const calls = await getCollection(COL.CALLS);
+  const calls = await getCrmCollection(COL.CALLS);
   const now = nowISO();
   await calls.updateOne(
     { _id: input.call_id } as any,
@@ -876,7 +871,7 @@ export interface MessageInput {
  *  deduped by provider message id. */
 export async function recordMessage(input: MessageInput): Promise<void> {
   void ensureCrmIndexes();
-  const messages = await getCollection(COL.CRM_MESSAGES);
+  const messages = await getCrmCollection(COL.CRM_MESSAGES);
   const now = input.ts ? new Date(input.ts).toISOString() : nowISO();
   await messages.updateOne(
     { _id: input.message_id } as any,
@@ -894,7 +889,7 @@ export async function recordMessage(input: MessageInput): Promise<void> {
   );
 
   if (!input.lead_id) return; // phone-level store only; no lead to attribute
-  const leads = await getCollection(COL.CRM_LEADS);
+  const leads = await getCrmCollection(COL.CRM_LEADS);
   const cur = (await leads.findOne({ _id: input.lead_id } as any)) as any;
   if (!cur) return;
   const inbound = input.direction === "inbound";
@@ -919,7 +914,7 @@ export async function recordDocSent(
   docType: string,
   opts: { ref?: string; sizeLabel?: string; actor?: Actor } = {},
 ): Promise<void> {
-  const leads = await getCollection(COL.CRM_LEADS);
+  const leads = await getCrmCollection(COL.CRM_LEADS);
   const cur = (await leads.findOne({ _id: leadId } as any)) as any;
   if (!cur) return;
   const ev = await appendEvent({
@@ -948,7 +943,7 @@ export interface SiteVisitInput {
  *  visit_booked event. Does NOT change stage — callers pair it with
  *  changeStage("visit_scheduled") so the milestone/automation-stop is explicit. */
 export async function recordSiteVisitBooked(input: SiteVisitInput): Promise<void> {
-  const visits = await getCollection(COL.SITE_VISITS);
+  const visits = await getCrmCollection(COL.SITE_VISITS);
   const now = nowISO();
   await visits.updateOne(
     { _id: input.visit_id } as any,
@@ -977,7 +972,7 @@ export async function recordSiteVisitOutcome(
   status: "done" | "no_show" | "cancelled",
   opts: { actor?: Actor } = {},
 ): Promise<void> {
-  const visits = await getCollection(COL.SITE_VISITS);
+  const visits = await getCrmCollection(COL.SITE_VISITS);
   const visit = (await visits.findOne({ _id: visitId } as any)) as any;
   if (!visit) return;
   await visits.updateOne(
@@ -1013,9 +1008,9 @@ export interface CallerContext {
  */
 export async function buildCallerContext(phone: string): Promise<CallerContext> {
   const personId = personIdOf(phone);
-  const persons = await getCollection(COL.PERSONS);
-  const leads = await getCollection(COL.CRM_LEADS);
-  const stale = await getCollection(COL.STALE_PERSON_RECORD);
+  const persons = await getCrmCollection(COL.PERSONS);
+  const leads = await getCrmCollection(COL.CRM_LEADS);
+  const stale = await getCrmCollection(COL.STALE_PERSON_RECORD);
 
   const person = (await persons.findOne({ _id: personId } as any)) as any;
   const active = (await leads.find({ person_id: personId, is_active: true } as any).toArray()) as any[];
