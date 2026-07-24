@@ -8027,8 +8027,11 @@ ${SHARED_STYLE}
     const session = (req as any)._session;
     const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
     const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
-    if (!session && (!expectedSecret || incomingSecret !== expectedSecret)) {
-      return res.status(401).json({ error: "Unauthorized — log in OR pass ?secret=..." });
+    // Heavy CRM op: require an ADMIN session OR the shared secret — a plain
+    // approved viewer session must NOT be able to trigger a full backfill
+    // commit. Fails closed on a missing/blank secret.
+    if (!(session?.role === "admin") && !(expectedSecret && incomingSecret === expectedSecret)) {
+      return res.status(401).json({ error: "Unauthorized — admin login OR pass ?secret=..." });
     }
     // commit ONLY when explicitly asked AND via POST — a GET can never write.
     const wantsCommit = String((req.query.commit as string) || (req.body && (req.body as any).commit) || "").toLowerCase() === "true";
@@ -8071,8 +8074,10 @@ ${SHARED_STYLE}
     const session = (req as any)._session;
     const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
     const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
-    if (!session && (!expectedSecret || incomingSecret !== expectedSecret)) {
-      return res.status(401).json({ error: "Unauthorized — log in OR pass ?secret=..." });
+    // Require an ADMIN session OR the shared secret (index rebuilds hit the DB —
+    // keep viewer sessions out). Fails closed on a missing/blank secret.
+    if (!(session?.role === "admin") && !(expectedSecret && incomingSecret === expectedSecret)) {
+      return res.status(401).json({ error: "Unauthorized — admin login OR pass ?secret=..." });
     }
     try {
       const { ensureCrmIndexesNow } = await import("./_utils/crm_model");
@@ -8102,15 +8107,28 @@ ${SHARED_STYLE}
   //     were accidentally created in the LEGACY Zoho_Database (before the
   //     Intelligent_CRM db split). SAFE: drops ONLY these exact names, ONLY from
   //     Zoho_Database, and ONLY when the collection is EMPTY — never drops data.
-  //   POST /api/chat-history?action=drop-legacy-crm-collections&secret=<...>
-  if ((req.method === "GET" || req.method === "POST") && req.query.action === "drop-legacy-crm-collections") {
+  //     POST-only + &confirm=true required (destructive-capable; must not be
+  //     reachable by a plain URL that lands in access logs / history).
+  //   POST /api/chat-history?action=drop-legacy-crm-collections&secret=<...>&confirm=true
+  if (req.method === "POST" && req.query.action === "drop-legacy-crm-collections") {
     const session = (req as any)._session;
     const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
     const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
-    if (!session && (!expectedSecret || incomingSecret !== expectedSecret)) {
-      return res.status(401).json({ error: "Unauthorized — log in OR pass ?secret=..." });
+    // Destructive-capable: require an ADMIN session OR the shared secret. Fails
+    // closed on a missing/blank secret; a plain viewer session cannot invoke it.
+    if (!(session?.role === "admin") && !(expectedSecret && incomingSecret === expectedSecret)) {
+      return res.status(401).json({ error: "Unauthorized — admin login OR pass ?secret=..." });
+    }
+    // Explicit confirmation so an accidental/replayed call can't drop anything.
+    let dropBody: any = req.body || {};
+    if (typeof dropBody === "string") { try { dropBody = JSON.parse(dropBody); } catch { dropBody = {}; } }
+    const confirmed = String((req.query.confirm as string) || dropBody.confirm || "").toLowerCase() === "true";
+    if (!confirmed) {
+      return res.status(400).json({ error: "Refused — pass confirm=true to drop the empty legacy CRM collections." });
     }
     try {
+      // Hardcoded 7-name allowlist — NO user input reaches the drop. getDb() is
+      // Zoho_Database ONLY, so this can never touch Intelligent_CRM.
       const NAMES = ["persons", "crm_leads", "lead_events", "calls", "messages", "site_visits", "stale_person_record"];
       const { getDb } = await import("./_utils/mongo");
       const db = await getDb(); // Zoho_Database (the LEGACY db these were wrongly created in)
@@ -8118,7 +8136,10 @@ ${SHARED_STYLE}
       const result: any[] = [];
       for (const name of NAMES) {
         if (!existing.includes(name)) { result.push({ name, status: "absent" }); continue; }
-        const count = await db.collection(name).estimatedDocumentCount();
+        // countDocuments({}) does a real count — estimatedDocumentCount reads
+        // cached metadata that can report 0 for a non-empty collection after an
+        // unclean shutdown, which would risk dropping live data.
+        const count = await db.collection(name).countDocuments({});
         if (count > 0) { result.push({ name, status: "SKIPPED — not empty", count }); continue; }
         await db.collection(name).drop().catch(() => {});
         result.push({ name, status: "dropped" });

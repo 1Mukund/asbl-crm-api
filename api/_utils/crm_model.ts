@@ -31,7 +31,7 @@
  * (missing ids); call sites that must not fail ingest wrap in try/catch.
  */
 
-import { getCrmCollection, getCrmNextSequence, COL } from "./mongo";
+import { getCrmCollection, getCrmNextSequence, getCollection, COL } from "./mongo";
 
 // ─── Enums (string unions + runtime arrays) ────────────────────────────────
 
@@ -142,6 +142,17 @@ export async function ensureCrmIndexes(): Promise<void> {
       stale.createIndex({ person_id: 1 }, { name: "idx_stale_person" }),
       stale.createIndex({ person_id: 1, inncircles_born_date: 1 }, { name: "idx_stale_person_born" }),
     ]);
+    // frozen_inbox {at} TTL (§7 / §3.9). archiveFrozen() in automation_freeze.ts
+    // writes this collection via getCollection → it lives in the LEGACY
+    // Zoho_Database, so the TTL index MUST be built on THAT db (index and data
+    // must co-locate). `at` is a BSON Date, so the 30-day TTL fires. Nested in
+    // its own try so a failure here can't disturb the CRM-db index build above.
+    try {
+      const frozen = await getCollection(COL.FROZEN_INBOX);
+      await frozen.createIndex({ at: 1 }, { name: "idx_frozen_inbox_ttl", expireAfterSeconds: 2592000 });
+    } catch (ferr: any) {
+      console.error(`[crm_model] frozen_inbox TTL index failed: ${ferr.message}`);
+    }
   } catch (err: any) {
     (globalThis as any).__crmIdxEnsured = false; // allow a later retry
     console.error(`[crm_model] ensureCrmIndexes failed: ${err.message}`);
@@ -165,6 +176,15 @@ export async function ensureCrmIndexesNow(): Promise<Record<string, string[]>> {
     } catch (err: any) {
       out[name] = [`error: ${err.message}`];
     }
+  }
+  // frozen_inbox lives in the LEGACY Zoho_Database (see ensureCrmIndexes), so
+  // report it from there, not the CRM db.
+  try {
+    const frozen = await getCollection(COL.FROZEN_INBOX);
+    const idx = await frozen.listIndexes().toArray();
+    out["frozen_inbox (Zoho_Database)"] = idx.map((i: any) => i.name);
+  } catch (err: any) {
+    out["frozen_inbox (Zoho_Database)"] = [`error: ${err.message}`];
   }
   return out;
 }
@@ -225,6 +245,24 @@ export async function appendEvent(evt: EventInput): Promise<EventDoc> {
 export async function getLeadTimeline(leadId: string): Promise<EventDoc[]> {
   const col = await getCrmCollection(COL.LEAD_EVENTS);
   return (await col.find({ lead_id: leadId } as any).sort({ seq: 1 }).toArray()) as any;
+}
+
+/**
+ * True if an event of this (lead_id, type, ref) already exists. Detail docs
+ * (calls / messages / site_visits) are deduped by _id, but the *event* append
+ * and its counter $inc must ALSO fire at most once per external ref — otherwise
+ * a provider/webhook retry (same call_id / message_id / visit_id) double-appends
+ * history and double-counts counters (§10 "idempotent where it matters").
+ *
+ * When `ref` is absent we can't distinguish a retry from a legitimate repeat, so
+ * we return false and let the append proceed (e.g. a doc deliberately re-sent
+ * with no external id).
+ */
+async function eventExistsByRef(leadId: string, type: EventType, ref?: string): Promise<boolean> {
+  if (!ref) return false;
+  const col = await getCrmCollection(COL.LEAD_EVENTS);
+  const hit = await col.findOne({ lead_id: leadId, type, ref } as any, { projection: { _id: 1 } });
+  return !!hit;
 }
 
 // ─── projection helper ─────────────────────────────────────────────────────
@@ -781,6 +819,8 @@ export async function recordCallScheduled(input: CallScheduledInput): Promise<vo
     },
     { upsert: true },
   );
+  // Idempotent per call_id: a retry must not re-append or double-count call_count.
+  if (await eventExistsByRef(input.lead_id, "call_scheduled", input.call_id)) return;
   const ev = await appendEvent({
     lead_id: input.lead_id, person_id: input.person_id, project: input.project,
     type: "call_scheduled", actor: input.actor ?? "cron", channel: "call",
@@ -830,6 +870,9 @@ export async function recordCallCompleted(input: CallCompletedInput): Promise<vo
     },
     { upsert: true },
   );
+  // Idempotent per call_id: a webhook retry must not re-append call_completed or
+  // double-count connected_count.
+  if (await eventExistsByRef(input.lead_id, "call_completed", input.call_id)) return;
   const connected = input.outcome === "connected";
   const ev = await appendEvent({
     lead_id: input.lead_id, person_id: input.person_id, project: input.project,
@@ -846,6 +889,16 @@ export async function recordCallCompleted(input: CallCompletedInput): Promise<vo
     { "last.call_at": ev.ts, "last.call_outcome": input.outcome },
     connected ? { "counters.connected_count": 1 } : undefined,
   );
+  // Advance reachability status off never_contacted once we actually connect.
+  // changeStatus is itself a no-op when unchanged, and never demotes a lead we
+  // already reached (we only promote TO connected here). Non-connected outcomes
+  // (attempting/unreachable) depend on cadence-level retry counts, not a single
+  // dial, so we leave status untouched for them.
+  if (connected) {
+    await changeStatus(input.lead_id, "connected", {
+      actor: input.actor ?? "bot", channel: "call", reason: `call connected`,
+    });
+  }
 }
 
 // ─── messages (WhatsApp) ────────────────────────────────────────────────────
@@ -893,6 +946,9 @@ export async function recordMessage(input: MessageInput): Promise<void> {
   const cur = (await leads.findOne({ _id: input.lead_id } as any)) as any;
   if (!cur) return;
   const inbound = input.direction === "inbound";
+  // Idempotent per message_id: a provider retry must not re-append the wa_* event
+  // or double-count wa_in/wa_out (the message doc itself is already deduped by _id).
+  if (await eventExistsByRef(input.lead_id, inbound ? "wa_inbound" : "wa_outbound", input.message_id)) return;
   const ev = await appendEvent({
     lead_id: input.lead_id, person_id: input.person_id, project: cur.project,
     type: inbound ? "wa_inbound" : "wa_outbound",
@@ -917,6 +973,10 @@ export async function recordDocSent(
   const leads = await getCrmCollection(COL.CRM_LEADS);
   const cur = (await leads.findOne({ _id: leadId } as any)) as any;
   if (!cur) return;
+  // Idempotent per ref (when the caller supplies one): a retry of the same send
+  // must not re-append doc_sent or double-count docs_sent. With no ref we can't
+  // tell a retry from a deliberate re-send, so the append proceeds.
+  if (await eventExistsByRef(leadId, "doc_sent", opts.ref)) return;
   const ev = await appendEvent({
     lead_id: leadId, person_id: cur.person_id, project: cur.project,
     type: "doc_sent", actor: opts.actor ?? "bot", channel: "whatsapp",
@@ -957,6 +1017,8 @@ export async function recordSiteVisitBooked(input: SiteVisitInput): Promise<void
     },
     { upsert: true },
   );
+  // Idempotent per visit_id: a retry must not re-append visit_booked.
+  if (await eventExistsByRef(input.lead_id, "visit_booked", input.visit_id)) return;
   const ev = await appendEvent({
     lead_id: input.lead_id, person_id: input.person_id, project: input.project,
     type: "visit_booked", actor: input.actor ?? "bot", channel: input.booked_via === "whatsapp" ? "whatsapp" : "call",
