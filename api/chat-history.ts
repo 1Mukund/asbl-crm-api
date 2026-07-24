@@ -8010,6 +8010,94 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── backfill-new-model — migrate legacy `leads` into the event-sourced
+  //   model (persons / crm_leads / lead_events / stale_person_record).
+  //
+  //   DRY-RUN BY DEFAULT — nothing is written unless commit=true is passed
+  //   EXPLICITLY. Dry-run reads only and returns what it WOULD do.
+  //
+  //   Dry-run first:
+  //     GET  /api/chat-history?action=backfill-new-model&secret=<...>&limit=500
+  //   Then commit:
+  //     POST /api/chat-history?action=backfill-new-model&secret=<...>&commit=true&limit=20000
+  //
+  //   ?limit= caps legacy docs scanned (Vercel time budget). Idempotent —
+  //   re-running commit does not duplicate history events.
+  if ((req.method === "GET" || req.method === "POST") && req.query.action === "backfill-new-model") {
+    const session = (req as any)._session;
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!session && (!expectedSecret || incomingSecret !== expectedSecret)) {
+      return res.status(401).json({ error: "Unauthorized — log in OR pass ?secret=..." });
+    }
+    // commit ONLY when explicitly asked AND via POST — a GET can never write.
+    const wantsCommit = String((req.query.commit as string) || (req.body && (req.body as any).commit) || "").toLowerCase() === "true";
+    const commit = req.method === "POST" && wantsCommit;
+    const limitRaw = Number((req.query.limit as string) || (req.body && (req.body as any).limit) || 500);
+    const limit = Number.isFinite(limitRaw) ? limitRaw : 500;
+    try {
+      const { backfillNewModel } = await import("./_utils/crm_backfill");
+      const report = await backfillNewModel({ commit, limit });
+      if (commit) {
+        const { logAudit, clientIp } = await import("./_utils/audit");
+        await logAudit({
+          actor_email: session?.email || "(secret)",
+          action: "backfill-new-model",
+          target: "crm_model",
+          summary: `commit — persons=${report.persons} active=${report.active_leads} stale=${report.stale_leads} stageSets=${report.stage_sets}`,
+          ip: clientIp(req),
+        }).catch(() => {});
+      }
+      return res.status(200).json({
+        ok: true,
+        ...report,
+        hint: commit
+          ? "COMMITTED. Re-run is safe (idempotent)."
+          : "DRY-RUN only. To apply: POST the same URL with &commit=true (add &limit= to size each batch).",
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── ensure-crm-indexes — (re)build every index for the event-sourced CRM
+  //   model (persons / crm_leads / lead_events / calls / messages / site_visits
+  //   / stale_person_record + frozen_inbox TTL) per the approved architecture.
+  //   Idempotent (createIndex is a no-op once built) and also runs lazily on the
+  //   first model write; this is the manual/verifiable trigger. Returns the live
+  //   index names per collection so you can confirm the plan is in place.
+  //   GET|POST /api/chat-history?action=ensure-crm-indexes&secret=<...>
+  if ((req.method === "GET" || req.method === "POST") && req.query.action === "ensure-crm-indexes") {
+    const session = (req as any)._session;
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!session && (!expectedSecret || incomingSecret !== expectedSecret)) {
+      return res.status(401).json({ error: "Unauthorized — log in OR pass ?secret=..." });
+    }
+    try {
+      const { ensureCrmIndexesNow } = await import("./_utils/crm_model");
+      const indexes = await ensureCrmIndexesNow();
+      const total = Object.values(indexes).reduce((n, arr) => n + arr.length, 0);
+      const { logAudit, clientIp } = await import("./_utils/audit");
+      await logAudit({
+        actor_email: session?.email || "(secret)",
+        action: "ensure-crm-indexes",
+        target: "crm_model",
+        summary: `built/verified ${total} indexes across ${Object.keys(indexes).length} collections`,
+        ip: clientIp(req),
+      }).catch(() => {});
+      return res.status(200).json({
+        ok: true,
+        collections: Object.keys(indexes).length,
+        total_indexes: total,
+        indexes,
+        note: "Idempotent — safe to re-run. Indexes also self-heal on first model write.",
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── supabase-config-check — where do dashboard uploads actually go?
   //   Reports the SUPABASE_URL host (not the key) + does a real round-trip:
   //   upload a tiny test file via the same helper the dashboard uses, build

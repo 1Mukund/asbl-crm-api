@@ -378,6 +378,15 @@ const ZOHO_TO_MONGO_PRD_FIELD_MAP: Record<string, string> = {
   Last_Recording_URL:       "last_recording_url",
   Call_Attempt_Count:       "call_attempt_count",
   Last_Call_At:             "last_call_at",
+  // Reactive-inbound + transition side fields — mirrored so the Mongo `leads`
+  // doc is the authoritative, complete state (field names match mapZohoLead()).
+  Last_Intent:              "last_intent",
+  Whatsapp_Replied:         "whatsapp_replied",
+  Last_Whatsapp_At:         "last_whatsapp_at",
+  Last_Customer_Response:   "last_customer_response",
+  Not_Interested_Reason:    "not_interested_reason",
+  Intent_Captured:          "intent_captured",
+  Preferred_Call_Time:      "preferred_call_time",
 };
 
 export async function mirrorLeadStateToMongo(

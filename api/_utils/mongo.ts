@@ -65,6 +65,38 @@ export const COL = {
    *  Postgres serial sequences atomically (e.g. for MLID/PLID + the
    *  round-robin sender index). */
   COUNTERS:           "_counters",
+
+  // ─── Event-sourced CRM model (rebuild v1) ──────────────────────────────
+  // New collections implementing the approved event-sourced architecture
+  // (persons + current-state leads + append-only lead_events + calls +
+  // messages + site_visits + stale_person_record). These live ALONGSIDE the
+  // legacy flat `LEADS` mirror above during the rebuild. IMPORTANT: the new
+  // current-state projection is deliberately named "crm_leads" (NOT "leads")
+  // so it never collides with the legacy Zoho-shaped `LEADS` collection that
+  // the (currently frozen) automation still reads/writes. Once the legacy
+  // collection is retired, CRM_LEADS can be renamed to "leads".
+  /** persons — one doc per phone (_id = digits). Person-level identity +
+   *  running profile + which project-leads are active / primary-caller. */
+  PERSONS:            "persons",
+  /** crm_leads — current-state projection, one doc per person×project
+   *  (_id = "<person_id>:<PROJECT>"). Rebuilt from lead_events. */
+  CRM_LEADS:          "crm_leads",
+  /** lead_events — append-only immutable timeline. NEVER update/delete. */
+  LEAD_EVENTS:        "lead_events",
+  /** calls — one doc per dial (_id = call_id), linked from events via ref. */
+  CALLS:              "calls",
+  /** messages — WhatsApp in/out, phone-level (_id = provider message id). */
+  CRM_MESSAGES:       "messages",
+  /** site_visits — one doc per booking (_id = visit_id). */
+  SITE_VISITS:        "site_visits",
+  /** stale_person_record — not-interested Inncircles siblings (all four
+   *  activation flags false). Hidden from CRM; promoted to crm_leads if an
+   *  activation flag later arrives. _id = same lead_id as crm_leads. */
+  STALE_PERSON_RECORD: "stale_person_record",
+  /** frozen_inbox — raw payloads archived while automation_frozen is true
+   *  (see automation_freeze.ts). TTL-indexed on `at` so it auto-expires (30d)
+   *  and never bloats. `at` MUST be a BSON Date for the TTL to fire. */
+  FROZEN_INBOX:       "frozen_inbox",
 } as const;
 
 // ─── Cached client (shared across warm Vercel invocations) ────────────────
