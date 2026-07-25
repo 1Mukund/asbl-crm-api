@@ -68,6 +68,7 @@ export function detectProject(text: string | null | undefined): string | null {
   const t = text.toLowerCase();
   if (t.includes("loft"))     return "LOFT";
   if (t.includes("spectra"))  return "SPECTRA";
+  if (t.includes("spire"))    return "SPIRE";
   if (t.includes("broadway")) return "BROADWAY";
   if (t.includes("landmark")) return "LANDMARK";
   if (t.includes("legacy"))   return "LEGACY";
