@@ -7255,6 +7255,96 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── cadence-counts — read-only breakdown of the never-called CALL QUEUE
+  //     (leads with Next_Call_At set but no Last_Inhouse_Call_ID yet), split by
+  //     today vs backlog, India vs NRI, and LEGACY vs other project — plus a
+  //     count of ALL leads created today. Lets ops decide scope before resuming
+  //     calls. Pure Zoho COQL reads; no writes, no dials.
+  //   GET /api/chat-history?action=cadence-counts&secret=<INHOUSE_POSTHOOK_SECRET>
+  if (req.method === "GET" && req.query.action === "cadence-counts") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    try {
+      const { getAccessToken } = await import("./_utils/zoho");
+      const token = await getAccessToken();
+      const COQL_URL = "https://www.zohoapis.in/crm/v3/coql";
+
+      // IST midnight today, as a Zoho-friendly ISO with +05:30 offset.
+      const nowMs = Date.now();
+      const istNow = new Date(nowMs + 5.5 * 3600 * 1000);
+      const istMidnight = `${istNow.getUTCFullYear()}-${String(istNow.getUTCMonth() + 1).padStart(2, "0")}-${String(istNow.getUTCDate()).padStart(2, "0")}T00:00:00+05:30`;
+
+      async function coqlPage(selectQuery: string): Promise<any[]> {
+        const r = await fetch(COQL_URL, {
+          method: "POST",
+          headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ select_query: selectQuery }),
+        });
+        if (r.status === 204) return [];
+        if (!r.ok) throw new Error(`COQL ${r.status}: ${(await r.text()).slice(0, 200)}`);
+        const j = (await r.json()) as any;
+        return (j?.data || []) as any[];
+      }
+
+      // Country bucket from a stored number: 10-digit or +91… = India; else NRI.
+      const isIndia = (num?: string | null): boolean => {
+        const d = String(num || "").replace(/\D/g, "");
+        if (!d) return false;
+        if (d.length === 10) return true;                 // local 10-digit
+        if (d.startsWith("91") && d.length === 12) return true;
+        return false;
+      };
+
+      // 1) The never-called call queue: Next_Call_At set, never dialed.
+      const queue = { total: 0, today: 0, backlog: 0, india: 0, nri: 0, legacy: 0, other_project: 0 };
+      const MAX_PAGES = 15; // 15×200 = 3000 rows cap (guards the serverless budget)
+      let unknownCountry = 0;
+      for (let page = 0; page < MAX_PAGES; page++) {
+        const rows = await coqlPage(
+          `select id, ASBL_Project, Mobile, Phone, Created_Time from Leads ` +
+          `where Next_Call_At is not null and Last_Inhouse_Call_ID is null ` +
+          `order by Created_Time desc limit 200 offset ${page * 200}`,
+        );
+        for (const l of rows) {
+          queue.total++;
+          const created = l.Created_Time ? new Date(l.Created_Time).getTime() : 0;
+          if (created >= new Date(istMidnight).getTime()) queue.today++; else queue.backlog++;
+          const india = isIndia(l.Mobile) || isIndia(l.Phone);
+          if (india) queue.india++; else { queue.nri++; if (!l.Mobile && !l.Phone) unknownCountry++; }
+          if (String(l.ASBL_Project || "").toUpperCase() === "LEGACY") queue.legacy++; else queue.other_project++;
+        }
+        if (rows.length < 200) break;
+      }
+
+      // 2) ALL leads created today (any call state) — the "aaj ki leads" number.
+      let todayTotal = 0;
+      for (let page = 0; page < MAX_PAGES; page++) {
+        const rows = await coqlPage(
+          `select id from Leads where Created_Time >= '${istMidnight}' ` +
+          `order by Created_Time desc limit 200 offset ${page * 200}`,
+        );
+        todayTotal += rows.length;
+        if (rows.length < 200) break;
+      }
+
+      return res.status(200).json({
+        ok: true,
+        as_of: new Date(nowMs).toISOString(),
+        ist_midnight: istMidnight,
+        leads_created_today: todayTotal,
+        never_called_queue: queue,
+        capped: queue.total >= MAX_PAGES * 200 ? `queue count capped at ${MAX_PAGES * 200}` : null,
+        note: "never_called_queue = leads with Next_Call_At set but no call yet (what the cron dials FIFO). nri = non-India numbers. Counts, no dials.",
+        unknown_country_in_nri: unknownCountry,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── block-calls — mark leads so the dial-time guard NEVER proactively
   //     calls them. Each supplied id is matched against mlid / zoho_lead_id /
   //     source_lead_id / plid(_id) in the Mongo `leads` collection. mlid is the
