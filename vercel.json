@@ -4,7 +4,9 @@
     "api/ingest/inncircles.ts": { "maxDuration": 300 },
     "api/ingest/website.ts": { "maxDuration": 60 },
     "api/ingest/meta.ts": { "maxDuration": 60 },
-    "api/ingest/fim.ts": { "maxDuration": 60 }
+    "api/ingest/fim.ts": { "maxDuration": 60 },
+    "api/cron/followup.ts": { "maxDuration": 300 },
+    "api/chat-history.ts": { "maxDuration": 60 }
   },
   "crons": [
     {
