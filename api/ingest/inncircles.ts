@@ -189,7 +189,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const { isAutomationFrozen, archiveFrozen } = await import("../_utils/automation_freeze");
       if (await isAutomationFrozen()) {
         await archiveFrozen("ingest:inncircles", body);
-        return res.status(200).json({ frozen: true, message: "automation frozen — lead archived, not processed" });
+        // HONEST contract: success:false + a machine-readable code so a caller
+        // that keys off HTTP status alone (200) doesn't record an archived-but-
+        // unprocessed lead as a success. The lead is NOT in Zoho/Mongo yet — it
+        // sits in frozen_inbox (30-day TTL) awaiting replay once the freeze lifts.
+        return res.status(200).json({ success: false, frozen: true, code: "AUTOMATION_FROZEN", message: "automation frozen — lead archived, not processed" });
       }
     }
 
