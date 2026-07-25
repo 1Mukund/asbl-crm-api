@@ -24,6 +24,7 @@
 import { VercelRequest, VercelResponse } from "@vercel/node";
 import { triggerBlueprintTransition, updateLead } from "../_utils/zoho";
 import { mirrorLeadStateToMongo } from "../_utils/supabase";
+import { displayName } from "../_utils/project_detection";
 
 // Voice-bot base URL. Default to angad-bot.onrender.com (current production
 // bot as of 2026-06-03). The earlier voice.asbl.in self-hosted instance
@@ -155,11 +156,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // Extract context that Zoho Deluge already supplies on every trigger.
     // This is what enables Anandita to greet by name + speak about the
     // right project (was missing earlier — bot knew nothing about the lead).
-    const customerName: string =
+    // Sanitize on THIS path too (not just the cron's fireAiCallDirect): a Zoho
+    // Deluge button or a voice-bot re-trigger reaches here directly, and a lead
+    // whose name field holds a phone / email / junk must never be read aloud as
+    // the customer's name. displayName() collapses those to "Sir" and is
+    // idempotent, so a name the cron already sanitized passes through unchanged.
+    const rawCustomerName: string =
       body.customer_full_name ||
       body.customer_name ||
       (body.retell_llm_dynamic_variables?.customer_name) ||
       "";
+    const customerName: string = displayName(rawCustomerName, "Sir");
     const externalScheduleId: string = body.external_schedule_id || "";
     const externalCustomerId: string =
       body.external_customer_id ||

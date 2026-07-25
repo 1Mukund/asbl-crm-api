@@ -39,6 +39,15 @@ export function displayName(name?: string | null, fallback = "Sir"): string {
   const collapsed = raw.replace(/[\s\-().]/g, "");
   if (!collapsed || collapsed === ".") return fallback;
   if (/^\+?[\dxX*]{6,}$/.test(collapsed)) return fallback;
+  // Ingest junk that must NEVER be read aloud as the customer's name:
+  //  • an email address in the name field ("foo.143@gmail.com")
+  if (/@/.test(raw) && /\.[a-z]{2,}/i.test(raw)) return fallback;
+  //  • a phone number embedded with stray text ("p-9876543210", "9876543210 loft"):
+  //    7+ digits is never a real personal name (the pure-phone case above only
+  //    caught names that were ENTIRELY phone chars).
+  if (raw.replace(/\D/g, "").length >= 7) return fallback;
+  //  • no alphabetic character at all → symbols/number soup, not a name.
+  if (!/[a-z]/i.test(raw)) return fallback;
   return raw;
 }
 
