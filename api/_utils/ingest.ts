@@ -184,37 +184,41 @@ export async function ingestLead(lead: NormalizedLead): Promise<IngestResult> {
   const preZohoId: string | null = existingLead ? String(existingLead.id) : null;
   await upsertLead(lead, mlid, plid, preZohoId, false);
 
-  // ── New event-sourced model (rebuild v1) — Mongo-first, additive ──────────
-  // Populate persons / crm_leads / lead_events (+ stale_person_record for
-  // not-interested Inncircles siblings) alongside the legacy `leads` mirror.
-  // Best-effort: a failure here must NEVER fail ingest (the legacy write above
-  // already made the lead durable). Runs only when not frozen (the ingest
-  // handlers gate on the freeze before ever calling ingestLead).
-  try {
-    const { recordIngestToNewModel } = await import("./crm_model");
-    await recordIngestToNewModel({
-      phone: mobile,
-      project,
-      source: lead.lead_source,
-      name: `${lead.first_name} ${lead.last_name}`.trim(),
-      email: lead.email,
-      born_at: lead.born_date || lead.lead_received_at,
-      // The Inncircles-supplied original born date drives active/stale +
-      // primary-caller ordering. Only meaningful when the caller sent one.
-      inncircles_born_date: lead.born_date,
-      source_lead_id: lead.source_lead_id,
-      flags: lead.inncircles_flags,
-      zoho_lead_id: preZohoId,
-      prefs: {
-        budget: lead.budget,
-        size: lead.size_preference,
-        facing: lead.floor_preference,
-        timeline: lead.possession_timeline,
-        purpose: lead.purchase_purpose,
-      },
-    });
-  } catch (merrModel: any) {
-    console.error(`[Ingest] recordIngestToNewModel failed (legacy write is durable) for plid=${plid}: ${merrModel.message}`);
+  // ── New event-sourced model shadow-write — DISABLED by default ────────────
+  // The standalone Intelligent-CRM backend now OWNS the Intelligent_CRM DB, in a
+  // DIFFERENT (integer-MLID) identity scheme. asbl-crm-api dual-writing here (its
+  // legacy phone-based scheme) would POLLUTE that DB and break the new backend's
+  // unique indexes. So this shadow-write is gated OFF: leads still go to the
+  // legacy `leads` mirror + Zoho above (unchanged). Data will reach the new model
+  // via a one-time BACKFILL, not this path. Re-enable ONLY by setting
+  // ENABLE_CRM_SHADOW_WRITE="true" if that ownership ever changes.
+  if (process.env.ENABLE_CRM_SHADOW_WRITE === "true") {
+    try {
+      const { recordIngestToNewModel } = await import("./crm_model");
+      await recordIngestToNewModel({
+        phone: mobile,
+        project,
+        source: lead.lead_source,
+        name: `${lead.first_name} ${lead.last_name}`.trim(),
+        email: lead.email,
+        born_at: lead.born_date || lead.lead_received_at,
+        // The Inncircles-supplied original born date drives active/stale +
+        // primary-caller ordering. Only meaningful when the caller sent one.
+        inncircles_born_date: lead.born_date,
+        source_lead_id: lead.source_lead_id,
+        flags: lead.inncircles_flags,
+        zoho_lead_id: preZohoId,
+        prefs: {
+          budget: lead.budget,
+          size: lead.size_preference,
+          facing: lead.floor_preference,
+          timeline: lead.possession_timeline,
+          purpose: lead.purchase_purpose,
+        },
+      });
+    } catch (merrModel: any) {
+      console.error(`[Ingest] recordIngestToNewModel failed (legacy write is durable) for plid=${plid}: ${merrModel.message}`);
+    }
   }
 
   let zohoLeadId: string | null = preZohoId;
