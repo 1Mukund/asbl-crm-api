@@ -21,6 +21,7 @@ import {
   findLeadByInhouseCallId,
   findLeadByArrowheadCallId,
   findLeadByPhone,
+  getLeadById,
   updateLead,
   createCallLog,
   createCallNote,
@@ -28,12 +29,28 @@ import {
 } from "../_utils/zoho";
 import { mirrorLeadStateToMongo } from "../_utils/supabase";
 
-/** Lookup chain: Last_Inhouse_Call_ID → Last_Arrowhead_Call_ID → phone.
+/** Lookup chain: direct zoho_lead_id → Last_Inhouse_Call_ID →
+ *  Last_Arrowhead_Call_ID → phone.
+ *  ISSUE 3 (correlation key): the ONLY unambiguous key is the Zoho lead id we
+ *  handed the voice-bot at trigger time. When the bot echoes it back in the
+ *  posthook payload we resolve the lead directly — no call-id or phone lookup,
+ *  no ambiguity for a phone that owns multiple project leads. The call-id and
+ *  phone fallbacks stay for older/legacy dials that don't carry the id yet.
  *  Deluge still stamps the call_id in Last_Arrowhead_Call_ID (the legacy
  *  field) even for the new in-house voice-bot flow, so we must check both
  *  custom fields before falling back to phone (which is ambiguous for
  *  customers with multiple project leads). */
-async function locateLead(callId: string, phoneRaw: string): Promise<any | null> {
+async function locateLead(
+  callId: string,
+  phoneRaw: string,
+  directZohoId?: string,
+): Promise<any | null> {
+  if (directZohoId) {
+    try {
+      const lead = await getLeadById(directZohoId);
+      if (lead) return lead;
+    } catch {}
+  }
   if (callId) {
     try {
       const lead = await findLeadByInhouseCallId(callId);
@@ -281,10 +298,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // ── 1. Find the Zoho lead via full chain:
-    //    Last_Inhouse_Call_ID → Last_Arrowhead_Call_ID → phone fallback.
-    //    Deluge stamps the call_id under Last_Arrowhead_Call_ID for legacy
-    //    reasons, so we must check both call-id fields before phone.
-    const lead = await locateLead(callId, phoneRaw);
+    //    direct zoho_lead_id → Last_Inhouse_Call_ID → Last_Arrowhead_Call_ID
+    //    → phone fallback. The direct id (echoed back by the voice-bot in the
+    //    metadata / external_customer_id we sent at trigger time) is the only
+    //    unambiguous key — see ISSUE 3 in locateLead. Deluge stamps the call_id
+    //    under Last_Arrowhead_Call_ID for legacy reasons, so we still check both
+    //    call-id fields before phone.
+    const directZohoId = String(
+      body.zoho_lead_id ||
+        body.metadata?.zoho_lead_id ||
+        body.external_customer_id ||
+        "",
+    ).trim();
+    const lead = await locateLead(callId, phoneRaw, directZohoId);
 
     if (!lead) {
       console.log(`[InHouse Posthook] No Zoho lead found for call_id=${callId} phone=${phoneRaw}`);
@@ -292,7 +318,40 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     const leadName = [lead.First_Name, lead.Last_Name].filter(Boolean).join(" ") || "Unknown";
-    const callStatus = deriveCallStatus(rawSlug, durationSecs);
+    let callStatus = deriveCallStatus(rawSlug, durationSecs);
+
+    // ISSUE 7 (pre-site gap): the voice-bot's PRE_SITE / VIRTUAL_TOUR slug is
+    // often missing or mislabelled, but when the bot captures a booked date in
+    // extracted_slots that IS a milestone — treat it as such REGARDLESS of the
+    // slug. Without this a booked lead can keep the plain "Connected" status and
+    // get re-armed for another call. A site-visit date → "Pre Site"; a virtual /
+    // GMeet date → "Virtual Tour". Both are STOP statuses below, so the cadence
+    // halts. Defined here (before PICKUP/STOP) so the override takes effect.
+    const extractedSlots = (body.extracted_slots || {}) as any;
+    const svDate =
+      extractedSlots.site_visit_date ||
+      extractedSlots.siteVisitDate ||
+      extractedSlots.visit_date ||
+      extractedSlots.visitDate;
+    const vtDate =
+      extractedSlots.gmeet_date_time ||
+      extractedSlots.gMeetDateAndTime ||
+      extractedSlots.virtual_tour_date ||
+      extractedSlots.virtualTourDate ||
+      extractedSlots.meet_date_time;
+    if (svDate && callStatus !== "Pre Site") {
+      console.log(
+        `[InHouse Posthook] pre-site fuzzy override — site_visit_date present, ` +
+        `callStatus ${callStatus} → Pre Site (slug=${rawSlug || "none"})`,
+      );
+      callStatus = "Pre Site";
+    } else if (vtDate && callStatus !== "Pre Site" && callStatus !== "Virtual Tour") {
+      console.log(
+        `[InHouse Posthook] virtual-tour fuzzy override — meet date present, ` +
+        `callStatus ${callStatus} → Virtual Tour (slug=${rawSlug || "none"})`,
+      );
+      callStatus = "Virtual Tour";
+    }
 
     // ── 2. Update lead-level fields (latest call status + accumulate duration
     //      + the next-call schedule decided by the v2 calling state machine).
@@ -332,7 +391,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const isStop = STOP_STATUSES.has(callStatus);
 
     const phone = String(lead.Mobile || phoneRaw || "");
-    const extractedSlots = (body.extracted_slots || {}) as any;
     const preferredCallbackTime: string | null =
       extractedSlots.preferred_callback_time || null;
     const { nextCallAfterPickup, nextCallAfterMiss, zohoIso: schedZohoIso } =

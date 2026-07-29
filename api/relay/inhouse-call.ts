@@ -184,6 +184,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       ? body.enquired_projects.filter(Boolean).join(", ")
       : String(dynVars.other_projects || "");
     const metadata: Record<string, any> = {
+      // ISSUE 3 (correlation key): hand the voice-bot the ONE unambiguous key —
+      // the Zoho lead id. The posthook prefers this echoed-back id over the
+      // call-id / phone lookup chain, so a call always resolves to the exact
+      // lead we dialled (phone lookup is ambiguous for multi-project leads).
+      zoho_lead_id: zohoLeadId,
       project: dynVars.project_name || body.project || "",
       enquired_projects: enquiredProjects,
       plid: dynVars.plid || "",
