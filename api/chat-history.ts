@@ -7345,6 +7345,91 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── call-batch-list — read-only. Given a list of MLIDs (+ optionally the
+  //     never-called "fresh" pool), return the leads that are GENUINELY CALLABLE
+  //     and INDIAN, after the manual-batch guards (skip terminal/pre-site stage,
+  //     call_blocked, already-called, non-India, no-zoho-id; dedupe by phone).
+  //     Powers the localhost 2-at-a-time trigger controller. NO writes, no dials.
+  //   POST /api/chat-history?action=call-batch-list&secret=<INHOUSE_POSTHOOK_SECRET>
+  //   Body: { mlids?: ["3091",...], includeFresh?: true, freshLimit?: 1500 }
+  if ((req.method === "POST" || req.method === "GET") && req.query.action === "call-batch-list") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    try {
+      const body = (req.body || {}) as any;
+      const mlids: string[] = Array.isArray(body.mlids)
+        ? body.mlids.map((m: any) => String(m).trim()).filter(Boolean) : [];
+      const includeFresh = body.includeFresh !== false;
+      const freshLimit = Math.min(Math.max(Number(body.freshLimit) || 1500, 0), 5000);
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const leads = await getCollection(COL.LEADS);
+
+      const digitsOf = (p: any) => String(p || "").replace(/\D/g, "");
+      const isIndia = (p: any) => { const d = digitsOf(p); return d.length === 10 || (d.startsWith("91") && d.length === 12); };
+      const SKIP_STAGES = new Set(["not interested", "spam", "pre site visit"]);
+      const phoneOf = (d: any) => digitsOf(d.phone || d.Mobile || d.zoho?.Mobile || d.zoho?.Phone);
+      const stageOf = (d: any) => String(d.prd_stage || d.zoho?.PRD_Stage || d.lead_status || "").trim();
+      const calledOf = (d: any) => !!(d.last_inhouse_call_id || d.zoho?.Last_Inhouse_Call_ID);
+      const zidOf = (d: any) => d.zoho_lead_id || d.zoho?.id || null;
+
+      const seen = new Set<string>();
+      const docs: any[] = [];
+      if (mlids.length) {
+        const byMlid = await leads.find({ mlid: { $in: mlids } } as any).toArray();
+        for (const d of byMlid) { const k = String((d as any)._id); if (!seen.has(k)) { seen.add(k); (d as any).__src = "mlid"; docs.push(d); } }
+      }
+      if (includeFresh) {
+        const fresh = await leads.find({
+          $and: [
+            { $or: [{ last_inhouse_call_id: { $in: [null, ""] } }, { last_inhouse_call_id: { $exists: false } }] },
+            { prd_stage: { $exists: true, $ne: null } },
+            { prd_stage: { $nin: ["Not Interested", "Spam", "Pre Site Visit"] } },
+          ],
+        } as any).limit(freshLimit).toArray();
+        for (const d of fresh) { const k = String((d as any)._id); if (!seen.has(k)) { seen.add(k); (d as any).__src = "fresh"; docs.push(d); } }
+      }
+
+      const skip: Record<string, number> = { not_found: 0, no_phone: 0, not_indian: 0, terminal_stage: 0, blocked: 0, already_called: 0, no_zoho_id: 0, duplicate_phone: 0 };
+      const foundMlids = new Set(docs.filter((d) => d.__src === "mlid").map((d) => String(d.mlid)));
+      for (const m of mlids) if (!foundMlids.has(m)) skip.not_found++;
+
+      const callable: any[] = [];
+      const phoneSeen = new Set<string>();
+      for (const d of docs) {
+        const phone = phoneOf(d);
+        if (!phone) { skip.no_phone++; continue; }
+        if (!isIndia(phone)) { skip.not_indian++; continue; }
+        if (SKIP_STAGES.has(stageOf(d).toLowerCase())) { skip.terminal_stage++; continue; }
+        if ((d as any).call_blocked === true) { skip.blocked++; continue; }
+        if (calledOf(d)) { skip.already_called++; continue; }
+        const zid = zidOf(d);
+        if (!zid) { skip.no_zoho_id++; continue; }
+        if (phoneSeen.has(phone)) { skip.duplicate_phone++; continue; }
+        phoneSeen.add(phone);
+        callable.push({
+          mlid: String(d.mlid || ""), zoho_lead_id: String(zid),
+          phone: "+" + (phone.length === 10 ? "91" + phone : phone),
+          project: (d as any).project || (d as any).zoho?.ASBL_Project || "", stage: stageOf(d), src: (d as any).__src,
+        });
+      }
+
+      return res.status(200).json({
+        ok: true,
+        input_mlids: mlids.length,
+        candidates: docs.length,
+        callable_count: callable.length,
+        breakdown_by_src: { mlid: callable.filter((c) => c.src === "mlid").length, fresh: callable.filter((c) => c.src === "fresh").length },
+        skipped: skip,
+        callable,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── block-calls — mark leads so the dial-time guard NEVER proactively
   //     calls them. Each supplied id is matched against mlid / zoho_lead_id /
   //     source_lead_id / plid(_id) in the Mongo `leads` collection. mlid is the
