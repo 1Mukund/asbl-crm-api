@@ -2217,6 +2217,73 @@ ${SHARED_STYLE}
     return res.status(303).end();
   }
 
+  // ─── leads-export — CSV of Mongo `leads` filtered by lead_received_at ─────
+  // Secret-gated (curl-friendly, for Excel). One row per lead whose
+  // lead_received_at is on/after ?since=YYYY-MM-DD:
+  //   Phone Number, Source Lead Id, Project, Lead recieved at
+  //
+  //   GET /api/chat-history?action=leads-export&since=2026-07-17&secret=<INHOUSE_POSTHOOK_SECRET>
+  //
+  // lead_received_at is stored as an ISO-8601 string, so a lexicographic $gte on
+  // the date prefix is chronologically correct ("2026-07-25T..." >= "2026-07-17").
+  // The cutoff is compared against the stored UTC ISO value; pass a full
+  // "2026-07-16T18:30:00Z" for an IST-midnight cutoff instead of UTC-midnight.
+  if (req.method === "GET" && req.query.action === "leads-export") {
+    const incomingSecret =
+      (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    const sess = (req as any)._session;
+    if (!sess && (!expectedSecret || incomingSecret !== expectedSecret)) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=..." });
+    }
+    const since = String(req.query.since || "").trim();
+    if (!since) {
+      return res
+        .status(400)
+        .json({ error: "since=YYYY-MM-DD required (e.g. since=2026-07-17)" });
+    }
+    try {
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const col = await getCollection(COL.LEADS);
+      const rows = (await col
+        .find(
+          { lead_received_at: { $gte: since } } as any,
+          {
+            projection: {
+              _id: 0,
+              phone: 1,
+              source_lead_id: 1,
+              project: 1,
+              lead_received_at: 1,
+            },
+          },
+        )
+        .sort({ lead_received_at: 1 })
+        .limit(100000)
+        .toArray()) as any[];
+
+      const csvEsc = (v: any) => {
+        const s = v == null ? "" : String(v);
+        return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+      };
+      const header = "Phone Number,Source Lead Id,Project,Lead recieved at";
+      const lines = rows.map((r) =>
+        [r.phone, r.source_lead_id, r.project, r.lead_received_at]
+          .map(csvEsc)
+          .join(","),
+      );
+      const csv = [header, ...lines].join("\n") + "\n";
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="leads_since_${since.slice(0, 10)}.csv"`,
+      );
+      return res.status(200).send(csv);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // Manual inventory refresh (POST form from dashboard)
   if (req.method === "POST" && req.query.action === "refresh-inventory") {
     try {
