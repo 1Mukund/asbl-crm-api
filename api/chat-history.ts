@@ -2242,6 +2242,13 @@ ${SHARED_STYLE}
         .status(400)
         .json({ error: "since=YYYY-MM-DD required (e.g. since=2026-07-17)" });
     }
+    // ?enrich=zoho → also fetch each lead's Zoho Created_Time (the TRUE original
+    // arrival — immune to the lead_received_at resubmit-clobber). Batched 100
+    // ids/call; use &page=&pageSize= to bound the Zoho calls per request so a
+    // large set never trips the 60s function limit.
+    const enrichZoho = String(req.query.enrich || "") === "zoho";
+    const pageSize = Math.min(Math.max(Number(req.query.pageSize) || 100000, 1), 100000);
+    const page = Math.max(Number(req.query.page) || 0, 0);
     try {
       const { getCollection, COL } = await import("./_utils/mongo");
       const col = await getCollection(COL.LEADS);
@@ -2255,28 +2262,76 @@ ${SHARED_STYLE}
               source_lead_id: 1,
               project: 1,
               lead_received_at: 1,
+              // first_received_at is the origin-immutable arrival (only present on
+              // leads created after the born-immutable fix; blank for older docs).
+              first_received_at: 1,
+              zoho_lead_id: 1,
             },
           },
         )
         .sort({ lead_received_at: 1 })
-        .limit(100000)
+        .skip(page * pageSize)
+        .limit(pageSize)
         .toArray()) as any[];
+
+      // Optional Zoho Created_Time enrichment — bulk GET by ids (max 100/call).
+      const createdByZohoId: Record<string, string> = {};
+      if (enrichZoho) {
+        const { getAccessToken } = await import("./_utils/zoho");
+        const ZOHO_API_BASE = "https://www.zohoapis.in/crm/v3";
+        const token = await getAccessToken();
+        const ids = [
+          ...new Set(rows.map((r) => r.zoho_lead_id).filter(Boolean).map(String)),
+        ];
+        for (let i = 0; i < ids.length; i += 100) {
+          const batch = ids.slice(i, i + 100);
+          try {
+            const zr = await fetch(
+              `${ZOHO_API_BASE}/Leads?ids=${batch.join(",")}&fields=id,Created_Time`,
+              { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
+            );
+            const zj = (await zr.json().catch(() => ({}))) as any;
+            for (const rec of zj?.data || []) {
+              if (rec?.id) createdByZohoId[String(rec.id)] = rec.Created_Time || "";
+            }
+          } catch (e: any) {
+            console.error(`[leads-export] Zoho batch fetch failed: ${e.message}`);
+          }
+        }
+      }
 
       const csvEsc = (v: any) => {
         const s = v == null ? "" : String(v);
         return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
       };
-      const header = "Phone Number,Source Lead Id,Project,Lead recieved at";
-      const lines = rows.map((r) =>
-        [r.phone, r.source_lead_id, r.project, r.lead_received_at]
-          .map(csvEsc)
-          .join(","),
-      );
-      const csv = [header, ...lines].join("\n") + "\n";
+      const cols = [
+        "Phone Number",
+        "Source Lead Id",
+        "Project",
+        "Lead recieved at",
+        "First received at",
+        "Zoho Lead Id",
+      ];
+      if (enrichZoho) cols.push("Zoho Created Time");
+      const header = cols.join(",");
+      const lines = rows.map((r) => {
+        const base = [
+          r.phone,
+          r.source_lead_id,
+          r.project,
+          r.lead_received_at,
+          r.first_received_at,
+          r.zoho_lead_id,
+        ];
+        if (enrichZoho) base.push(createdByZohoId[String(r.zoho_lead_id)] || "");
+        return base.map(csvEsc).join(",");
+      });
+      // Header only on the first page so paginated pulls concatenate cleanly.
+      const csv = (page === 0 ? [header, ...lines] : lines).join("\n") + "\n";
       res.setHeader("Content-Type", "text/csv; charset=utf-8");
       res.setHeader(
         "Content-Disposition",
-        `attachment; filename="leads_since_${since.slice(0, 10)}.csv"`,
+        `attachment; filename="leads_since_${since.slice(0, 10)}${enrichZoho ? "_enriched" : ""}_p${page}.csv"`,
       );
       return res.status(200).send(csv);
     } catch (err: any) {
