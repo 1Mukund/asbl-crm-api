@@ -206,6 +206,115 @@ function isPastLifetime(slot: Date, createdAt?: string | Date | null): boolean {
   return slot.getTime() >= cap;
 }
 
+/** 0=Sun .. 6=Sat in the given timezone (Intl weekday → index). */
+function weekdayInTz(d: Date, tz: string): number {
+  const wd = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" }).format(d);
+  const map: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  return map[wd] ?? 0;
+}
+
+const WEEKDAY_NAMES: Record<string, number> = {
+  sunday: 0, sun: 0, monday: 1, mon: 1, tuesday: 2, tue: 2, tues: 2,
+  wednesday: 3, wed: 3, weds: 3, thursday: 4, thu: 4, thur: 4, thurs: 4,
+  friday: 5, fri: 5, saturday: 6, sat: 6,
+};
+
+/**
+ * Conservative, TIMEZONE-AWARE parse of the customer's stated callback time.
+ * Returns a FUTURE Date, or null (with a warn log) when the value is empty /
+ * ambiguous / in the past — the caller then falls back to the slot grid.
+ *
+ * RCA 2026-07-31 (callbacks firing ~20 min after a "call me Monday"):
+ *   the old code did a bare `new Date(preferredCallbackTime)`, which returns
+ *   Invalid Date for ANY non-ISO string ("Monday", "tomorrow 3pm", "kal") and
+ *   then SILENTLY fell through to the next same-day slot — so a customer who
+ *   asked for Monday got re-dialed at the next picked-hour slot (~20 min).
+ *   This parser (a) never silently drops — it LOGS every miss, and (b) handles
+ *   the common natural-language forms as a safety net until the voice bot emits
+ *   proper ISO for `preferred_callback_time`.
+ *
+ * Order: 1) any Date-parseable / ISO string (the well-behaved-bot happy path);
+ *        2) NL in the CUSTOMER tz — weekday names + today/tomorrow/aaj/kal/parso,
+ *           with an optional explicit time (am/pm or HH:MM). A day given with no
+ *           clear time defaults to 11:00 local (inside the picked-hour set).
+ * Anything ambiguous (e.g. a bare "9 baje" with no am/pm) → null + warn, so a
+ * BAD guess never dials the customer at the wrong hour.
+ */
+export function parseCallbackTime(
+  raw: string | Date | null | undefined,
+  phone: string,
+  now: Date = new Date(),
+): Date | null {
+  if (raw == null || raw === "") return null;
+  if (raw instanceof Date) return isNaN(raw.getTime()) ? null : raw;
+  const s = String(raw).trim();
+  if (!s) return null;
+
+  // 1) ISO / any natively-parseable datetime — the happy path.
+  const direct = new Date(s);
+  if (!isNaN(direct.getTime())) return direct;
+
+  // 2) Conservative natural-language, resolved in the customer's timezone.
+  const tz = lookupTimezone(phone);
+  const lower = s.toLowerCase();
+
+  // Time-of-day — only UNAMBIGUOUS forms (explicit am/pm, or 24h HH:MM).
+  let hour: number | null = null;
+  let minute = 0;
+  const ampm = lower.match(/(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?/);
+  const h24 = lower.match(/\b(\d{1,2}):(\d{2})\b/);
+  if (ampm) {
+    hour = (+ampm[1]) % 12;
+    if (ampm[3] === "p") hour += 12;
+    minute = ampm[2] ? +ampm[2] : 0;
+  } else if (h24) {
+    hour = +h24[1];
+    minute = +h24[2];
+  }
+  if (hour !== null && (hour < 0 || hour > 23 || minute < 0 || minute > 59)) {
+    hour = null;
+    minute = 0;
+  }
+
+  // Day — relative words first, then weekday names.
+  let dayOffset: number | null = null;
+  if (/\b(today|aaj|tonight)\b/.test(lower)) dayOffset = 0;
+  else if (/\b(day after tomorrow|parso|parson)\b/.test(lower)) dayOffset = 2;
+  else if (/\b(tomorrow|tmrw|tmr|kal)\b/.test(lower)) dayOffset = 1;
+  else {
+    const curDow = weekdayInTz(now, tz);
+    for (const name of Object.keys(WEEKDAY_NAMES)) {
+      if (new RegExp(`\\b${name}\\b`).test(lower)) {
+        let diff = (WEEKDAY_NAMES[name] - curDow + 7) % 7;
+        if (diff === 0) diff = 7; // "Monday" spoken on a Monday means NEXT Monday
+        dayOffset = diff;
+        break;
+      }
+    }
+  }
+
+  if (dayOffset === null && hour === null) {
+    console.warn(`[callback-parse] unparseable callback time "${s}" (${tz}) — falling back to slot grid`);
+    return null;
+  }
+
+  // Build the target wall-clock on the intended calendar day in the customer TZ.
+  const todayParts = partsInTz(now, tz);
+  const H = hour !== null ? hour : 11; // day given, no clear time → 11:00 local
+  const dayShifted = new Date(
+    wallClockToUtc(todayParts.year, todayParts.month, todayParts.day, H, minute, tz).getTime() +
+      (dayOffset ?? 0) * 24 * 60 * 60 * 1000,
+  );
+  const tp = partsInTz(dayShifted, tz);
+  const target = wallClockToUtc(tp.year, tp.month, tp.day, H, minute, tz);
+
+  if (target.getTime() <= now.getTime()) {
+    console.warn(`[callback-parse] parsed "${s}" → ${target.toISOString()} is in the past — falling back to slot grid`);
+    return null;
+  }
+  return target;
+}
+
 /** Compute next call after a PICKED call. Customer-specified callback time
  *  always wins (overrides the 7-day lifetime cap — strongest engagement
  *  signal). No-time-given falls into the slot grid + lifetime cap. */
@@ -219,10 +328,12 @@ export function nextCallAfterPickup(opts: {
   const tz = lookupTimezone(opts.phone);
 
   if (opts.preferredCallbackTime) {
-    const t = opts.preferredCallbackTime instanceof Date
-      ? opts.preferredCallbackTime
-      : new Date(opts.preferredCallbackTime);
-    if (!isNaN(t.getTime()) && t.getTime() > now.getTime()) {
+    // RCA 2026-07-31: parse via the TZ-aware conservative parser (not a bare
+    // `new Date()`), so a natural-language "call me Monday" resolves to Monday
+    // instead of silently falling through to the next ~20-min slot. parseCallbackTime
+    // returns a FUTURE Date or null (logging every miss).
+    const t = parseCallbackTime(opts.preferredCallbackTime, opts.phone, now);
+    if (t && t.getTime() > now.getTime()) {
       return {
         nextCallAt: t,
         phase: "FOLLOWUP_AT_TIME",
