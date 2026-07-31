@@ -331,16 +331,35 @@ export async function upsertLead(
     zoho_lead_id: zohoLeadId,
     zoho_synced: zohoSynced,
     zoho_synced_at: zohoSynced ? now : null,
+    // LATEST ingest touch — moves on every resubmit. The origin-immutable
+    // "when did this lead FIRST arrive" is first_received_at (below).
     lead_received_at: lead.lead_received_at,
-    // Original born date at source (caller-supplied); falls back to the
+    updated_at: now,
+  };
+
+  // ORIGIN-IMMUTABLE fields — written ONCE at first insert, NEVER overwritten on
+  // a resubmit/update. Mirrors Zoho's "strip Born_Date / Inncircles_Born_Date on
+  // update" behaviour (see ingest.ts). Previously born_date lived in the $set doc
+  // above, so every resubmit's full $set OVERWROTE it — and when the resubmit
+  // carried no born_date it fell back to the LATEST received date, drifting Mongo's
+  // born fresher than Zoho's (which preserves the original). Mongo also carried NO
+  // inncircles_born_date at all. $setOnInsert fixes both: first write wins,
+  // resubmits leave the original born untouched — exactly like Zoho.
+  const originImmutable: any = {
+    // Original born date at source (caller-supplied); falls back to the FIRST
     // CRM-entry date so the in-house CRM always has a value.
     born_date: lead.born_date ?? lead.lead_received_at.slice(0, 10),
-    updated_at: now,
+    // Dedicated Inncircles-supplied born (null when the caller didn't send one) —
+    // was MISSING from the Mongo mirror entirely before this.
+    inncircles_born_date: lead.born_date ?? null,
+    // True "lead first arrived" timestamp — the Mongo equivalent of Zoho's
+    // Created_Time, immutable across resubmits (unlike lead_received_at).
+    first_received_at: lead.lead_received_at,
   };
 
   await col.updateOne(
     { _id: plid as any },
-    { $set: doc },
+    { $set: doc, $setOnInsert: originImmutable },
     { upsert: true },
   );
 }
