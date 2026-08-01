@@ -2,6 +2,7 @@ import { VercelRequest, VercelResponse } from "@vercel/node";
 import axios from "axios";
 import { normalizePhone, parseName, detectProject } from "../_utils/normalize";
 import { ingestLead } from "../_utils/ingest";
+import { fanoutToNewCrm } from "../_utils/fanout_new_crm";
 import { NormalizedLead } from "../_utils/types";
 
 const GRAPH_API = "https://graph.facebook.com/v19.0";
@@ -210,6 +211,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
       }
 
+      // DUAL-RUN fan-out: forward the ORIGINAL raw Meta webhook body to the new
+      // Intelligent CRM, once, after the freeze check passed and the legacy
+      // leads were processed above. NOTE: forwarded WITHOUT x-webhook-secret —
+      // the new CRM's /api/ingest/meta verifies an X-Hub-Signature HMAC we can't
+      // re-sign here (see fanout_new_crm.ts TODO). Best-effort + gated on
+      // NEW_CRM_INGEST_URL/SECRET (inert until set); never throws, never affects
+      // the legacy Zoho/Mongo write or this response.
+      await fanoutToNewCrm("meta", body);
+
       return res.status(200).json({
         success: true,
         processed: results.length,
@@ -228,6 +238,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     const result = await ingestLead(lead);
+    // DUAL-RUN fan-out (Format B). Same contract as Format A above.
+    await fanoutToNewCrm("meta", body);
     return res.status(200).json({ success: true, ...result });
 
   } catch (err: any) {

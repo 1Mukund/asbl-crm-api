@@ -1,6 +1,7 @@
 import { VercelRequest, VercelResponse } from "@vercel/node";
 import { normalizePhone, parseName, detectProject } from "../_utils/normalize";
 import { ingestLead } from "../_utils/ingest";
+import { fanoutToNewCrm } from "../_utils/fanout_new_crm";
 import { NormalizedLead } from "../_utils/types";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -116,6 +117,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         console.error(`[Website→PRD] handleLeadCreated failed: ${err.message}`);
       }
     }
+
+    // DUAL-RUN fan-out: forward the ORIGINAL raw body to the new Intelligent CRM
+    // so the same lead lands in BOTH systems for parallel-run verification.
+    // Runs ONLY after the freeze check passed and the legacy write path ran
+    // above. Best-effort + gated on NEW_CRM_INGEST_URL/SECRET (inert until set);
+    // never throws, never affects the legacy Zoho/Mongo write or this response.
+    await fanoutToNewCrm("website", body);
 
     return res.status(200).json({ success: true, ...result });
 

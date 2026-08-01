@@ -1,6 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { NormalizedLead } from "../_utils/types";
 import { ingestLead } from "../_utils/ingest";
+import { fanoutToNewCrm } from "../_utils/fanout_new_crm";
 
 // ── Normalize Meta phone (p:7842570649 or p:917842570649) ────
 function normalizePhone(raw: string): string {
@@ -154,6 +155,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const created = results.filter(r => r.action === "created").length;
     const updated = results.filter(r => r.action === "updated").length;
     const errors  = results.filter(r => r.status === "error").length;
+
+    // DUAL-RUN fan-out: forward the ORIGINAL raw body (single row OR array,
+    // exactly as received) to the new Intelligent CRM once, after the freeze
+    // check passed and the legacy rows were processed above. Best-effort + gated
+    // on NEW_CRM_INGEST_URL/SECRET (inert until set); never throws, never affects
+    // the legacy Zoho/Mongo write or this response.
+    await fanoutToNewCrm("fim", body);
 
     return res.json({ summary: { total: rows.length, created, updated, errors }, results });
   } catch (err: any) {
