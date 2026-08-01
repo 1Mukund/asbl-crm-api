@@ -22,6 +22,7 @@
 import { VercelRequest, VercelResponse } from "@vercel/node";
 import { normalizePhone, parseName, detectProject } from "../_utils/normalize";
 import { ingestLead } from "../_utils/ingest";
+import { fanoutToNewCrm } from "../_utils/fanout_new_crm";
 import { NormalizedLead } from "../_utils/types";
 
 // FALLBACK source only. The webhook now honours a caller-supplied `source`
@@ -300,6 +301,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // (durable in Mongo, auto-reconciled), and `errors`/`failed` show real fails.
     const errored = results.filter((r) => r.status === "error");
     const failed = errored.map((r) => ({ phone: r.phone ?? null, error: r.error ?? null }));
+
+    // DUAL-RUN fan-out: forward the ORIGINAL raw body (single object, array, or
+    // { leads: [...] }, exactly as received) to the new Intelligent CRM once,
+    // after the freeze check passed and the legacy items were processed above.
+    // Best-effort + gated on NEW_CRM_INGEST_URL/SECRET (inert until set); never
+    // throws, never affects the legacy Zoho/Mongo write or this response.
+    await fanoutToNewCrm("inncircles", body);
+
     return res.status(200).json({
       success: errored.length === 0,
       default_source: DEFAULT_SOURCE,   // per-lead source is in results[].lead_source

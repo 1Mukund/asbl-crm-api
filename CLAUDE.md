@@ -193,6 +193,7 @@ All set on **Production** scope (most also on Preview). Grouped by integration:
 | In-house voice bot | `ASBL_VOICEBOT_URL`, `ASBL_VOICEBOT_API_KEY`, `INHOUSE_POSTHOOK_SECRET` |
 | Anandita LLM (legacy fallback) | `ANANDITA_URL`, `ANANDITA_API_KEY`, `ANANDITA_INTENT_URL` |
 | Lazybot | `LAZYBOT_URL`, `LAZYBOT_API_KEY`, `LAZYBOT_SESSION_ID` |
+| Dual-run fan-out to new Intelligent CRM | `NEW_CRM_INGEST_URL` (= `https://intelligent-crm-api.vercel.app`), `NEW_CRM_INGEST_SECRET` (= the new CRM's `INGEST_SECRET`). Both must be set to START the parallel run; unset either to STOP it. Drives `api/_utils/fanout_new_crm.ts` — every successfully-ingested lead is best-effort forwarded to `${NEW_CRM_INGEST_URL}/api/ingest/<source>` so it appears in BOTH systems. Inert (silent no-op) until both are set. |
 
 ## Useful debug + ops endpoints
 
