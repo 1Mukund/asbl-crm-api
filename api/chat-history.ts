@@ -7674,6 +7674,70 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── delete-null-orphans — remove the REDUNDANT duplicate lead docs. A
+  //   null-mlid (or duplicate_orphan-flagged) doc is deletable ONLY when a
+  //   DIFFERENT, proper lead already holds this person+project at PLID
+  //   {phone-mlid}-{project} — i.e. the null doc is a pure duplicate whose data
+  //   is safely held by the proper lead. Docs with NO proper counterpart (or no
+  //   phone / no phone-mlid) are KEPT and reported, never deleted. Mongo-only —
+  //   Zoho is never touched. Preview by default; {commit:true} deletes. Paged.
+  //   POST ?action=delete-null-orphans&secret=...  { commit?, page?, pageSize? }
+  if (req.method === "POST" && req.query.action === "delete-null-orphans") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=..." });
+    }
+    try {
+      let body: any = req.body || {};
+      if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
+      const commit = body.commit === true;
+      const page = Math.max(0, Number(body.page) || 0);
+      const pageSize = Math.min(Math.max(1, Number(body.pageSize) || 50), 200);
+
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const leads = await getCollection(COL.LEADS);
+      const reg = await getCollection(COL.MLID_REGISTRY);
+
+      // Candidates: null/missing/empty mlid OR already-flagged duplicate_orphan.
+      const candQ: any = { $or: [{ mlid: null }, { mlid: { $exists: false } }, { mlid: "" }, { duplicate_orphan: true }] };
+      const totalCandidates = await leads.countDocuments(candQ);
+      const docs = (await leads.find(candQ).sort({ _id: 1 }).skip(page * pageSize).limit(pageSize).toArray()) as any[];
+
+      let deletable = 0, kept = 0, deleted = 0;
+      const keptReport: any[] = [];
+      for (const d of docs) {
+        const phone = String(d.phone || "").replace(/\D/g, "");
+        const project = d.project || "UNKNOWN";
+        // Resolve the phone's canonical MLID WITHOUT minting (read-only).
+        const regDoc = phone ? ((await reg.findOne({ _id: phone } as any)) as any) : null;
+        const mlid = regDoc?.mlid ? String(regDoc.mlid) : (d.mlid ? String(d.mlid) : "");
+        if (!phone || !mlid) { kept++; keptReport.push({ _id: d._id, phone: phone || null, reason: "no-phone-or-no-mlid → kept" }); continue; }
+        const properPlid = `${mlid}-${project}`;
+        // A DIFFERENT proper lead must already hold this person+project.
+        const proper = (await leads.findOne({ _id: properPlid } as any)) as any;
+        const hasProper = !!proper && String(proper._id) !== String(d._id) && (proper.mlid != null && proper.mlid !== "");
+        if (!hasProper) { kept++; keptReport.push({ _id: d._id, phone, project, reason: `no proper lead at ${properPlid} → kept (genuinely missing, not a duplicate)` }); continue; }
+        deletable++;
+        if (commit) { await leads.deleteOne({ _id: d._id } as any); deleted++; }
+      }
+
+      return res.status(200).json({
+        ok: true,
+        mode: commit ? "COMMITTED" : "PREVIEW (no writes)",
+        total_candidates: totalCandidates,
+        page, pageSize, docs_in_page: docs.length,
+        deletable, deleted: commit ? deleted : undefined, kept,
+        kept_sample: keptReport.slice(0, 15),
+        note: commit
+          ? `Deleted ${deleted} redundant duplicate doc(s) this page (proper lead confirmed present). Kept ${kept} (no proper counterpart / no phone). Zoho untouched. Re-run page 0 until deletable = 0.`
+          : `PREVIEW — 'deletable' have a proper lead elsewhere (safe to delete). 'kept' are genuinely missing / no-phone (NOT deleted). Re-POST commit:true to delete.`,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── inncircles-audit — is the Inncircles caller actually SENDING born_date
   //     + origin flags, did they land in Mongo, and do they match Zoho?
   //     Read-only diagnostic (no writes, no side effects).
