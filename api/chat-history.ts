@@ -7380,6 +7380,115 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── remint-duplicate-mlids — repair duplicate MLIDs (two phones sharing one
+  //   MLID because the counter was behind). Per group: the EARLIEST-registered
+  //   phone KEEPS the MLID (the original owner); every other (victim) phone gets
+  //   a FRESH MLID, its Mongo leads are re-keyed to the new PLID, plid_registry
+  //   + mlid_registry are updated, and its Zoho Master_Lead_ID / Project_Lead_ID
+  //   are set to the new values. Naturally IDEMPOTENT — a fixed group drops out
+  //   of the duplicate set (its victim docs no longer carry the old mlid), so a
+  //   re-run skips it. Preview by default; {commit:true} applies. Paginated.
+  //   POST ?action=remint-duplicate-mlids&secret=...  { commit?, page?, pageSize? }
+  if (req.method === "POST" && req.query.action === "remint-duplicate-mlids") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=..." });
+    }
+    try {
+      let body: any = req.body || {};
+      if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
+      const commit = body.commit === true;
+      const page = Math.max(0, Number(body.page) || 0);
+      const pageSize = Math.min(Math.max(1, Number(body.pageSize) || 20), 50);
+
+      const { getCollection, COL, getNextSequence } = await import("./_utils/mongo");
+      const leads = await getCollection(COL.LEADS);
+      const reg = await getCollection(COL.MLID_REGISTRY);
+      const plidReg = await getCollection(COL.PLID_REGISTRY);
+
+      // All duplicate MLID groups (non-null mlid shared across >1 distinct phone).
+      const allGroups = (await leads.aggregate([
+        { $match: { mlid: { $ne: null, $exists: true } } },
+        { $group: { _id: "$mlid", phones: { $addToSet: "$phone" } } },
+        { $match: { $expr: { $gt: [{ $size: "$phones" }, 1] } } },
+        { $sort: { _id: 1 } },
+      ], { allowDiskUse: true }).toArray()) as any[];
+      const total = allGroups.length;
+      const pageGroups = allGroups.slice(page * pageSize, page * pageSize + pageSize);
+
+      const report: any[] = [];
+      let victimsRemintedTotal = 0;
+      for (const g of pageGroups) {
+        const mlid = String(g._id);
+        const docs = (await leads.find({ mlid } as any).toArray()) as any[];
+        const phones = [...new Set(docs.map((d) => d.phone).filter(Boolean))].map(String);
+        const regs = (await reg.find({ _id: { $in: phones } } as any).toArray()) as any[];
+        const createdBy: Record<string, string> = {};
+        for (const r of regs) createdBy[String(r._id)] = r.created_at || "";
+        // Original = earliest-registered phone (tie → smallest phone string).
+        const sorted = [...phones].sort(
+          (a, b) => (createdBy[a] || "~").localeCompare(createdBy[b] || "~") || a.localeCompare(b),
+        );
+        const original = sorted[0];
+        const victims = sorted.slice(1);
+        const gRep: any = { mlid, original, original_created_at: createdBy[original] || null, victims: [] };
+
+        for (const v of victims) {
+          const vDocs = docs.filter((d) => String(d.phone) === v);
+          const vRep: any = { phone: v, new_mlid: commit ? null : "(assigned on commit)", rekeyed: [], zoho_updates: [] };
+          if (commit) {
+            const newMlid = String(await getNextSequence("mlid", 1000));
+            vRep.new_mlid = newMlid;
+            for (const d of vDocs) {
+              const proj = d.project || "UNKNOWN";
+              const newPlid = `${newMlid}-${proj}`;
+              const nd = { ...d, _id: newPlid, mlid: newMlid, plid: newPlid, remint_from: { old_plid: d._id, old_mlid: mlid }, updated_at: new Date().toISOString() };
+              await leads.updateOne({ _id: newPlid } as any, { $setOnInsert: nd } as any, { upsert: true });
+              await leads.deleteOne({ _id: d._id } as any);
+              await plidReg.updateOne(
+                { _id: newPlid } as any,
+                { $setOnInsert: { _id: newPlid, plid: newPlid, phone: v, mlid: newMlid, project: proj, created_at: new Date().toISOString() } } as any,
+                { upsert: true },
+              );
+              const zu: any = { zoho_lead_id: d.zoho_lead_id || null, from: d._id, to: newPlid };
+              if (d.zoho_lead_id) {
+                try {
+                  const { updateLead } = await import("./_utils/zoho");
+                  await updateLead(String(d.zoho_lead_id), { Master_Lead_ID: newMlid, Project_Lead_ID: newPlid });
+                  zu.ok = true;
+                } catch (e: any) { zu.ok = false; zu.error = e.message; }
+              }
+              vRep.rekeyed.push(zu);
+            }
+            await reg.updateOne({ _id: v } as any, { $set: { mlid: newMlid } });
+            victimsRemintedTotal++;
+          } else {
+            vRep.rekeyed = vDocs.map((d) => ({ zoho_lead_id: d.zoho_lead_id || null, from: d._id, to: `<newMlid>-${d.project || "UNKNOWN"}` }));
+          }
+          gRep.victims.push(vRep);
+        }
+        report.push(gRep);
+      }
+
+      const pagesTotal = Math.ceil(total / pageSize);
+      return res.status(200).json({
+        ok: true,
+        mode: commit ? "COMMITTED" : "PREVIEW (no writes)",
+        total_duplicate_groups: total,
+        page, pageSize, pages_total: pagesTotal,
+        groups_in_page: pageGroups.length,
+        victims_reminted: commit ? victimsRemintedTotal : undefined,
+        note: commit
+          ? `Re-minted ${victimsRemintedTotal} victim phone(s) on page ${page}. Idempotent — re-run page 0 until groups_in_page hits 0 (fixed groups drop out).`
+          : `PREVIEW only. Re-POST with commit:true to apply this page. Then advance pages OR just keep committing page 0 (fixed groups leave the set).`,
+        report,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── inncircles-audit — is the Inncircles caller actually SENDING born_date
   //     + origin flags, did they land in Mongo, and do they match Zoho?
   //     Read-only diagnostic (no writes, no side effects).
