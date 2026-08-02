@@ -7602,6 +7602,78 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── mlid-zoho-reconcile — for every RE-MINTED lead (carries remint_from),
+  //   confirm Zoho's Master_Lead_ID matches Mongo's new mlid; fix the ones whose
+  //   Zoho write failed during the re-mint (e.g. the 1 that errored). Bulk-reads
+  //   Zoho by ids (100/call). Preview by default; {commit:true} re-applies.
+  //   POST ?action=mlid-zoho-reconcile&secret=...  { commit?, page?, pageSize? }
+  if (req.method === "POST" && req.query.action === "mlid-zoho-reconcile") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=..." });
+    }
+    try {
+      let body: any = req.body || {};
+      if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
+      const commit = body.commit === true;
+      const page = Math.max(0, Number(body.page) || 0);
+      const pageSize = Math.min(Math.max(1, Number(body.pageSize) || 100), 200);
+
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const leads = await getCollection(COL.LEADS);
+      const q: any = { remint_from: { $exists: true } };
+      const total = await leads.countDocuments(q);
+      const docs = (await leads.find(q, { projection: { _id: 1, mlid: 1, zoho_lead_id: 1 } })
+        .sort({ _id: 1 }).skip(page * pageSize).limit(pageSize).toArray()) as any[];
+      const withZoho = docs.filter((d) => d.zoho_lead_id);
+
+      const { getAccessToken } = await import("./_utils/zoho");
+      const ZBASE = "https://www.zohoapis.in/crm/v3";
+      const token = await getAccessToken();
+      const zmap: Record<string, string> = {};
+      const ids = [...new Set(withZoho.map((d) => String(d.zoho_lead_id)))];
+      for (let i = 0; i < ids.length; i += 100) {
+        const batch = ids.slice(i, i + 100);
+        try {
+          const zr = await fetch(`${ZBASE}/Leads?ids=${batch.join(",")}&fields=id,Master_Lead_ID`, { headers: { Authorization: `Zoho-oauthtoken ${token}` } });
+          const zj = (await zr.json().catch(() => ({}))) as any;
+          for (const rec of zj?.data || []) if (rec?.id) zmap[String(rec.id)] = rec.Master_Lead_ID != null ? String(rec.Master_Lead_ID) : "";
+        } catch { /* skip batch */ }
+      }
+
+      const mismatches: any[] = [];
+      let fixed = 0;
+      for (const d of withZoho) {
+        const zMlid = zmap[String(d.zoho_lead_id)] ?? null;
+        if (zMlid !== String(d.mlid)) {
+          const m: any = { zoho_lead_id: d.zoho_lead_id, plid: d._id, mongo_mlid: String(d.mlid), zoho_mlid: zMlid };
+          if (commit) {
+            try {
+              const { updateLead } = await import("./_utils/zoho");
+              await updateLead(String(d.zoho_lead_id), { Master_Lead_ID: String(d.mlid), Project_Lead_ID: String(d._id) });
+              m.fixed = true; fixed++;
+            } catch (e: any) { m.fixed = false; m.err = e.message; }
+          }
+          mismatches.push(m);
+        }
+      }
+
+      return res.status(200).json({
+        ok: true,
+        mode: commit ? "COMMITTED" : "PREVIEW (no writes)",
+        total_reminted_leads: total, page, pageSize, checked_this_page: withZoho.length,
+        mismatches_found: mismatches.length, fixed: commit ? fixed : undefined,
+        note: commit
+          ? `Re-applied Zoho Master_Lead_ID on ${fixed} mismatched lead(s) this page. Advance pages until mismatches_found = 0.`
+          : `PREVIEW — leads whose Zoho Master_Lead_ID != Mongo mlid. Re-POST commit:true to fix.`,
+        mismatches,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── inncircles-audit — is the Inncircles caller actually SENDING born_date
   //     + origin flags, did they land in Mongo, and do they match Zoho?
   //     Read-only diagnostic (no writes, no side effects).
