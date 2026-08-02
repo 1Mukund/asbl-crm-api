@@ -59,6 +59,34 @@ export async function assertProactiveCallAllowed(opts: {
 }): Promise<CallGuardResult> {
   const { zohoLeadId, phone } = opts;
 
+  // ── PHONE PRE-BLOCK — highest priority, works even before the lead exists ──
+  // A single-number ops block (set via the block-phone admin endpoint). Checked
+  // FIRST, by PHONE, so a specific incoming Inncircles lead never gets a T=0 (or
+  // any) proactive call — the fresh T=0 doc doesn't carry call_blocked yet, so
+  // the lead-doc check below can't catch it. Only listed numbers are affected;
+  // everyone else dials normally. Read-only; fail-open on any read error.
+  if (phone) {
+    try {
+      const { getCollection, COL } = await import("./mongo");
+      const col = await getCollection<any>(COL.CALL_BLOCK_LIST);
+      const digits = String(phone).replace(/\D/g, "").replace(/^0+/, "");
+      const norm = digits.length === 10 ? `91${digits}` : digits;
+      // STRICT exact-match on the full normalized number only (no last-10 match)
+      // so a different country's number sharing the same last 10 digits is NEVER
+      // caught — the block affects THIS number and nothing else.
+      const hit = await col.findOne({ _id: norm as any });
+      if (hit) {
+        return {
+          allowed: false,
+          blockedBy: "blocked",
+          reason: `phone ${norm} is on the manual number-block list — dial aborted`,
+        };
+      }
+    } catch (err: any) {
+      console.error(`[call_guard] phone-blocklist read failed (continuing): ${err.message}`);
+    }
+  }
+
   // ── ISSUE 1 — TERMINAL gate ────────────────────────────────────────────
   // Cheap, reliable read of THIS lead's current stage from Mongo, keyed on the
   // indexed zoho_lead_id (always present + freshly mirrored by every PRD write

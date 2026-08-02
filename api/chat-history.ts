@@ -7602,6 +7602,73 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── block-phone — pre-block a SINGLE number so it NEVER gets a proactive
+  //   call (T=0 or cron), even before its lead exists. call_guard checks this
+  //   list by phone. Targeted: only this number is affected, everyone else
+  //   dials normally. Run this BEFORE creating the lead in Zoho.
+  //   POST /api/chat-history?action=block-phone&secret=<INHOUSE_POSTHOOK_SECRET>
+  //     body: { "phone": "+918235276810" }          → block
+  //           { "phone": "...", "unblock": true }    → un-block
+  if (req.method === "POST" && req.query.action === "block-phone") {
+    const incomingSecret =
+      (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=<INHOUSE_POSTHOOK_SECRET>" });
+    }
+    try {
+      let body: any = req.body || {};
+      if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
+      const raw = String(body.phone || req.query.phone || "").trim();
+      const digits = raw.replace(/\D/g, "").replace(/^0+/, "");
+      if (digits.length < 10) {
+        return res.status(400).json({ error: "valid phone required (e.g. +918235276810)" });
+      }
+      const norm = digits.length === 10 ? `91${digits}` : digits;
+      const last10 = norm.slice(-10);
+      const unblock = body.unblock === true || String(req.query.unblock || "") === "true";
+      const reason = String(body.reason || "manual single-number block").slice(0, 200);
+
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const col = await getCollection(COL.CALL_BLOCK_LIST);
+
+      if (unblock) {
+        const r = await col.deleteOne({ _id: norm as any });
+        return res.status(200).json({
+          ok: true, mode: "UNBLOCK", phone: norm,
+          removed: (r as any).deletedCount ?? 0,
+          note: `${norm} removed from the number-block list — proactive calls re-enabled for it.`,
+        });
+      }
+
+      await col.updateOne(
+        { _id: norm as any },
+        { $set: { last10, reason, blocked_at: new Date().toISOString() } },
+        { upsert: true },
+      );
+
+      // Belt + braces: also flag any EXISTING lead docs for this phone right now,
+      // so a cron dial is blocked even before call_guard is reached.
+      let existingBlocked = 0;
+      try {
+        const leads = await getCollection(COL.LEADS);
+        const r = await leads.updateMany(
+          { phone: { $in: [norm, last10, digits] } } as any,
+          { $set: { call_blocked: true, call_block_reason: reason, call_blocked_at: new Date().toISOString() } },
+        );
+        existingBlocked = (r as any).modifiedCount ?? 0;
+      } catch { /* best-effort */ }
+
+      return res.status(200).json({
+        ok: true, mode: "BLOCK", phone: norm, last10,
+        existing_lead_docs_blocked: existingBlocked,
+        note: `${norm} added to the number-block list. call_guard now aborts EVERY proactive dial (T=0 + cron) for THIS number only — no other lead is affected. Add this BEFORE creating the lead in Zoho.`,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── Mongo backfill from Supabase (one-shot per collection) ────────────
   // POST /api/chat-history?action=mongo-backfill&collection=<name>&secret=<...>
   // Copies rows from the named Supabase table to its Mongo equivalent.
