@@ -7257,6 +7257,129 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── mlid-audit — READ-ONLY. The MLID counter (_counters.mlid.seq) drifting
+  //     BELOW the max issued MLID makes getNextSequence hand out already-used
+  //     MLIDs → two phones share one MLID → same-project PLID collision → one
+  //     leads doc overwrites the other (the "data galat" root cause). This shows
+  //     the counter vs max, whether the NEXT mint will collide, and the existing
+  //     duplicate-MLID leads (same mlid across >1 phone).
+  //   GET ?action=mlid-audit&secret=<INHOUSE_POSTHOOK_SECRET>
+  if (req.method === "GET" && req.query.action === "mlid-audit") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=..." });
+    }
+    try {
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const counters = await getCollection(COL.COUNTERS);
+      const reg = await getCollection(COL.MLID_REGISTRY);
+      const leads = await getCollection(COL.LEADS);
+      const toInt = (f: string) => ({ $convert: { input: f, to: "int", onError: 0, onNull: 0 } });
+
+      const counterDoc = (await counters.findOne({ _id: "mlid" as any })) as any;
+      const counterSeq = counterDoc?.seq ?? null;
+      const maxReg = ((await reg.aggregate([{ $group: { _id: null, m: { $max: toInt("$mlid") } } }]).toArray()) as any[])[0]?.m ?? 0;
+      const maxLeads = ((await leads.aggregate([{ $group: { _id: null, m: { $max: toInt("$mlid") } } }]).toArray()) as any[])[0]?.m ?? 0;
+      const maxMlid = Math.max(maxReg, maxLeads);
+      const nextWouldBe = (counterSeq ?? 0) + 1;
+
+      // leads-level duplicate MLIDs: same mlid shared across >1 distinct phone.
+      const dupGroups = (await leads.aggregate([
+        { $group: { _id: "$mlid", phones: { $addToSet: "$phone" }, projects: { $addToSet: "$project" }, n: { $sum: 1 } } },
+        { $match: { $expr: { $gt: [{ $size: "$phones" }, 1] } } },
+        { $sort: { n: -1 } },
+      ], { allowDiskUse: true }).toArray()) as any[];
+      const totalDupLeads = dupGroups.reduce((s, g) => s + g.n, 0);
+      const sample = dupGroups.slice(0, 25).map((g) => ({
+        mlid: g._id,
+        distinct_phones: g.phones.length,
+        phones: g.phones.slice(0, 8),
+        projects: g.projects,
+        lead_docs: g.n,
+      }));
+
+      return res.status(200).json({
+        ok: true,
+        counter_seq: counterSeq,
+        max_mlid_registry: maxReg,
+        max_mlid_leads: maxLeads,
+        max_mlid: maxMlid,
+        next_mlid_would_be: nextWouldBe,
+        WILL_COLLIDE: nextWouldBe <= maxMlid,
+        duplicate_mlid_groups: dupGroups.length,
+        total_leads_with_duplicate_mlid: totalDupLeads,
+        sample,
+        note: nextWouldBe <= maxMlid
+          ? `COUNTER IS BEHIND — the next mint (${nextWouldBe}) is <= max issued (${maxMlid}) → new leads WILL collide. Run fix-mlid-counter.`
+          : `Counter is ahead of max — new mints are safe. ${dupGroups.length} existing duplicate-MLID groups still need re-minting.`,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ─── fix-mlid-counter — set _counters.mlid.seq ABOVE the max issued MLID so
+  //     getNextSequence never hands out a used MLID again (stops NEW duplicates).
+  //     Preview by default; body {commit:true} to apply. Optional {buffer:N}
+  //     (default 25) headroom above max. Does NOT touch existing docs.
+  //   POST ?action=fix-mlid-counter&secret=<...>   { "commit": true, "buffer": 25 }
+  if (req.method === "POST" && req.query.action === "fix-mlid-counter") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=..." });
+    }
+    try {
+      let body: any = req.body || {};
+      if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
+      const commit = body.commit === true;
+      const buffer = Math.max(0, Number(body.buffer) || 25);
+
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const counters = await getCollection(COL.COUNTERS);
+      const reg = await getCollection(COL.MLID_REGISTRY);
+      const leads = await getCollection(COL.LEADS);
+      const toInt = (f: string) => ({ $convert: { input: f, to: "int", onError: 0, onNull: 0 } });
+
+      const maxReg = ((await reg.aggregate([{ $group: { _id: null, m: { $max: toInt("$mlid") } } }]).toArray()) as any[])[0]?.m ?? 0;
+      const maxLeads = ((await leads.aggregate([{ $group: { _id: null, m: { $max: toInt("$mlid") } } }]).toArray()) as any[])[0]?.m ?? 0;
+      const maxMlid = Math.max(maxReg, maxLeads);
+      const target = maxMlid + buffer;
+      const counterDoc = (await counters.findOne({ _id: "mlid" as any })) as any;
+      const current = counterDoc?.seq ?? 0;
+      const wouldChange = target > current;
+
+      if (!commit) {
+        return res.status(200).json({
+          ok: true, mode: "PREVIEW (no writes)",
+          current_seq: current, max_mlid: maxMlid, buffer, target_seq: target,
+          would_change: wouldChange,
+          next_mlid_after_fix: target + 1,
+          note: wouldChange
+            ? `Re-POST with commit:true to set _counters.mlid.seq = ${target} (next mint → ${target + 1}, safely above max ${maxMlid}).`
+            : `Counter (${current}) already >= target (${target}) — nothing to change.`,
+        });
+      }
+
+      if (!wouldChange) {
+        return res.status(200).json({
+          ok: true, mode: "NO-OP", current_seq: current, target_seq: target,
+          note: `Counter already safe (${current} >= ${target}).`,
+        });
+      }
+      await counters.updateOne({ _id: "mlid" as any }, { $set: { seq: target } }, { upsert: true });
+      return res.status(200).json({
+        ok: true, mode: "COMMITTED",
+        previous_seq: current, new_seq: target, max_mlid: maxMlid,
+        next_mlid_will_be: target + 1,
+        note: `_counters.mlid.seq set to ${target}. New leads now mint unique MLIDs from ${target + 1}. (Existing duplicate leads still need re-minting — separate step.)`,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── inncircles-audit — is the Inncircles caller actually SENDING born_date
   //     + origin flags, did they land in Mongo, and do they match Zoho?
   //     Read-only diagnostic (no writes, no side effects).
