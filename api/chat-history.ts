@@ -7257,6 +7257,132 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── remint-registry-duplicates — the COMPLETE fix for registry-level MLID
+  //   duplicates (two phones → one mlid, where the leads-level re-mint couldn't
+  //   see it because one phone's lead was overwritten/null). Per dup mlid: the
+  //   EARLIEST-registered phone keeps the mlid; each later (victim) phone gets a
+  //   fresh mlid. Then BOTH phones' leads are REBUILT FRESH FROM ZOHO (the source
+  //   of truth) under their correct mlid — this untangles the corrupted "B-phone
+  //   + A-zoho-id" docs instead of trusting them. Zoho Master_Lead_ID /
+  //   Project_Lead_ID are re-stamped per phone. Idempotent (fixed mlids leave the
+  //   registry-dup set). Preview by default; {commit:true} applies. Paginated.
+  //   POST ?action=remint-registry-duplicates&secret=...  { commit?, page?, pageSize? }
+  if (req.method === "POST" && req.query.action === "remint-registry-duplicates") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=..." });
+    }
+    try {
+      let body: any = req.body || {};
+      if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
+      const commit = body.commit === true;
+      const page = Math.max(0, Number(body.page) || 0);
+      const pageSize = Math.min(Math.max(1, Number(body.pageSize) || 10), 25);
+
+      const { getCollection, COL, getNextSequence } = await import("./_utils/mongo");
+      const { getAccessToken, updateLead } = await import("./_utils/zoho");
+      const reg = await getCollection(COL.MLID_REGISTRY);
+      const leads = await getCollection(COL.LEADS);
+      const plidReg = await getCollection(COL.PLID_REGISTRY);
+      const ZBASE = "https://www.zohoapis.in/crm/v3";
+      const ZFIELDS = "id,First_Name,Last_Name,Mobile,Phone,ASBL_Project,Lead_Source,Born_Date";
+      const token = await getAccessToken();
+      const clean = (p: string) => String(p || "").replace(/\D/g, "");
+
+      const zohoLeadsByPhone = async (phone: string): Promise<any[]> => {
+        const digits = clean(phone); const last10 = digits.slice(-10);
+        const variants = [...new Set([digits, last10, last10 ? `91${last10}` : ""].filter(Boolean))];
+        const crit = variants.map((v) => `(Mobile:equals:${v})`).join("or");
+        try {
+          const r = await fetch(`${ZBASE}/Leads/search?criteria=(${crit})&fields=${ZFIELDS}`, { headers: { Authorization: `Zoho-oauthtoken ${token}` } });
+          if (!r.ok || r.status === 204) return [];
+          const t = await r.text(); if (!t) return [];
+          return (JSON.parse(t)?.data || []) as any[];
+        } catch { return []; }
+      };
+
+      const dups = (await reg.aggregate([
+        { $group: { _id: "$mlid", phones: { $addToSet: "$_id" } } },
+        { $match: { $expr: { $gt: [{ $size: "$phones" }, 1] } } },
+        { $sort: { _id: 1 } },
+      ], { allowDiskUse: true }).toArray()) as any[];
+      const total = dups.length;
+      const pageDups = dups.slice(page * pageSize, page * pageSize + pageSize);
+
+      const report: any[] = [];
+      let victimsReminted = 0, leadsRebuilt = 0;
+      for (const g of pageDups) {
+        const mlid = String(g._id);
+        const regDocs = (await reg.find({ mlid } as any).toArray()) as any[];
+        regDocs.sort((a, b) => String(a.created_at || "~").localeCompare(String(b.created_at || "~")) || String(a._id).localeCompare(String(b._id)));
+        const phones = regDocs.map((r) => clean(String(r._id)));
+        const original = phones[0];
+        const victims = phones.slice(1);
+        const gRep: any = { mlid, original, victims: [], rebuilt: [] };
+
+        if (!commit) {
+          for (const v of victims) gRep.victims.push({ phone: v, new_mlid: "(mint on commit)" });
+          for (const p of phones) {
+            const zl = await zohoLeadsByPhone(p);
+            gRep.rebuilt.push({ phone: p, plan: p === original ? `keep ${mlid}` : "new mlid", zoho_projects: zl.map((z) => z.ASBL_Project || "?"), zoho_lead_count: zl.length });
+          }
+          report.push(gRep);
+          continue;
+        }
+
+        // COMMIT
+        const finalMlid: Record<string, string> = { [original]: mlid };
+        for (const v of victims) {
+          const y = String(await getNextSequence("mlid", 1000));
+          finalMlid[v] = y;
+          await reg.updateOne({ _id: v } as any, { $set: { mlid: y } });
+          gRep.victims.push({ phone: v, new_mlid: y });
+          victimsReminted++;
+        }
+        // Rebuild each phone's leads fresh from Zoho under its final mlid.
+        for (const p of phones) {
+          const m = finalMlid[p];
+          const zl = await zohoLeadsByPhone(p);
+          for (const z of zl) {
+            const project = z.ASBL_Project || "UNKNOWN";
+            const plid = `${m}-${project}`;
+            const doc: any = {
+              _id: plid, plid, mlid: m, phone: p, project,
+              zoho_lead_id: String(z.id), first_name: z.First_Name || "", last_name: z.Last_Name || "",
+              lead_source: z.Lead_Source || "", born_date: z.Born_Date || null,
+              zoho_synced: true, rebuilt_from_zoho: true, updated_at: new Date().toISOString(),
+            };
+            await leads.updateOne({ _id: plid } as any, { $set: doc } as any, { upsert: true });
+            await plidReg.updateOne({ _id: plid } as any, { $setOnInsert: { _id: plid, plid, phone: p, mlid: m, project, created_at: new Date().toISOString() } } as any, { upsert: true });
+            try { await updateLead(String(z.id), { Master_Lead_ID: m, Project_Lead_ID: plid }); } catch { /* logged in note */ }
+            gRep.rebuilt.push({ phone: p, mlid: m, project, plid, zoho_lead_id: String(z.id) });
+            leadsRebuilt++;
+          }
+        }
+        // Remove any stale docs still under the OLD shared mlid that don't belong
+        // to the original (victim's old / corrupted B-phone+A-zoho docs).
+        await leads.deleteMany({ mlid, phone: { $ne: original } } as any);
+        report.push(gRep);
+      }
+
+      return res.status(200).json({
+        ok: true,
+        mode: commit ? "COMMITTED" : "PREVIEW (no writes)",
+        total_registry_duplicate_mlids: total,
+        page, pageSize, groups_in_page: pageDups.length,
+        victims_reminted: commit ? victimsReminted : undefined,
+        leads_rebuilt_from_zoho: commit ? leadsRebuilt : undefined,
+        note: commit
+          ? `Re-minted ${victimsReminted} victim phone(s), rebuilt ${leadsRebuilt} lead(s) from Zoho. Idempotent — keep committing page 0 until groups_in_page = 0.`
+          : `PREVIEW — each phone's Zoho leads shown; original keeps the mlid, victims get new ones on commit. Re-POST commit:true to apply.`,
+        report,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── mlid-registry-audit — READ-ONLY. The DEEPER check: the mlid_registry
   //     (phone → mlid) can hold two PHONES mapped to the SAME mlid. The
   //     leads-level re-mint only saw phones that had a lead carrying that mlid;
