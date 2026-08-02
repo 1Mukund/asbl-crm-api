@@ -61,6 +61,11 @@ export const COL = {
    *  when a lead arrives via the Inncircles webhook whose phone is here, its
    *  Lead_Source is flipped from "Inncircles M1" to "Manual Reactivation". */
   REACTIVATION_LIST:  "reactivation_list",
+  /** Single-number proactive-call block. _id = normalized phone (91XXXXXXXXXX).
+   *  call_guard aborts EVERY proactive dial (T=0 + cron) for a listed number —
+   *  works even before the lead exists, so a specific incoming Inncircles lead
+   *  never gets a call. Targeted: only listed numbers are affected. */
+  CALL_BLOCK_LIST:    "call_block_list",
   /** Internal: monotonic counters used by getNextSequence() to mimic
    *  Postgres serial sequences atomically (e.g. for MLID/PLID + the
    *  round-robin sender index). */
