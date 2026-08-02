@@ -7257,6 +7257,67 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── mlid-registry-audit — READ-ONLY. The DEEPER check: the mlid_registry
+  //     (phone → mlid) can hold two PHONES mapped to the SAME mlid. The
+  //     leads-level re-mint only saw phones that had a lead carrying that mlid;
+  //     a phone whose leads were null-mlid stayed hidden, and its registry-mlid
+  //     surfaces later (reuse) as a fresh duplicate (the 1071 case). This audits
+  //     the REGISTRY directly, and with ?mlid=X dumps every phone + lead for one
+  //     MLID so a single case (e.g. 1263) can be judged one-person vs collision.
+  //   GET ?action=mlid-registry-audit&secret=...        (registry-wide summary)
+  //   GET ?action=mlid-registry-audit&mlid=1263&secret=... (one-MLID detail)
+  if (req.method === "GET" && req.query.action === "mlid-registry-audit") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=..." });
+    }
+    try {
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const reg = await getCollection(COL.MLID_REGISTRY);
+      const leads = await getCollection(COL.LEADS);
+      const specific = req.query.mlid ? String(req.query.mlid).trim() : "";
+
+      if (specific) {
+        const regEntries = (await reg.find({ mlid: specific } as any).toArray()) as any[];
+        const leadDocs = (await leads.find({ mlid: specific } as any, {
+          projection: { _id: 1, phone: 1, project: 1, born_date: 1, first_received_at: 1, zoho_lead_id: 1 },
+        }).toArray()) as any[];
+        const regPhones = regEntries.map((r) => String(r._id));
+        const leadPhones = [...new Set(leadDocs.map((d) => String(d.phone)).filter(Boolean))];
+        const allPhones = [...new Set([...regPhones, ...leadPhones])];
+        return res.status(200).json({
+          ok: true, mlid: specific,
+          registry_phone_count: regEntries.length,
+          registry_phones: regEntries.map((r) => ({ phone: String(r._id), created_at: r.created_at || null })),
+          distinct_lead_phones: leadPhones.length,
+          leads: leadDocs.map((d) => ({ plid: d._id, phone: d.phone, project: d.project, born_date: d.born_date || null, zoho_lead_id: d.zoho_lead_id || null })),
+          verdict: allPhones.length > 1
+            ? `DUPLICATE — ${allPhones.length} different phones share MLID ${specific} → needs re-mint`
+            : `OK — single person (one phone), genuine multi-project reuse`,
+        });
+      }
+
+      const dups = (await reg.aggregate([
+        { $group: { _id: "$mlid", phones: { $addToSet: "$_id" }, n: { $sum: 1 } } },
+        { $match: { $expr: { $gt: [{ $size: "$phones" }, 1] } } },
+        { $sort: { n: -1 } },
+      ], { allowDiskUse: true }).toArray()) as any[];
+      const totalVictimPhones = dups.reduce((s, g) => s + (g.phones.length - 1), 0);
+      return res.status(200).json({
+        ok: true,
+        registry_duplicate_mlids: dups.length,
+        total_victim_phones: totalVictimPhones,
+        note: dups.length
+          ? `${dups.length} MLIDs in mlid_registry are mapped to >1 phone — these are the HIDDEN duplicates the leads-level re-mint missed. Need a REGISTRY-level re-mint.`
+          : `Registry is clean — every MLID maps to exactly one phone.`,
+        sample: dups.slice(0, 30).map((g) => ({ mlid: g._id, phones: g.phones.length, sample_phones: g.phones.slice(0, 6) })),
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── mlid-audit — READ-ONLY. The MLID counter (_counters.mlid.seq) drifting
   //     BELOW the max issued MLID makes getNextSequence hand out already-used
   //     MLIDs → two phones share one MLID → same-project PLID collision → one
