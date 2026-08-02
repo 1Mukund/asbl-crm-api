@@ -7489,6 +7489,119 @@ ${SHARED_STYLE}
     }
   }
 
+  // ─── assign-null-mlids — give an MLID to leads that have none. CRITICAL:
+  //   MLID is per-PERSON (per phone), shared across projects — so we resolve
+  //   each lead's phone through getOrCreateMLID(phone), which RE-USES the
+  //   phone's existing MLID when it already has one (multi-project same person
+  //   → same MLID) and only mints a fresh MLID (from the now-fixed counter) for
+  //   a phone that has none. The lead is then re-keyed to its proper PLID
+  //   ({mlid}-{project}); if a proper lead already occupies that PLID, the null
+  //   doc is a redundant duplicate → we stamp its mlid in place + flag it (never
+  //   overwrite the good doc). Idempotent (fixed docs leave the null set).
+  //   Preview by default; {commit:true} applies. Paginated.
+  //   POST ?action=assign-null-mlids&secret=...  { commit?, page?, pageSize? }
+  if (req.method === "POST" && req.query.action === "assign-null-mlids") {
+    const incomingSecret = (req.query.secret as string) || (req.headers["x-debug-secret"] as string) || "";
+    const expectedSecret = process.env.INHOUSE_POSTHOOK_SECRET || "";
+    if (!expectedSecret || incomingSecret !== expectedSecret) {
+      return res.status(401).json({ error: "Unauthorized — pass ?secret=..." });
+    }
+    try {
+      let body: any = req.body || {};
+      if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
+      const commit = body.commit === true;
+      const page = Math.max(0, Number(body.page) || 0);
+      const pageSize = Math.min(Math.max(1, Number(body.pageSize) || 30), 100);
+
+      const { getCollection, COL } = await import("./_utils/mongo");
+      const { getOrCreateMLID } = await import("./_utils/supabase");
+      const leads = await getCollection(COL.LEADS);
+      const reg = await getCollection(COL.MLID_REGISTRY);
+      const plidReg = await getCollection(COL.PLID_REGISTRY);
+
+      const nullQ: any = { $or: [{ mlid: null }, { mlid: { $exists: false } }, { mlid: "" }] };
+      const totalNull = await leads.countDocuments(nullQ);
+      const docs = (await leads.find(nullQ).sort({ _id: 1 }).skip(page * pageSize).limit(pageSize).toArray()) as any[];
+
+      const now = new Date().toISOString();
+      let assigned = 0, reused = 0, minted = 0, skipped = 0;
+      const report: any[] = [];
+      for (const d of docs) {
+        const phone = String(d.phone || "").replace(/\D/g, "");
+        const project = d.project || "UNKNOWN";
+        if (!phone) { report.push({ _id: d._id, action: "skip:no-phone" }); skipped++; continue; }
+
+        const existing = (await reg.findOne({ _id: phone } as any)) as any;
+        const willReuse = !!existing?.mlid;
+        const rep: any = { _id: d._id, phone, project, zoho_lead_id: d.zoho_lead_id || null, reuse_existing: willReuse };
+
+        if (!commit) {
+          rep.mlid = willReuse ? String(existing.mlid) : "(mint on commit)";
+          rep.new_plid = willReuse ? `${existing.mlid}-${project}` : `<newMlid>-${project}`;
+          rep.action = willReuse ? "would-reuse-phone-mlid" : "would-mint-new-mlid";
+          report.push(rep);
+          continue;
+        }
+
+        // COMMIT — resolve the phone's MLID (existing → reused; else fresh mint).
+        const mlid = await getOrCreateMLID(phone);
+        const newPlid = `${mlid}-${project}`;
+        rep.mlid = mlid; rep.new_plid = newPlid;
+        if (willReuse) reused++; else minted++;
+
+        const clash = (await leads.findOne({ _id: newPlid } as any)) as any;
+        if (clash && String(clash._id) !== String(d._id)) {
+          // A proper lead already holds this person+project — the null doc is a
+          // redundant duplicate. Stamp mlid in place (so it leaves the null set)
+          // + flag; never overwrite the good doc.
+          await leads.updateOne({ _id: d._id } as any, { $set: { mlid, duplicate_orphan: true, orphan_of: newPlid, updated_at: now } });
+          rep.action = "flagged-duplicate-orphan (proper lead exists at new_plid)";
+          skipped++;
+          report.push(rep);
+          continue;
+        }
+
+        if (newPlid === String(d._id)) {
+          await leads.updateOne({ _id: d._id } as any, { $set: { mlid, plid: newPlid, updated_at: now } });
+          rep.action = "set-mlid-inplace";
+        } else {
+          const nd = { ...d, _id: newPlid, mlid, plid: newPlid, updated_at: now, assigned_from_null: { old_id: d._id } };
+          await leads.updateOne({ _id: newPlid } as any, { $setOnInsert: nd } as any, { upsert: true });
+          await leads.deleteOne({ _id: d._id } as any);
+          await plidReg.updateOne(
+            { _id: newPlid } as any,
+            { $setOnInsert: { _id: newPlid, plid: newPlid, phone, mlid, project, created_at: now } } as any,
+            { upsert: true },
+          );
+          rep.action = "rekeyed";
+        }
+        assigned++;
+        if (d.zoho_lead_id) {
+          try {
+            const { updateLead } = await import("./_utils/zoho");
+            await updateLead(String(d.zoho_lead_id), { Master_Lead_ID: mlid, Project_Lead_ID: newPlid });
+            rep.zoho_ok = true;
+          } catch (e: any) { rep.zoho_ok = false; rep.zoho_err = e.message; }
+        }
+        report.push(rep);
+      }
+
+      return res.status(200).json({
+        ok: true,
+        mode: commit ? "COMMITTED" : "PREVIEW (no writes)",
+        total_null_mlid: totalNull,
+        page, pageSize, docs_in_page: docs.length,
+        assigned, reused_existing_phone_mlid: reused, newly_minted: minted, skipped,
+        note: commit
+          ? `Assigned ${assigned} (reused ${reused} existing phone-MLIDs, minted ${minted} new). Idempotent — keep committing page 0 until docs_in_page = 0.`
+          : `PREVIEW only. reuse_existing=true means that phone already has an MLID → the SAME one is used (multi-project same person). Re-POST commit:true to apply.`,
+        report,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // ─── inncircles-audit — is the Inncircles caller actually SENDING born_date
   //     + origin flags, did they land in Mongo, and do they match Zoho?
   //     Read-only diagnostic (no writes, no side effects).
