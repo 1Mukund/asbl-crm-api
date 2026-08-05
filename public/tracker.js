@@ -9,7 +9,7 @@
   'use strict';
 
   var STORAGE_KEY   = 'asbl_track';
-  var INGEST_DOMAIN = 'asbl-crm-api.vercel.app/api/ingest';
+  var INGEST_DOMAIN = 'growth-relay.asbl.in/api/ingest';
 
   // ── Helpers ──────────────────────────────────────────────
   function load() {

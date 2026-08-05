@@ -11,7 +11,7 @@ require("fs").readFileSync(".env", "utf8").split("\n").forEach(line => {
 });
 
 const { ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN } = process.env;
-const VERCEL_URL = "https://asbl-crm-api.vercel.app/api/relay/periskope";
+const VERCEL_URL = "https://growth-relay.asbl.in/api/relay/periskope";
 const API_BASE   = "https://www.zohoapis.in/crm/v3";
 
 async function getAccessToken() {

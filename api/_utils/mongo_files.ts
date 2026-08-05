@@ -86,6 +86,6 @@ export async function deleteFile(id: string): Promise<void> {
 /** Build the public serve URL for a stored fileId. This is what gets saved
  *  as project_documents.url and handed to Periskope. */
 export function fileServeUrl(fileId: string): string {
-  const base = (process.env.SELF_PUBLIC_URL || "https://asbl-crm-api.vercel.app").replace(/\/+$/, "");
+  const base = (process.env.SELF_PUBLIC_URL || "https://growth-relay.asbl.in").replace(/\/+$/, "");
   return `${base}/api/chat-history?action=doc-file&id=${fileId}`;
 }

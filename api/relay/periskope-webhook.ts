@@ -16,7 +16,7 @@
  *  11. Save inbound + outbound to Supabase with project tag
  *  12. Update Zoho: Last_Intent + Whatsapp_Replied
  *
- * Webhook URL: https://asbl-crm-api.vercel.app/api/relay/periskope-webhook
+ * Webhook URL: https://growth-relay.asbl.in/api/relay/periskope-webhook
  */
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { resolveProject, detectMultiProjectIntent, Project } from "../_utils/project_detection";
@@ -488,7 +488,7 @@ async function triggerCallbackCall(
   }
 
   // 2. Fire the call through our in-house relay
-  const SELF_BASE = process.env.SELF_PUBLIC_URL || "https://asbl-crm-api.vercel.app";
+  const SELF_BASE = process.env.SELF_PUBLIC_URL || "https://growth-relay.asbl.in";
   const payload = {
     _zoho_lead_id: leadId,
     phone_number: phone,

@@ -3,7 +3,7 @@
 **Last updated:** 2026-06-05
 **Owner:** Mukund (1Mukund)
 **Repo:** https://github.com/1Mukund/asbl-crm-api
-**Production:** https://asbl-crm-api.vercel.app (Vercel Pro, auto-deploy from `main`)
+**Production:** https://growth-relay.asbl.in (Vercel Pro, auto-deploy from `main`)
 
 ---
 
@@ -281,7 +281,7 @@ Until 2026-06-05, `handleLeadCreated(...)` was called with **fire-and-forget** `
 PRD orchestrator OR Zoho Deluge bulk button OR WhatsApp "call me" intent
         │
         ▼
-POST https://asbl-crm-api.vercel.app/api/relay/inhouse-call
+POST https://growth-relay.asbl.in/api/relay/inhouse-call
         │
         ├──→ Normalize phone to E.164 (+91XXX...)
         ├──→ POST angad-bot.onrender.com/api/calls/initiate
@@ -415,7 +415,7 @@ New logic: gate only on `now - lastOutboundMs >= 24h`. Self-throttling regardles
 
 When voice-bot finishes a call, it POSTs to:
 ```
-POST https://asbl-crm-api.vercel.app/api/relay/inhouse-posthook
+POST https://growth-relay.asbl.in/api/relay/inhouse-posthook
 Header: X-Webhook-Secret: <INHOUSE_POSTHOOK_SECRET>
 Content-Type: application/json
 ```
@@ -623,7 +623,7 @@ Behaviour (after 2026-06-03 update):
 2. Validate phone has digits (no country restriction — accepts ALL countries now)
 3. Increment `Call_Attempt_Count`
 4. Build payload with `_zoho_lead_id`, `phone_number`, `customer_full_name`, `retell_llm_dynamic_variables`, `external_schedule_id`
-5. POST to `https://asbl-crm-api.vercel.app/api/relay/inhouse-call`
+5. POST to `https://growth-relay.asbl.in/api/relay/inhouse-call`
 6. Stamp Zoho: `Last_Arrowhead_Call_ID` = `<PLID>-call-<N>`, `Call_Status` = "Not Called"
 
 ### Function: `automation.bulkTriggerArrowheadCalls`
@@ -657,7 +657,7 @@ This prevents customer spam — if someone fills 3 forms in 5 minutes, only one 
 ### Bot kill-switch (per-phone)
 Mongo `user_profiles.bot_enabled = false` → WhatsApp webhook still logs inbound messages but **skips Gemini reply + Periskope send**. Voice calls (via PRD T=0 / SS cron / bulk button) still go.
 
-Toggle from dashboard: `https://asbl-crm-api.vercel.app/api/chat-history?view=dashboard` → "Bot Override" section → search phone → click toggle.
+Toggle from dashboard: `https://growth-relay.asbl.in/api/chat-history?view=dashboard` → "Bot Override" section → search phone → click toggle.
 
 ### Spam (`/api/chat-history?action=mark-spam`)
 - Zoho: Lead_Status="Spam", PRD_Stage="Spam"

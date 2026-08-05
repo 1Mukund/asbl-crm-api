@@ -8,7 +8,7 @@
 ```
 Lead Sources (Meta/Website/FIM)
         ↓
-Vercel API (asbl-crm-api.vercel.app)
+Vercel API (growth-relay.asbl.in)
         ↓
 Supabase (MLID/PLID generation)
         ↓
@@ -22,7 +22,7 @@ Arrowhead AI Call → LazyBot WhatsApp
 ## 1. Lead Ingestion (Vercel API)
 
 **Repo:** `https://github.com/1Mukund/asbl-crm-api`
-**Live URL:** `https://asbl-crm-api.vercel.app`
+**Live URL:** `https://growth-relay.asbl.in`
 
 ### Endpoints
 - `POST /api/ingest/website` — Website form leads
@@ -146,7 +146,7 @@ Stored as digits only, NO `+` sign. Example: `918700432466`
 ### external_schedule_id Format: `PLID-call-N` (e.g. `1002-BROADWAY-call-3`)
 
 ### Posthook URL (sent to Arrowhead team — pending their config)
-`https://asbl-crm-api.vercel.app/api/relay/arrowhead-posthook`
+`https://growth-relay.asbl.in/api/relay/arrowhead-posthook`
 
 ### Call Status Mapping (Arrowhead → Zoho)
 - `CONNECTED`/`AUTO_CALLBACK` → `Connected`
@@ -163,7 +163,7 @@ Stored as digits only, NO `+` sign. Example: `918700432466`
 
 ### `automation.triggerArrowheadCall(string lead_id)` ✅ WORKING
 - Fetches lead, normalizes phone, increments attempt count
-- Calls `https://asbl-crm-api.vercel.app/api/relay/arrowhead`
+- Calls `https://growth-relay.asbl.in/api/relay/arrowhead`
 - Updates: `Call_Attempt_Count`, `Last_Call_At`, `Last_Arrowhead_Call_ID`, `Call_Status`
 - DateTime format: `yyyy-MM-dd'T'HH:mm:ss+05:30`
 

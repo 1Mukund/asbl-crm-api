@@ -50,7 +50,7 @@ const OUTREACH_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
 // protection enabled and returns 401 to unauthenticated internal calls,
 // breaking the resubmission outreach. The public alias is stable across
 // deploys and isn't gated by deployment protection.
-const SELF_BASE_URL = process.env.SELF_PUBLIC_URL || "https://asbl-crm-api.vercel.app";
+const SELF_BASE_URL = process.env.SELF_PUBLIC_URL || "https://growth-relay.asbl.in";
 
 // Same 10-sender pool as api/relay/periskope.ts — kept in sync so a returning
 // lead gets paired with the same RM-pool variety they saw on first contact.

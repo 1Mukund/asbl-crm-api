@@ -180,7 +180,7 @@ curl "https://www.zohoapis.in/crm/v3/settings/automation/blueprint?module=Leads"
   -H "Authorization: Zoho-oauthtoken $ACCESS_TOKEN"
 
 # Run our audit endpoint
-curl "https://asbl-crm-api.vercel.app/api/chat-history?action=zoho-audit&secret=$INHOUSE_POSTHOOK_SECRET" \
+curl "https://growth-relay.asbl.in/api/chat-history?action=zoho-audit&secret=$INHOUSE_POSTHOOK_SECRET" \
   | python3 -m json.tool
 ```
 
@@ -242,7 +242,7 @@ Once Phase 1 fields are in (already done) and Blueprint is set up:
 
 ```bash
 # Migrate 200 leads at a time, paginate through all
-curl -X POST "https://asbl-crm-api.vercel.app/api/chat-history?action=asbl-spec-migrate-legacy&secret=$INHOUSE_POSTHOOK_SECRET&max=200&page=1" \
+curl -X POST "https://growth-relay.asbl.in/api/chat-history?action=asbl-spec-migrate-legacy&secret=$INHOUSE_POSTHOOK_SECRET&max=200&page=1" \
   | python3 -m json.tool
 ```
 

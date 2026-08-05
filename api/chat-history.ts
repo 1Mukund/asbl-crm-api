@@ -876,11 +876,11 @@ ${SHARED_STYLE}
     </div>
     <div style="font-size:13px;color:var(--text-soft);line-height:1.5">
       <strong>Backfill existing PDFs</strong> — if you uploaded PDFs before this feature existed, they don't have text extracts yet. Run the backfill once to extract all of them:
-      <pre style="background:var(--surface-muted);padding:10px;border-radius:6px;font-size:12px;overflow:auto;margin-top:8px">curl -X POST "https://asbl-crm-api.vercel.app/api/chat-history?action=backfill-pdf-extracts&secret=&lt;INHOUSE_POSTHOOK_SECRET&gt;"
+      <pre style="background:var(--surface-muted);padding:10px;border-radius:6px;font-size:12px;overflow:auto;margin-top:8px">curl -X POST "https://growth-relay.asbl.in/api/chat-history?action=backfill-pdf-extracts&secret=&lt;INHOUSE_POSTHOOK_SECRET&gt;"
 
 # v5 strict-meta backfill — parses existing size_label to fill unit_size_sft/facing/tower
 # Preview (no writes): &dry=1   |   Filter: &doc_type=unit_plan  &project=LOFT
-curl "https://asbl-crm-api.vercel.app/api/chat-history?action=backfill-doc-meta&secret=&lt;INHOUSE_POSTHOOK_SECRET&gt;&dry=1"</pre>
+curl "https://growth-relay.asbl.in/api/chat-history?action=backfill-doc-meta&secret=&lt;INHOUSE_POSTHOOK_SECRET&gt;&dry=1"</pre>
     </div>
   </div>
 
@@ -4037,7 +4037,7 @@ ${SHARED_STYLE}
 
     const BOT_BASE_URL = (process.env.ASBL_VOICEBOT_URL || "https://angad-bot.onrender.com").replace(/\/+$/, "");
     const BOT_API_KEY = process.env.ASBL_VOICEBOT_API_KEY || "";
-    const SELF_BASE_URL = process.env.SELF_PUBLIC_URL || "https://asbl-crm-api.vercel.app";
+    const SELF_BASE_URL = process.env.SELF_PUBLIC_URL || "https://growth-relay.asbl.in";
 
     if (!BOT_API_KEY) {
       return res.status(500).json({ error: "ASBL_VOICEBOT_API_KEY env var missing — required for bot's GET /api/calls/<id>" });

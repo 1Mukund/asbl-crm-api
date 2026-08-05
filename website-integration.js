@@ -4,12 +4,12 @@
  * Copy-paste this in ANY website — HTML, React, Next.js, Vue, WordPress, etc.
  * Just call: ASBLLeads.submit(formData)
  *
- * Endpoint: https://asbl-crm-api.vercel.app/api/ingest/website
+ * Endpoint: https://growth-relay.asbl.in/api/ingest/website
  */
 
 const ASBLLeads = {
 
-  endpoint: "https://asbl-crm-api.vercel.app/api/ingest/website",
+  endpoint: "https://growth-relay.asbl.in/api/ingest/website",
 
   /**
    * Get UTM params from current URL automatically

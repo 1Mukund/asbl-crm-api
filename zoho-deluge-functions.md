@@ -67,7 +67,7 @@ string automation.triggerArrowheadCall(string lead_id)
     // ── Call Arrowhead via Vercel relay ───────────────────────────────────────
     arrowhead_response = invokeurl
     [
-        url: "https://asbl-crm-api.vercel.app/api/relay/arrowhead"
+        url: "https://growth-relay.asbl.in/api/relay/arrowhead"
         type: POST
         parameters: payload.toString()
         headers: {"Content-Type": "application/json"}

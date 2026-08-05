@@ -4,7 +4,7 @@
  * Replaces the Arrowhead posthook.
  *
  * Webhook endpoint to register in voice-bot dashboard:
- *   https://asbl-crm-api.vercel.app/api/relay/inhouse-posthook
+ *   https://growth-relay.asbl.in/api/relay/inhouse-posthook
  *
  * Auth (defence-in-depth): if INHOUSE_POSTHOOK_SECRET env var is set,
  * incoming requests must carry a matching X-Webhook-Secret header.

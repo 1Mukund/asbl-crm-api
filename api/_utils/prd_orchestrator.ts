@@ -226,7 +226,7 @@ async function fireAiCall(opts: {
   size_preference?: string;
   preferred_call_time?: string;
 }): Promise<{ ok: boolean; error?: string; response?: any }> {
-  const SELF_BASE_URL = process.env.SELF_PUBLIC_URL || "https://asbl-crm-api.vercel.app";
+  const SELF_BASE_URL = process.env.SELF_PUBLIC_URL || "https://growth-relay.asbl.in";
 
   // ── EXECUTION-TIME SAFETY GUARD (last line of defence) ───────────────────
   // Re-validate from Mongo right before dialing — the cadence's stage stop +

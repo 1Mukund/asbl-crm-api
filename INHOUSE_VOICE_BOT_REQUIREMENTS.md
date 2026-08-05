@@ -51,7 +51,7 @@ CRM is the **system of record** for everything (lead state, transcripts, recordi
   "customer_name": "Rajesh Kumar",
   "external_schedule_id": "1419-LOFT-call-1",
   "external_customer_id": "MLID-1419",
-  "callback_url": "https://asbl-crm-api.vercel.app/api/relay/inhouse-posthook",
+  "callback_url": "https://growth-relay.asbl.in/api/relay/inhouse-posthook",
   "agent_persona_id": "asbl_loft_warm_v2",
   "scheduled_at": null,
   "metadata": {
@@ -121,7 +121,7 @@ CRM cron monitors this every 5 min for uptime alerts.
 All posthook events go to:
 
 ```
-POST https://asbl-crm-api.vercel.app/api/relay/inhouse-posthook
+POST https://growth-relay.asbl.in/api/relay/inhouse-posthook
 ```
 
 **Auth header (mandatory on every webhook):**
@@ -265,7 +265,7 @@ Customer asks to be removed from calling list. CRM must immediately suppress all
 When a customer **calls IN** to one of the ASBL numbers, your bot should fetch their context BEFORE the conversation starts, so it doesn't sound cold.
 
 ```
-GET https://asbl-crm-api.vercel.app/api/chat-history?action=lead-context
+GET https://growth-relay.asbl.in/api/chat-history?action=lead-context
   &phone=+919876543210
   &secret=<INHOUSE_POSTHOOK_SECRET>
 ```
@@ -308,7 +308,7 @@ If `found: false`, treat as a cold call.
 If during the call your LLM extracts a new slot value (e.g. customer confirms budget changed from `1_5_to_2cr` to `2_to_2_5cr`), push immediately:
 
 ```
-POST https://asbl-crm-api.vercel.app/api/chat-history?action=webhook-bot-turn
+POST https://growth-relay.asbl.in/api/chat-history?action=webhook-bot-turn
 Headers: X-Webhook-Secret: <INHOUSE_POSTHOOK_SECRET>
 
 {
